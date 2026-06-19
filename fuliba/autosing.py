@@ -7,12 +7,18 @@ new Env('福利吧签到');
 
 import os
 import re
+from urllib.parse import urljoin, urlparse
 
 import requests
 from sendNotify import send
 
 
-DOMAINS = ["www.wnflb99.com", "www.wnflb2023.com", "www.wnflb00.com"]
+BASE_URLS = [
+    "https://www.wnflb99.com",
+    "http://www.wnflb2023.com",
+    "https://wnflb00.com",
+    "https://www.wnflb00.com",
+]
 TIMEOUT = 15
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,21 +35,40 @@ def normalize_cookie(cookie):
     return cookie.replace("\r", "").replace("\n", "; ")
 
 
-def get_candidate_domains():
-    configured = os.getenv("FUBA_DOMAIN") or os.getenv("FUBA_DOMAINS") or ""
-    raw_domains = re.split(r"[,;\s]+", configured) + DOMAINS
-    domains = []
-    for domain in raw_domains:
-        domain = re.sub(r"^https?://", "", domain.strip()).strip("/")
-        if domain and domain not in domains:
-            domains.append(domain)
-    return domains
+def normalize_base_url(raw_value):
+    value = raw_value.strip().strip("/")
+    if not value:
+        return []
+    if re.match(r"^https?://", value):
+        return [value]
+    return [f"https://{value}", f"http://{value}"]
+
+
+def get_candidate_base_urls():
+    configured = " ".join(
+        filter(
+            None,
+            (
+                os.getenv("FUBA_BASE_URL"),
+                os.getenv("FUBA_URL"),
+                os.getenv("FUBA_DOMAIN"),
+                os.getenv("FUBA_DOMAINS"),
+            ),
+        )
+    )
+    raw_urls = re.split(r"[,;\s]+", configured) + BASE_URLS
+    urls = []
+    for raw_url in raw_urls:
+        for base_url in normalize_base_url(raw_url):
+            if base_url and base_url not in urls:
+                urls.append(base_url)
+    return urls
 
 
 def build_headers(cookie, host):
     return {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "zh-CN,zh;q=0.9",
         "cache-control": "max-age=0",
         "Upgrade-Insecure-Requests": "1",
@@ -53,17 +78,41 @@ def build_headers(cookie, host):
     }
 
 
-def find_available_domain(session):
-    last_error = None
-    for domain in get_candidate_domains():
+def build_probe_headers():
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "User-Agent": USER_AGENT,
+    }
+
+
+def get_origin(url):
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(f"无效站点地址：{url}")
+    return f"{parsed.scheme}://{parsed.netloc}", parsed.netloc
+
+
+def make_url(base_url, path):
+    return urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+
+
+def find_available_base_url(session):
+    errors = []
+    for base_url in get_candidate_base_urls():
         try:
-            response = session.get(f"https://{domain}", timeout=TIMEOUT)
-            if response.status_code == 200:
-                return domain
-            last_error = f"{domain} 状态码 {response.status_code}"
+            response = session.get(
+                base_url,
+                headers=build_probe_headers(),
+                timeout=TIMEOUT,
+                allow_redirects=True,
+            )
+            if 200 <= response.status_code < 400:
+                return get_origin(response.url)[0]
+            errors.append(f"{base_url} 状态码 {response.status_code}")
         except requests.RequestException as exc:
-            last_error = f"{domain} 请求失败：{exc}"
-    raise RuntimeError(f"所有备用域名均不可用：{last_error}")
+            errors.append(f"{base_url} 请求失败：{exc}")
+    raise RuntimeError("所有备用域名均不可用：" + "；".join(errors))
 
 
 def extract_checkin_url(page_text):
@@ -115,13 +164,14 @@ def start(cookie, username):
             raise RuntimeError("未配置环境变量 FUBAUN")
 
         session = requests.session()
-        flb_url = find_available_domain(session)
-        headers = build_headers(cookie, flb_url)
+        base_url = find_available_base_url(session)
+        host = get_origin(base_url)[1]
+        headers = build_headers(cookie, host)
 
         # 访问 PC 主页，下面保留原脚本的登录校验方式。
-        print(flb_url)
+        print(base_url)
         user_info = session.get(
-            f"https://{flb_url}/forum.php?mobile=no",
+            make_url(base_url, "forum.php?mobile=no"),
             headers=headers,
             timeout=TIMEOUT,
         ).text
@@ -147,7 +197,7 @@ def start(cookie, username):
 
         print(qiandao_url)
         sign_response = session.get(
-            f"https://{flb_url}/{qiandao_url}",
+            make_url(base_url, qiandao_url),
             headers=headers,
             timeout=TIMEOUT,
         ).text
@@ -155,7 +205,7 @@ def start(cookie, username):
             print("检测到今日已签到")
 
         user_info = session.get(
-            f"https://{flb_url}/forum.php?mobile=no",
+            make_url(base_url, "forum.php?mobile=no"),
             headers=headers,
             timeout=TIMEOUT,
         ).text
