@@ -115,6 +115,7 @@ Environment for each site:
   <PREFIX>_SYSTEM_ACCESS_TOKEN  Optional system access token from account security settings.
   <PREFIX>_COOKIE               Optional full Cookie header copied from browser.
   <PREFIX>_SESSION              Optional session cookie value when <PREFIX>_COOKIE is not set.
+  <PREFIX>_IP_FAMILY            Optional, set to 4 to force IPv4 for unstable TLS handshakes.
   <PREFIX>_BASE_URL             Optional site base URL override.
   <PREFIX>_API_USER_HEADER      Optional, defaults to new-api-user.
   <PREFIX>_CHECKIN_PATH         Optional, defaults to /api/user/checkin.
@@ -157,6 +158,15 @@ function buildSiteConfig(site) {
   const checkInPath = envValue(`${prefix}_CHECKIN_PATH`) || '/api/user/checkin';
   const userInfoPath = envValue(`${prefix}_USER_INFO_PATH`) || '/api/user/self';
   const userAgent = envValue(`${prefix}_USER_AGENT`) || envValue('NEWAPI_USER_AGENT') || DEFAULT_USER_AGENT;
+  const ipFamily = parseIpFamily(envValue(`${prefix}_IP_FAMILY`) || envValue('NEWAPI_IP_FAMILY'));
+  const retryCount = parseNonNegativeInteger(
+    envValue(`${prefix}_RETRY_COUNT`) || envValue('NEWAPI_RETRY_COUNT'),
+    2
+  );
+  const preflightUserInfo = parseBoolean(
+    envValue(`${prefix}_PREFLIGHT_USER_INFO`) || envValue('NEWAPI_PREFLIGHT_USER_INFO'),
+    false
+  );
 
   if (!apiUser) {
     throw new SignInError(`Missing ${prefix}_API_USER. Read localStorage user.id from ${baseUrl}/console/personal.`);
@@ -179,6 +189,9 @@ function buildSiteConfig(site) {
     checkInPath,
     userInfoPath,
     userAgent,
+    ipFamily,
+    retryCount,
+    preflightUserInfo,
   };
 }
 
@@ -224,6 +237,23 @@ function parsePositiveInteger(raw, fallback) {
   if (!raw) return fallback;
   const value = Number.parseInt(raw, 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function parseNonNegativeInteger(raw, fallback) {
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function parseIpFamily(raw) {
+  if (!raw) return undefined;
+  const value = Number.parseInt(raw, 10);
+  return value === 4 || value === 6 ? value : undefined;
+}
+
+function parseBoolean(raw, fallback) {
+  if (!raw) return fallback;
+  return /^(1|true|yes|on)$/i.test(raw);
 }
 
 function isQinglongEnvironment() {
@@ -280,7 +310,28 @@ async function sendQinglongNotification(title, body) {
   }
 }
 
-function requestJson(site, method, apiPath, options = {}) {
+async function requestJson(site, method, apiPath, options = {}) {
+  let lastError = null;
+  const attempts = site.retryCount + 1;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await requestJsonOnce(site, method, apiPath, options);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableNetworkError(error) || attempt === attempts) {
+        throw error;
+      }
+
+      console.error(`[newapi:${site.id}] Network error on ${method} ${apiPath}: ${error.message}; retry ${attempt}/${site.retryCount}`);
+      await delay(800 * attempt);
+    }
+  }
+
+  throw lastError;
+}
+
+function requestJsonOnce(site, method, apiPath, options = {}) {
   const url = new URL(apiPath, site.baseUrl);
   const origin = new URL(site.baseUrl).origin;
   const client = url.protocol === 'http:' ? http : https;
@@ -320,6 +371,10 @@ function requestJson(site, method, apiPath, options = {}) {
     headers,
   };
 
+  if (site.ipFamily) {
+    requestOptions.family = site.ipFamily;
+  }
+
   return new Promise((resolve, reject) => {
     const req = client.request(requestOptions, (res) => {
       let responseBody = '';
@@ -336,6 +391,7 @@ function requestJson(site, method, apiPath, options = {}) {
             statusCode,
             response: scrubResponse(parsed),
             body: parsed === null ? responseBody.slice(0, 300) : undefined,
+            authHint: getAuthHint(responseBody),
           }));
           return;
         }
@@ -356,9 +412,30 @@ function requestJson(site, method, apiPath, options = {}) {
       req.destroy(new SignInError(`Request timed out after ${site.timeoutMs}ms: ${method} ${apiPath}`));
     });
 
-    req.on('error', reject);
+    req.on('error', (error) => {
+      if (error instanceof SignInError) {
+        reject(error);
+        return;
+      }
+
+      reject(new SignInError(error.message, {
+        code: error.code || '',
+        syscall: error.syscall || '',
+      }));
+    });
     req.end(body);
   });
+}
+
+function isRetryableNetworkError(error) {
+  if (!(error instanceof SignInError)) return false;
+  const code = error.details && error.details.code;
+  if (['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPROTO'].includes(code)) return true;
+  return /socket|tls|network|timeout|econnreset|disconnected/i.test(error.message);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseMaybeJson(body) {
@@ -478,18 +555,26 @@ async function runOneSite(site, args) {
   console.log(`[newapi:${site.id}] Start at ${new Date().toISOString()}`);
   console.log(`[newapi:${site.id}] Base URL: ${site.baseUrl}`);
 
-  const userInfo = await requestJson(site, 'GET', site.userInfoPath);
-  assertNewApiSuccess(userInfo, 'Session validation failed');
-  const beforeInfo = describeUserInfo(userInfo);
-  console.log(`[newapi:${site.id}] Session OK: ${beforeInfo.username}`);
-  console.log(`[newapi:${site.id}] Current balance: ${beforeInfo.line.replace(/\n/g, '; ')}`);
-
   if (args.statusOnly) {
+    const userInfo = await requestJson(site, 'GET', site.userInfoPath);
+    assertNewApiSuccess(userInfo, 'Session validation failed');
+    const beforeInfo = describeUserInfo(userInfo);
+    console.log(`[newapi:${site.id}] Session OK: ${beforeInfo.username}`);
+    console.log(`[newapi:${site.id}] Current balance: ${beforeInfo.line.replace(/\n/g, '; ')}`);
+
     return {
       site,
       success: true,
       message: ['状态检查成功', beforeInfo.line].join('\n'),
     };
+  }
+
+  if (site.preflightUserInfo) {
+    const userInfo = await requestJson(site, 'GET', site.userInfoPath);
+    assertNewApiSuccess(userInfo, 'Session validation failed');
+    const beforeInfo = describeUserInfo(userInfo);
+    console.log(`[newapi:${site.id}] Session OK: ${beforeInfo.username}`);
+    console.log(`[newapi:${site.id}] Current balance: ${beforeInfo.line.replace(/\n/g, '; ')}`);
   }
 
   const checkInResult = await requestJson(site, 'POST', site.checkInPath);
