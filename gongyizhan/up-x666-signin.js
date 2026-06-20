@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-// @name 薄荷签到
-// @cron 0 10 8 * * *
-// @description 薄荷公益站每日签到，优先使用青龙通知模块发送结果
-// new Env('薄荷签到')
+// cron: 0 10 8 * * *
+// new Env('薄荷签到');
+// description: 薄荷公益站每日签到，优先使用青龙通知模块发送结果
 
 const fs = require('fs');
 const http = require('http');
@@ -91,7 +90,7 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-  console.log(`Usage: node scripts/up-x666-signin.js [options]
+  console.log(`Usage: node gongyizhan/up-x666-signin.js [options]
 
 Options:
   --status-only   Validate the session and print today's sign-in status without spinning.
@@ -258,6 +257,15 @@ function scrubResponse(value) {
   return clone;
 }
 
+function canSpin(status) {
+  return status && status.can_spin === true;
+}
+
+function getUnavailableReason(status) {
+  if (status && status.can_spin === false) return '今天已签到，无需重复转盘。';
+  return '当前不可签到，接口未返回可转盘状态。';
+}
+
 function quotaToTimes(quota) {
   if (typeof quota !== 'number' || !Number.isFinite(quota)) return null;
   return quota / QUOTA_PER_TIME;
@@ -289,22 +297,22 @@ async function run() {
   assertSuccess(status, 'Failed to fetch check-in status');
 
   if (args.statusOnly) {
-    const canSpin = status.can_spin === false ? 'no' : 'yes';
-    console.log(`[up.x666] Status only: can spin today: ${canSpin}.`);
+    console.log(`[up.x666] Status only: can spin today: ${canSpin(status) ? 'yes' : 'no'}.`);
     if (typeof status.total_quota === 'number') {
       console.log(`[up.x666] Total earned: ${describeQuota(status.total_quota)}`);
     }
     return;
   }
 
-  if (status.can_spin === false) {
-    console.log('[up.x666] Already signed in today; no spin needed.');
+  if (!canSpin(status)) {
+    const reason = getUnavailableReason(status);
+    console.log(`[up.x666] ${reason}`);
     if (typeof status.total_quota === 'number') {
       console.log(`[up.x666] Total earned: ${describeQuota(status.total_quota)}`);
     }
     await sendQinglongNotification(
       TASK_NAME,
-      [`账号：${username}`, '今天已签到，无需重复转盘。'].join('\n')
+      [`账号：${username}`, reason].join('\n')
     );
     return;
   }
@@ -349,11 +357,13 @@ module.exports = {
   describeQuota,
   getConfig,
   getQinglongNotifyModule,
+  getUnavailableReason,
   isQinglongEnvironment,
   normalizeBaseUrl,
   parseArgs,
   quotaToTimes,
   requestJson,
   run,
+  canSpin,
   sendQinglongNotification,
 };
