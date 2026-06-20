@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 
+// @name 薄荷签到
+// @cron 0 10 8 * * *
+// @description 薄荷公益站每日签到，优先使用青龙通知模块发送结果
+
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
@@ -9,6 +13,7 @@ const path = require('path');
 const DEFAULT_BASE_URL = 'https://up.x666.me';
 const DEFAULT_TIMEOUT_MS = 30000;
 const QUOTA_PER_TIME = 500;
+const TASK_NAME = '薄荷签到';
 
 class SignInError extends Error {
   constructor(message, details = {}) {
@@ -97,6 +102,60 @@ Environment:
   UP_X666_COOKIE      Required full Cookie header from an authenticated browser session.
   UP_X666_BASE_URL    Optional, defaults to ${DEFAULT_BASE_URL}.
   UP_X666_TIMEOUT_MS  Optional, defaults to ${DEFAULT_TIMEOUT_MS}.`);
+}
+
+function isQinglongEnvironment() {
+  return Boolean(process.env.QL_DIR || process.env.QL_DATA_DIR || process.env.QL_BRANCH);
+}
+
+function getQinglongNotifyModule() {
+  const candidates = [
+    path.join(process.cwd(), 'sendNotify.js'),
+    path.join(process.cwd(), 'notify.js'),
+    path.join(process.cwd(), 'function', 'sendNotify.js'),
+    path.join(process.cwd(), 'function', 'notify.js'),
+    path.join('/ql', 'data', 'scripts', 'sendNotify.js'),
+    path.join('/ql', 'data', 'scripts', 'notify.js'),
+    path.join('/ql', 'scripts', 'sendNotify.js'),
+    path.join('/ql', 'scripts', 'notify.js'),
+  ];
+
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+
+    try {
+      const mod = require(file);
+      const sendNotify = typeof mod.sendNotify === 'function'
+        ? mod.sendNotify
+        : typeof mod === 'function'
+          ? mod
+          : null;
+
+      if (sendNotify) {
+        return { sendNotify, file };
+      }
+    } catch (error) {
+      console.error(`[up.x666] Failed to load Qinglong notify module: ${file}`);
+      console.error(`[up.x666] Notify load error: ${error.message}`);
+    }
+  }
+
+  return null;
+}
+
+async function sendQinglongNotification(title, body) {
+  if (!isQinglongEnvironment()) return false;
+
+  const notify = getQinglongNotifyModule();
+  if (!notify) return false;
+
+  try {
+    await Promise.resolve(notify.sendNotify(title, body));
+    return true;
+  } catch (error) {
+    console.error(`[up.x666] Qinglong notification failed: ${error.message}`);
+    return false;
+  }
 }
 
 function normalizeBaseUrl(raw) {
@@ -244,6 +303,10 @@ async function run() {
     if (typeof status.total_quota === 'number') {
       console.log(`[up.x666] Total earned: ${describeQuota(status.total_quota)}`);
     }
+    await sendQinglongNotification(
+      TASK_NAME,
+      [`账号：${username}`, '今天已签到，无需重复转盘。'].join('\n')
+    );
     return;
   }
 
@@ -259,6 +322,14 @@ async function run() {
     : 'unknown prize';
   const level = spinResult.level !== undefined ? `level ${spinResult.level}` : 'unknown level';
   console.log(`[up.x666] Spin succeeded: ${level}, prize ${prize}.`);
+  await sendQinglongNotification(
+    TASK_NAME,
+    [
+      `账号：${username}`,
+      `签到成功：${level}`,
+      `奖励：${prize}`,
+    ].join('\n')
+  );
 }
 
 if (require.main === module) {
@@ -267,7 +338,10 @@ if (require.main === module) {
     if (error instanceof SignInError && error.details && Object.keys(error.details).length > 0) {
       console.error(`[up.x666] Details: ${JSON.stringify(error.details)}`);
     }
-    process.exitCode = 1;
+    sendQinglongNotification(TASK_NAME, ['执行失败', error.message].join('\n'))
+      .finally(() => {
+        process.exitCode = 1;
+      });
   });
 }
 
@@ -275,9 +349,12 @@ module.exports = {
   SignInError,
   describeQuota,
   getConfig,
+  getQinglongNotifyModule,
+  isQinglongEnvironment,
   normalizeBaseUrl,
   parseArgs,
   quotaToTimes,
   requestJson,
   run,
+  sendQinglongNotification,
 };
