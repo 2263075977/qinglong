@@ -115,6 +115,8 @@ Environment for each site:
   <PREFIX>_SYSTEM_ACCESS_TOKEN  Optional system access token from account security settings.
   <PREFIX>_COOKIE               Optional full Cookie header copied from browser.
   <PREFIX>_SESSION              Optional session cookie value when <PREFIX>_COOKIE is not set.
+  <PREFIX>_TURNSTILE_TOKEN      Optional fresh Cloudflare Turnstile token for protected check-in.
+  <PREFIX>_USER_AGENT           Optional browser User-Agent matching copied Cloudflare cookies.
   <PREFIX>_IP_FAMILY            Optional, set to 4 to force IPv4 for unstable TLS handshakes.
   <PREFIX>_BASE_URL             Optional site base URL override.
   <PREFIX>_API_USER_HEADER      Optional, defaults to new-api-user.
@@ -158,6 +160,7 @@ function buildSiteConfig(site) {
   const checkInPath = envValue(`${prefix}_CHECKIN_PATH`) || '/api/user/checkin';
   const userInfoPath = envValue(`${prefix}_USER_INFO_PATH`) || '/api/user/self';
   const userAgent = envValue(`${prefix}_USER_AGENT`) || envValue('NEWAPI_USER_AGENT') || DEFAULT_USER_AGENT;
+  const turnstileToken = envValue(`${prefix}_TURNSTILE_TOKEN`);
   const ipFamily = parseIpFamily(envValue(`${prefix}_IP_FAMILY`) || envValue('NEWAPI_IP_FAMILY'));
   const retryCount = parseNonNegativeInteger(
     envValue(`${prefix}_RETRY_COUNT`) || envValue('NEWAPI_RETRY_COUNT'),
@@ -189,6 +192,7 @@ function buildSiteConfig(site) {
     checkInPath,
     userInfoPath,
     userAgent,
+    turnstileToken,
     ipFamily,
     retryCount,
     preflightUserInfo,
@@ -470,9 +474,26 @@ function assertNewApiSuccess(result, context) {
   if (isSuccessResponse(result)) return;
 
   const message = getResponseMessage(result);
-  throw new SignInError(message ? `${context}: ${message}` : `${context}: unexpected response`, {
+  const details = {
     response: scrubResponse(result),
+  };
+  const authHint = getFailureHint(message);
+  if (authHint) details.authHint = authHint;
+
+  throw new SignInError(message ? `${context}: ${message}` : `${context}: unexpected response`, {
+    ...details,
   });
+}
+
+function getFailureHint(message) {
+  if (/turnstile/i.test(message) || message.includes('Turnstile') || message.includes('验证')) {
+    return [
+      '站点要求 Cloudflare Turnstile token。',
+      '纯 Node 定时脚本无法稳定自动生成这个短时 token；可临时从浏览器请求里复制后设置 <PREFIX>_TURNSTILE_TOKEN，或改用带真实浏览器模式的签到工具。',
+    ].join('');
+  }
+
+  return '';
 }
 
 function isSuccessResponse(result) {
@@ -577,7 +598,10 @@ async function runOneSite(site, args) {
     console.log(`[newapi:${site.id}] Current balance: ${beforeInfo.line.replace(/\n/g, '; ')}`);
   }
 
-  const checkInResult = await requestJson(site, 'POST', site.checkInPath);
+  const checkInPath = site.turnstileToken
+    ? appendQueryParam(site.checkInPath, 'turnstile', site.turnstileToken)
+    : site.checkInPath;
+  const checkInResult = await requestJson(site, 'POST', checkInPath);
   assertNewApiSuccess(checkInResult, 'Check-in failed');
   const checkInLine = describeCheckInResult(checkInResult);
   console.log(`[newapi:${site.id}] ${checkInLine}`);
@@ -598,6 +622,11 @@ async function runOneSite(site, args) {
     success: true,
     message: [checkInLine, afterLine].filter(Boolean).join('\n'),
   };
+}
+
+function appendQueryParam(rawPath, key, value) {
+  const marker = rawPath.includes('?') ? '&' : '?';
+  return `${rawPath}${marker}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
 }
 
 async function run() {
