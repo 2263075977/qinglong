@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-'use strict';
-
 // @name 薄荷签到
 // @cron 0 10 8 * * *
 // @description 薄荷公益站每日签到，优先使用青龙通知模块发送结果
+// new Env('薄荷签到')
 
 const fs = require('fs');
 const http = require('http');
