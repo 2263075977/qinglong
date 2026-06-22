@@ -60,7 +60,16 @@ function getConfig() {
   const cookie = (process.env.UP_X666_COOKIE || '').trim();
   if (!cookie) {
     throw new SignInError(
-      'Missing UP_X666_COOKIE. Set it to the full Cookie header copied from an authenticated up.x666.me browser session.'
+      '缺少环境变量 UP_X666_COOKIE\n' +
+      '请在青龙面板"环境变量"中添加：\n' +
+      '  变量名: UP_X666_COOKIE\n' +
+      '  变量值: 从浏览器复制的完整 Cookie 字符串\n\n' +
+      '获取方法：\n' +
+      '  1. 登录 https://up.x666.me\n' +
+      '  2. F12 打开开发者工具 → Network 标签\n' +
+      '  3. 刷新页面，点击任意请求\n' +
+      '  4. 找到 Request Headers 中的 Cookie 行\n' +
+      '  5. 复制完整的 Cookie 值'
     );
   }
 
@@ -82,7 +91,7 @@ function parseArgs(argv) {
     } else if (arg === '--status-only') {
       args.statusOnly = true;
     } else {
-      throw new SignInError(`Unknown argument: ${arg}`);
+      throw new SignInError(`未知参数: ${arg}\n使用 --help 查看帮助`);
     }
   }
 
@@ -90,16 +99,27 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-  console.log(`Usage: node gongyizhan/up-x666-signin.js [options]
+  console.log(`使用方法: node up-x666-signin.js [选项]
 
-Options:
-  --status-only   Validate the session and print today's sign-in status without spinning.
-  -h, --help      Show this help.
+选项:
+  --status-only   仅验证会话并显示今日签到状态，不执行签到
+  -h, --help      显示此帮助信息
 
-Environment:
-  UP_X666_COOKIE      Required full Cookie header from an authenticated browser session.
-  UP_X666_BASE_URL    Optional, defaults to ${DEFAULT_BASE_URL}.
-  UP_X666_TIMEOUT_MS  Optional, defaults to ${DEFAULT_TIMEOUT_MS}.`);
+环境变量:
+  UP_X666_COOKIE      必需，从浏览器复制的完整 Cookie 字符串
+  UP_X666_BASE_URL    可选，默认为 ${DEFAULT_BASE_URL}
+  UP_X666_TIMEOUT_MS  可选，请求超时时间（毫秒），默认为 ${DEFAULT_TIMEOUT_MS}
+
+示例:
+  # 执行签到
+  node up-x666-signin.js
+
+  # 仅查看状态
+  node up-x666-signin.js --status-only
+
+  # 青龙面板定时任务
+  # cron: 0 10 8 * * *
+  # 环境变量中配置 UP_X666_COOKIE`);
 }
 
 function isQinglongEnvironment() {
@@ -133,8 +153,8 @@ function getQinglongNotifyModule() {
         return { sendNotify, file };
       }
     } catch (error) {
-      console.error(`[up.x666] Failed to load Qinglong notify module: ${file}`);
-      console.error(`[up.x666] Notify load error: ${error.message}`);
+      console.error(`[up.x666] 加载青龙通知模块失败: ${file}`);
+      console.error(`[up.x666] 错误: ${error.message}`);
     }
   }
 
@@ -151,7 +171,7 @@ async function sendQinglongNotification(title, body) {
     await Promise.resolve(notify.sendNotify(title, body));
     return true;
   } catch (error) {
-    console.error(`[up.x666] Qinglong notification failed: ${error.message}`);
+    console.error(`[up.x666] 青龙通知发送失败: ${error.message}`);
     return false;
   }
 }
@@ -164,7 +184,7 @@ function normalizeBaseUrl(raw) {
     url.hash = '';
     return url.toString().replace(/\/$/, '');
   } catch (error) {
-    throw new SignInError(`Invalid UP_X666_BASE_URL: ${raw}`);
+    throw new SignInError(`环境变量 UP_X666_BASE_URL 格式无效: ${raw}\n请提供完整的 URL（如 https://up.x666.me）`);
   }
 }
 
@@ -212,28 +232,39 @@ function requestJson(config, apiPath, options = {}) {
       res.on('end', () => {
         const statusCode = res.statusCode || 0;
         if (statusCode < 200 || statusCode >= 300) {
-          reject(new SignInError(`HTTP ${statusCode} from ${method} ${apiPath}`, {
-            statusCode,
-            body: body.slice(0, 300),
-          }));
+          reject(new SignInError(
+            `HTTP ${statusCode} - ${method} ${apiPath}\n` +
+            `响应内容: ${body.slice(0, 200)}...`,
+            { statusCode, body: body.slice(0, 300) }
+          ));
           return;
         }
 
         try {
           resolve(JSON.parse(body));
         } catch (error) {
-          reject(new SignInError(`Non-JSON response from ${method} ${apiPath}`, {
-            body: body.slice(0, 300),
-          }));
+          reject(new SignInError(
+            `服务器返回了非 JSON 格式的响应\n` +
+            `请求: ${method} ${apiPath}\n` +
+            `响应内容: ${body.slice(0, 200)}...`,
+            { body: body.slice(0, 300) }
+          ));
         }
       });
     });
 
     req.setTimeout(config.timeoutMs, () => {
-      req.destroy(new SignInError(`Request timed out after ${config.timeoutMs}ms: ${method} ${apiPath}`));
+      req.destroy(new SignInError(`请求超时（${config.timeoutMs}ms）: ${method} ${apiPath}`));
     });
 
-    req.on('error', reject);
+    req.on('error', (error) => {
+      reject(new SignInError(
+        `网络请求失败: ${error.message}\n` +
+        `请求: ${method} ${apiPath}\n` +
+        `请检查网络连接和站点地址`,
+        { originalError: error }
+      ));
+    });
     req.end();
   });
 }
@@ -242,7 +273,7 @@ function assertSuccess(result, context) {
   if (!result || result.success !== true) {
     const message = result && (result.message || result.error)
       ? `${context}: ${result.message || result.error}`
-      : `${context}: unexpected response`;
+      : `${context}: 未知错误`;
     throw new SignInError(message, { response: scrubResponse(result) });
   }
 }
@@ -262,8 +293,8 @@ function canSpin(status) {
 }
 
 function getUnavailableReason(status) {
-  if (status && status.can_spin === false) return '今天已签到，无需重复转盘。';
-  return '当前不可签到，接口未返回可转盘状态。';
+  if (status && status.can_spin === false) return '今天已签到，无需重复转盘';
+  return '当前不可签到，接口未返回可转盘状态';
 }
 
 function quotaToTimes(quota) {
@@ -274,7 +305,7 @@ function quotaToTimes(quota) {
 function describeQuota(quota) {
   const times = quotaToTimes(quota);
   if (times === null) return 'unknown';
-  return `${times.toLocaleString('en-US')} times (${quota.toLocaleString('en-US')} quota)`;
+  return `${times.toLocaleString('zh-CN')} 次 (${quota.toLocaleString('zh-CN')} 额度)`;
 }
 
 async function run() {
@@ -285,67 +316,116 @@ async function run() {
   }
 
   const config = getConfig();
-  console.log(`[up.x666] Start daily sign-in check at ${new Date().toISOString()}`);
+  console.log(`[up.x666] 开始执行签到检查 - ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
 
-  const userInfo = await requestJson(config, '/api/user/info');
-  assertSuccess(userInfo, 'Session validation failed');
+  // 验证会话
+  let userInfo;
+  try {
+    userInfo = await requestJson(config, '/api/user/info');
+    assertSuccess(userInfo, '会话验证失败');
+  } catch (error) {
+    const errorMsg = error instanceof SignInError ? error.message : String(error);
+    console.error(`[up.x666] ❌ 会话验证失败`);
+    console.error(`[up.x666] 错误详情: ${errorMsg}`);
+
+    await sendQinglongNotification(
+      TASK_NAME,
+      `❌ 会话验证失败\n\n${errorMsg}\n\n请更新环境变量 UP_X666_COOKIE`
+    );
+    throw error;
+  }
 
   const username = userInfo.username || userInfo.name || userInfo.linux_do_id || 'unknown user';
-  console.log(`[up.x666] Session OK: ${username}`);
+  console.log(`[up.x666] ✅ 会话验证成功: ${username}`);
 
-  const status = await requestJson(config, '/api/checkin/status');
-  assertSuccess(status, 'Failed to fetch check-in status');
+  // 获取签到状态
+  let status;
+  try {
+    status = await requestJson(config, '/api/checkin/status');
+    assertSuccess(status, '获取签到状态失败');
+  } catch (error) {
+    const errorMsg = error instanceof SignInError ? error.message : String(error);
+    console.error(`[up.x666] ❌ 获取签到状态失败`);
+    console.error(`[up.x666] 错误详情: ${errorMsg}`);
+
+    await sendQinglongNotification(
+      TASK_NAME,
+      `账号: ${username}\n❌ 获取签到状态失败\n\n${errorMsg}`
+    );
+    throw error;
+  }
 
   if (args.statusOnly) {
-    console.log(`[up.x666] Status only: can spin today: ${canSpin(status) ? 'yes' : 'no'}.`);
+    console.log(`[up.x666] 📊 状态查询模式: 今日${canSpin(status) ? '未' : '已'}签到`);
     if (typeof status.total_quota === 'number') {
-      console.log(`[up.x666] Total earned: ${describeQuota(status.total_quota)}`);
+      console.log(`[up.x666] 📊 累计获得: ${describeQuota(status.total_quota)}`);
     }
     return;
   }
 
   if (!canSpin(status)) {
     const reason = getUnavailableReason(status);
-    console.log(`[up.x666] ${reason}`);
+    console.log(`[up.x666] ⏭️  ${reason}`);
     if (typeof status.total_quota === 'number') {
-      console.log(`[up.x666] Total earned: ${describeQuota(status.total_quota)}`);
+      console.log(`[up.x666] 📊 累计获得: ${describeQuota(status.total_quota)}`);
     }
     await sendQinglongNotification(
       TASK_NAME,
-      [`账号：${username}`, reason].join('\n')
+      `账号: ${username}\n${reason}`
     );
     return;
   }
 
-  console.log('[up.x666] Sign-in is available; spinning now.');
-  const spinResult = await requestJson(config, '/api/checkin/spin', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  });
-  assertSuccess(spinResult, 'Spin failed');
+  // 执行签到
+  console.log('[up.x666] 🎰 开始签到转盘...');
+  let spinResult;
+  try {
+    spinResult = await requestJson(config, '/api/checkin/spin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    assertSuccess(spinResult, '签到失败');
+  } catch (error) {
+    const errorMsg = error instanceof SignInError ? error.message : String(error);
+    console.error(`[up.x666] ❌ 签到失败`);
+    console.error(`[up.x666] 错误详情: ${errorMsg}`);
+
+    await sendQinglongNotification(
+      TASK_NAME,
+      `账号: ${username}\n❌ 签到失败\n\n${errorMsg}`
+    );
+    throw error;
+  }
 
   const prize = spinResult.quota_amount !== undefined
     ? describeQuota(spinResult.quota_amount)
     : 'unknown prize';
   const level = spinResult.level !== undefined ? `level ${spinResult.level}` : 'unknown level';
-  console.log(`[up.x666] Spin succeeded: ${level}, prize ${prize}.`);
+
+  console.log(`[up.x666] 🎉 签到成功!`);
+  console.log(`[up.x666] 📦 等级: ${level}`);
+  console.log(`[up.x666] 🎁 奖励: ${prize}`);
+
   await sendQinglongNotification(
     TASK_NAME,
-    [
-      `账号：${username}`,
-      `签到成功：${level}`,
-      `奖励：${prize}`,
-    ].join('\n')
+    `账号: ${username}\n✅ 签到成功\n\n等级: ${level}\n奖励: ${prize}`
   );
 }
 
 if (require.main === module) {
   run().catch((error) => {
-    console.error(`[up.x666] Failed: ${error.message}`);
+    const errorMsg = error instanceof SignInError
+      ? error.message
+      : `未知错误: ${error.message || String(error)}`;
+
+    console.error(`[up.x666] ❌ 执行失败`);
+    console.error(`[up.x666] ${errorMsg}`);
+
     if (error instanceof SignInError && error.details && Object.keys(error.details).length > 0) {
-      console.error(`[up.x666] Details: ${JSON.stringify(error.details)}`);
+      console.error(`[up.x666] 详细信息: ${JSON.stringify(error.details, null, 2)}`);
     }
-    sendQinglongNotification(TASK_NAME, ['执行失败', error.message].join('\n'))
+
+    sendQinglongNotification(TASK_NAME, `❌ 执行失败\n\n${errorMsg}`)
       .finally(() => {
         process.exitCode = 1;
       });
