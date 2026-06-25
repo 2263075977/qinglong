@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron: 0 10 8 * * *
+// cron: 10 8 * * *
 // new Env('薄荷签到');
 // description: 薄荷公益站每日签到，优先使用青龙通知模块发送结果
 

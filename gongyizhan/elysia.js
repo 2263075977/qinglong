@@ -1,6 +1,6 @@
 'use strict';
 /**
- * cron: 10 8 * * *
+ * cron: 15 8 * * *
  * new Env('Elysia 签到');
  *
  * 环境变量: ELYSIA_ACCOUNTS (Cookie)

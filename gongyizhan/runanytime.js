@@ -1,6 +1,6 @@
 'use strict';
 /**
- * cron: 15 8 * * *
+ * cron: 25 8 * * *
  * new Env('RunAnytime 签到');
  *
  * 环境变量: RUNANYTIME_ACCOUNTS (Cookie)
