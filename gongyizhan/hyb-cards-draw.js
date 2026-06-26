@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron: 10 4 * * *
+// cron: 30 8 * * *
 // new Env('黑与白福利站 50连抽');
 // description: 黑与白福利站每日自动 50 连抽，默认只使用免费次数
 
@@ -122,7 +122,7 @@ function printUsage() {
   HYB_CARDS_TIMEOUT_MS   可选，请求超时时间（毫秒），默认为 ${DEFAULT_TIMEOUT_MS}
 
 青龙定时任务:
-  10 4 * * * node /ql/data/scripts/hyb-cards-draw.js`);
+  30 8 * * * node /ql/data/scripts/hyb-cards-draw.js`);
 }
 
 function isQinglongEnvironment() {
