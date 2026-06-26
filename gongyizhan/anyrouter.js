@@ -5,7 +5,6 @@
  *
  * 环境变量: ANYROUTER_COOKIE="session=xxx; acw_tc=xxx; acw_sc__v2=xxx"
  */
- */
 
 const SITE_URL = 'https://anyrouter.top';
 const USER_ID = '68910';
