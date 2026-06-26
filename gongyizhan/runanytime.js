@@ -26,8 +26,19 @@ function getNotify() {
     const notify = require('./sendNotify');
     return notify?.sendNotify || notify;
   } catch {
-    return (title, msg) => console.log(`\n${title}\n${msg}`);
+    return null;
   }
+}
+
+async function sendResult(notify, title, content) {
+  if (typeof notify === 'function') {
+    try {
+      await notify(title, content);
+      return;
+    } catch {}
+  }
+
+  console.log(content);
 }
 
 function buildHeaders(cookie) {
@@ -181,7 +192,6 @@ async function checkin(cookie) {
       }
 
       const delay = 2000 * Math.pow(2, attempt - 1);
-      console.log(`请求失败，${delay / 1000}s 后重试 (${attempt}/3)`);
       await sleep(delay);
     }
   }
@@ -191,19 +201,14 @@ async function checkin(cookie) {
 
 // 主流程
 async function main() {
-  console.log(`开始执行... ${new Date().toLocaleString('zh-CN')}\n`);
-
   const notify = getNotify();
   const cookie = process.env[CONFIG.ENV];
 
   if (!cookie?.trim()) {
-    const msg = `未配置 ${CONFIG.ENV}`;
-    console.log(msg);
-    await notify('RunAnytime 自动签到', `❌ ${msg}`);
+    await sendResult(notify, 'RunAnytime 自动签到', `❌ 未配置 ${CONFIG.ENV}`);
     return;
   }
 
-  console.log('签到中...');
   const result = await checkin(cookie.trim());
 
   let notifyContent = '';
@@ -215,15 +220,12 @@ async function main() {
     notifyContent = `❌ ${result.message}`;
   }
 
-  console.log(notifyContent);
-  console.log(`\n完成 ${new Date().toLocaleString('zh-CN')}`);
-  await notify('RunAnytime 自动签到', notifyContent);
+  await sendResult(notify, 'RunAnytime 自动签到', notifyContent);
 }
 
 main().catch(async (err) => {
-  console.error(`异常: ${err.message}`);
   try {
-    await getNotify()('RunAnytime 自动签到', `❌ 执行异常: ${err.message}`);
+    await sendResult(getNotify(), 'RunAnytime 自动签到', `❌ 执行异常: ${err.message}`);
   } catch {}
   process.exitCode = 1;
 });
