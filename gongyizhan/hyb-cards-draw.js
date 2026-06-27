@@ -136,22 +136,27 @@ function getQinglongNotifyModule() {
     path.join(process.cwd(), 'function', 'sendNotify.js'),
     path.join(process.cwd(), 'function', 'notify.js'),
     path.join(__dirname, 'sendNotify.js'),
+    path.join(__dirname, 'notify.js'),
+    path.join(__dirname, '..', 'sendNotify.js'),
+    path.join(__dirname, '..', 'notify.js'),
     path.join('/ql', 'data', 'scripts', 'sendNotify.js'),
     path.join('/ql', 'data', 'scripts', 'notify.js'),
     path.join('/ql', 'scripts', 'sendNotify.js'),
     path.join('/ql', 'scripts', 'notify.js'),
   ];
 
-  for (const file of candidates) {
+  for (const file of [...new Set(candidates)]) {
     if (!fs.existsSync(file)) continue;
 
     try {
       const mod = require(file);
-      const sendNotify = typeof mod.sendNotify === 'function'
-        ? mod.sendNotify
-        : typeof mod === 'function'
-          ? mod
-          : null;
+      const sendNotify = typeof mod === 'function'
+        ? mod
+        : typeof mod?.sendNotify === 'function'
+          ? mod.sendNotify
+          : typeof mod?.default === 'function'
+            ? mod.default
+            : null;
 
       if (sendNotify) {
         return { sendNotify, file };
@@ -523,7 +528,7 @@ async function run() {
   } catch (error) {
     const errorMsg = error instanceof HybCardsError ? error.message : String(error);
     console.error(`[hybgzs] 获取抽卡状态失败: ${errorMsg}`);
-    await sendQinglongNotification(TASK_NAME, `❌ 获取抽卡状态失败\n\n${errorMsg}\n\n请检查 HYB_CARDS_COOKIE 是否有效`);
+    await sendQinglongNotification(TASK_NAME, `❌ 获取抽卡状态失败\n\n${errorMsg}\n\n请检查 HYB_CARDS_COOKIE 是否已失效或无效`);
     throw error;
   }
 

@@ -24,7 +24,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function getNotify() {
   try {
     const notify = require('./sendNotify');
-    return notify?.sendNotify || notify;
+    return typeof notify === 'function' ? notify : notify?.sendNotify || notify?.default || null;
   } catch {
     return null;
   }
@@ -38,7 +38,7 @@ async function sendResult(notify, title, content) {
     } catch {}
   }
 
-  console.log(content);
+  console.log(`\n${title}\n${content}`);
 }
 
 function buildHeaders(cookie) {

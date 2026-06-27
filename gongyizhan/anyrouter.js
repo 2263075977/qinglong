@@ -14,14 +14,23 @@ const QUOTA_PER_YUAN = 500000;
 async function notify(title, content) {
   try {
     const mod = require('./sendNotify');
-    const sendNotify = typeof mod === 'function' ? mod : mod?.sendNotify;
-    if (typeof sendNotify === 'function') {
-      await sendNotify(title, content);
-      return;
-    }
-  } catch {}
+    const sendNotify = typeof mod === 'function'
+      ? mod
+      : typeof mod?.sendNotify === 'function'
+        ? mod.sendNotify
+        : typeof mod?.default === 'function'
+          ? mod.default
+          : null;
 
-  console.log(content);
+    if (sendNotify) {
+      return await Promise.resolve(sendNotify(title, content));
+    }
+  } catch (error) {
+    console.error(`[AnyRouter] 青龙通知发送失败: ${error.message}`);
+  }
+
+  console.log(`\n${title}\n${content}`);
+  return false;
 }
 
 function quotaToYuan(quota) {
