@@ -330,7 +330,7 @@ async function run() {
 
     await sendQinglongNotification(
       TASK_NAME,
-      `❌ 会话验证失败\n\n${errorMsg}\n\n请更新环境变量 UP_X666_COOKIE`
+      `❌ 发生异常：会话验证失败\n\n${errorMsg}\n\n请更新环境变量 UP_X666_COOKIE`
     );
     throw error;
   }
@@ -350,7 +350,7 @@ async function run() {
 
     await sendQinglongNotification(
       TASK_NAME,
-      `账号: ${username}\n❌ 获取签到状态失败\n\n${errorMsg}`
+      `账号: ${username}\n❌ 发生异常：获取签到状态失败\n\n${errorMsg}`
     );
     throw error;
   }
@@ -392,7 +392,7 @@ async function run() {
 
     await sendQinglongNotification(
       TASK_NAME,
-      `账号: ${username}\n❌ 签到失败\n\n${errorMsg}`
+      `账号: ${username}\n❌ 发生异常：签到失败\n\n${errorMsg}`
     );
     throw error;
   }
@@ -425,7 +425,7 @@ if (require.main === module) {
       console.error(`[up.x666] 详细信息: ${JSON.stringify(error.details, null, 2)}`);
     }
 
-    sendQinglongNotification(TASK_NAME, `❌ 执行失败\n\n${errorMsg}`)
+    sendQinglongNotification(TASK_NAME, `❌ 发生异常：执行失败\n\n${errorMsg}`)
       .finally(() => {
         process.exitCode = 1;
       });

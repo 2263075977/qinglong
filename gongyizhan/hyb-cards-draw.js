@@ -528,7 +528,8 @@ async function run() {
   } catch (error) {
     const errorMsg = error instanceof HybCardsError ? error.message : String(error);
     console.error(`[hybgzs] 获取抽卡状态失败: ${errorMsg}`);
-    await sendQinglongNotification(TASK_NAME, `❌ 获取抽卡状态失败\n\n${errorMsg}\n\n请检查 HYB_CARDS_COOKIE 是否已失效或无效`);
+    await sendQinglongNotification(TASK_NAME, `❌ 发生异常：获取抽卡状态失败\n\n${errorMsg}\n\n请检查 HYB_CARDS_COOKIE 是否已失效或无效`);
+    error.notificationSent = true;
     throw error;
   }
 
@@ -567,7 +568,8 @@ async function run() {
   } catch (error) {
     const errorMsg = error instanceof HybCardsError ? error.message : String(error);
     console.error(`[hybgzs] 50连抽失败: ${errorMsg}`);
-    await sendQinglongNotification(TASK_NAME, `账号: ${accountLabel}\n❌ 50连抽失败\n\n${errorMsg}`);
+    await sendQinglongNotification(TASK_NAME, `账号: ${accountLabel}\n❌ 发生异常：50连抽失败\n\n${errorMsg}`);
+    error.notificationSent = true;
     throw error;
   }
 
@@ -596,7 +598,13 @@ if (require.main === module) {
     if (error instanceof HybCardsError && error.details && Object.keys(error.details).length > 0) {
       console.error(`[hybgzs] 详细信息: ${JSON.stringify(error.details, null, 2)}`);
     }
-    process.exitCode = 1;
+    const notifyPromise = error.notificationSent
+      ? Promise.resolve()
+      : sendQinglongNotification(TASK_NAME, `❌ 发生异常：执行失败\n\n${errorMsg}`);
+
+    notifyPromise.finally(() => {
+      process.exitCode = 1;
+    });
   });
 }
 

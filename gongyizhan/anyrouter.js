@@ -416,21 +416,21 @@ function formatResult(result, userData) {
   }
 
   if (result.type === 'auth_failed') {
-    return `❌ ${result.message}\n\n请更新环境变量 ANYROUTER_COOKIE`;
+    return `❌ 发生异常：${result.message}\n\n请更新环境变量 ANYROUTER_COOKIE`;
   }
 
   if (result.type === 'challenge_failed') {
-    return `⚠️ ${result.message}`;
+    return `⚠️ 发生异常：${result.message}`;
   }
 
-  return `❌ ${result.message}${balanceText}`;
+  return `❌ 发生异常：${result.message}${balanceText}`;
 }
 
 async function main() {
   const cookie = process.env.ANYROUTER_COOKIE?.trim();
 
   if (!cookie) {
-    await notify(TASK_TITLE, '❌ 未配置环境变量 ANYROUTER_COOKIE');
+    await notify(TASK_TITLE, '❌ 发生异常：未配置环境变量 ANYROUTER_COOKIE');
     process.exit(1);
   }
 
@@ -465,6 +465,6 @@ async function main() {
 }
 
 main().catch(async (error) => {
-  await notify(TASK_TITLE, `❌ 执行异常: ${error.message}`);
+  await notify(TASK_TITLE, `❌ 发生异常：执行异常: ${error.message}`);
   process.exitCode = 1;
 });

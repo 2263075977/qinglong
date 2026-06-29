@@ -217,7 +217,7 @@ def start(cookie, username):
 
     except Exception as e:
         print("签到失败，失败原因:" + str(e))
-        send("签到结果", str(e))
+        send("签到结果", "❌ 发生异常：签到失败\n\n" + str(e))
 
 
 if __name__ == "__main__":

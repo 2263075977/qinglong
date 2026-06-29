@@ -158,7 +158,7 @@ async function main() {
   const cookie = process.env[CONFIG.ENV];
 
   if (!cookie?.trim()) {
-    await sendResult(notify, 'Elysia 自动签到', `❌ 未配置 ${CONFIG.ENV}`);
+    await sendResult(notify, 'Elysia 自动签到', `❌ 发生异常：未配置 ${CONFIG.ENV}`);
     return;
   }
 
@@ -170,7 +170,7 @@ async function main() {
   } else if (result.type === 'already_checked') {
     notifyContent = '⏭️ 今日已签到';
   } else {
-    notifyContent = `❌ ${result.message}`;
+    notifyContent = `❌ 发生异常：${result.message}`;
   }
 
   await sendResult(notify, 'Elysia 自动签到', notifyContent);
@@ -178,7 +178,7 @@ async function main() {
 
 main().catch(async (err) => {
   try {
-    await sendResult(getNotify(), 'Elysia 自动签到', `❌ 执行异常: ${err.message}`);
+    await sendResult(getNotify(), 'Elysia 自动签到', `❌ 发生异常：执行异常: ${err.message}`);
   } catch {}
   process.exitCode = 1;
 });
