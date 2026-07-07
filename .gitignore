@@ -5,6 +5,7 @@
 .env
 .env.*
 !.env.example
+hybgzs/*.env
 
 # Logs
 *.log
@@ -21,5 +22,9 @@ AGENTS.md
 .mindfs/
 .trellis/
 __pycache__/
+hybgzs/.daily-50-draw-state.json
+hybgzs/logs/
+hybgzs/screenshots/
 gongyizhan/.runanytime-browser-profile/
+gongyizhan/.browser-profile/
 runanytime-browser-no-button-*.png
