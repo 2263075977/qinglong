@@ -19,6 +19,32 @@ const ACTION_TIMEOUT_MS = 10 * 60 * 1000;
 // 环境变量配置（支持多种布尔值写法）
 const HEADLESS = ['true', '1', 'yes'].includes(process.env.PLAYWRIGHT_HEADLESS?.toLowerCase());
 
+// 系统 Chromium 路径：青龙依赖管理安装的 Chromium 不在 Playwright 默认缓存目录，
+// 通过 PLAYWRIGHT_CHROMIUM_PATH 或常见系统路径指定可执行文件位置。
+const CHROMIUM_EXECUTABLE_PATH = resolveChromiumPath();
+
+function resolveChromiumPath() {
+  const fromEnv = process.env.PLAYWRIGHT_CHROMIUM_PATH || process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  if (fromEnv) return fromEnv;
+
+  // Alpine / Debian 系统级 Chromium 常见路径，命中第一个存在的
+  const candidates = [
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/lib/chromium/chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (require('fs').existsSync(candidate)) return candidate;
+    } catch (error) {
+      // 忽略权限或访问错误，继续尝试下一个候选路径
+    }
+  }
+  return undefined; // 回退到 Playwright 自带 Chromium
+}
+
 const CHECKIN_BUTTON_SELECTORS = [
   'button:has-text("立即签到")',
   'button:has-text("今日签到")',
@@ -289,11 +315,19 @@ async function runWithPersistentContext() {
   // Playwright 会把 Cookie、localStorage 等会话状态保存到 PROFILE_DIR。
   // 后续运行复用同一个目录，一般可以直接进入 dashboard 并完成自动化。
   // 使用环境变量 PLAYWRIGHT_HEADLESS=true/1/yes 启用无头模式
-  const browser = await chromium.launchPersistentContext(PROFILE_DIR, {
+  const launchOptions = {
     headless: HEADLESS,
     viewport: VIEWPORT,
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
-  });
+  };
+
+  // 指定系统 Chromium（青龙依赖管理安装的浏览器），避免 Playwright 缓存目录缺失
+  if (CHROMIUM_EXECUTABLE_PATH) {
+    launchOptions.executablePath = CHROMIUM_EXECUTABLE_PATH;
+    log(`使用系统 Chromium: ${CHROMIUM_EXECUTABLE_PATH}`);
+  }
+
+  const browser = await chromium.launchPersistentContext(PROFILE_DIR, launchOptions);
 
   let page;
   try {
