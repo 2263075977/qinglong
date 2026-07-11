@@ -298,14 +298,42 @@ function getUnavailableReason(status) {
 }
 
 function quotaToTimes(quota) {
-  if (typeof quota !== 'number' || !Number.isFinite(quota)) return null;
-  return quota / QUOTA_PER_TIME;
+  const numericQuota = toFiniteNumber(quota);
+  if (numericQuota === null) return null;
+  return numericQuota / QUOTA_PER_TIME;
 }
 
 function describeQuota(quota) {
+  const numericQuota = toFiniteNumber(quota);
   const times = quotaToTimes(quota);
-  if (times === null) return 'unknown';
-  return `${times.toLocaleString('zh-CN')} 次 (${quota.toLocaleString('zh-CN')} 额度)`;
+  if (numericQuota === null || times === null) return '未知奖励';
+  return `${times.toLocaleString('zh-CN')} 次 (${numericQuota.toLocaleString('zh-CN')} 额度)`;
+}
+
+function toFiniteNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return null;
+
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function describeSpinPrize(spinResult) {
+  const quotaCandidates = [
+    spinResult && spinResult.quota,
+    spinResult && spinResult.quota_amount,
+    spinResult && spinResult.data && spinResult.data.quota,
+    spinResult && spinResult.data && spinResult.data.quota_amount,
+  ];
+
+  for (const quota of quotaCandidates) {
+    if (toFiniteNumber(quota) !== null) return describeQuota(quota);
+  }
+
+  const label = spinResult && typeof spinResult.label === 'string'
+    ? spinResult.label.trim()
+    : '';
+  return label || '奖励数据缺失';
 }
 
 async function run() {
@@ -397,9 +425,7 @@ async function run() {
     throw error;
   }
 
-  const prize = spinResult.quota_amount !== undefined
-    ? describeQuota(spinResult.quota_amount)
-    : 'unknown prize';
+  const prize = describeSpinPrize(spinResult);
   const level = spinResult.level !== undefined ? `level ${spinResult.level}` : 'unknown level';
 
   console.log(`[up.x666] 🎉 签到成功!`);
@@ -435,6 +461,7 @@ if (require.main === module) {
 module.exports = {
   SignInError,
   describeQuota,
+  describeSpinPrize,
   getConfig,
   getQinglongNotifyModule,
   getUnavailableReason,
