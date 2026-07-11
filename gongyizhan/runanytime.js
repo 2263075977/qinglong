@@ -6,8 +6,14 @@
  * 环境变量: RUNANYTIME_ACCOUNTS (Cookie)
  */
 
-const axios = require('axios');
 const crypto = require('crypto');
+
+let axiosClient;
+
+function getAxios() {
+  axiosClient ||= require('axios');
+  return axiosClient;
+}
 
 // 配置
 const CONFIG = {
@@ -74,11 +80,22 @@ function solvePow(prefix, difficulty) {
 }
 
 // 响应分析
+function isTurnstileChallenge(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('turnstile')
+    || text.includes('cf-turnstile')
+    || text.includes('人机验证');
+}
+
 function analyzeResponse(data, status) {
   const text = typeof data === 'string' ? data : JSON.stringify(data);
+  const lowerText = text.toLowerCase();
 
-  if (text.includes('<!doctype html>') || text.includes('bot detection')) {
-    return { type: 'auth_failed', message: 'Cookie 已失效或被拦截' };
+  if (lowerText.includes('<!doctype html>') || lowerText.includes('bot detection')) {
+    return {
+      type: 'challenge_required',
+      message: '站点触发浏览器安全验证，当前脚本未执行签到，请先在网页端手动签到',
+    };
   }
 
   try {
@@ -98,6 +115,13 @@ function analyzeResponse(data, status) {
       return { type: 'auth_failed', message: `Cookie 已失效: ${msg}` };
     }
 
+    if (isTurnstileChallenge(msg)) {
+      return {
+        type: 'challenge_required',
+        message: '站点要求浏览器 Turnstile 验证，当前脚本未执行签到，请先在网页端手动签到',
+      };
+    }
+
     return { type: 'error', message: `签到失败: ${msg}` };
   } catch {
     return { type: 'error', message: '无法解析响应' };
@@ -106,7 +130,7 @@ function analyzeResponse(data, status) {
 
 // API 调用
 async function getChallenge(cookie) {
-  const res = await axios.get(`${CONFIG.BASE_URL}/api/user/pow/challenge`, {
+  const res = await getAxios().get(`${CONFIG.BASE_URL}/api/user/pow/challenge`, {
     params: { action: 'checkin' },
     headers: buildHeaders(cookie),
     timeout: CONFIG.TIMEOUT,
@@ -150,7 +174,7 @@ async function getChallenge(cookie) {
 async function postCheckin(cookie, challengeId, nonce) {
   const url = `${CONFIG.BASE_URL}/api/user/checkin?pow_challenge=${encodeURIComponent(challengeId)}&pow_nonce=${encodeURIComponent(nonce)}`;
 
-  const res = await axios.post(url, null, {
+  const res = await getAxios().post(url, null, {
     headers: { ...buildHeaders(cookie), 'Content-Length': '0' },
     timeout: CONFIG.TIMEOUT,
     validateStatus: () => true,
@@ -216,6 +240,8 @@ async function main() {
     notifyContent = `✅ ${result.message} (尝试 ${result.attempts} 次)`;
   } else if (result.type === 'already_checked') {
     notifyContent = '⏭️ 今日已签到';
+  } else if (result.type === 'challenge_required') {
+    notifyContent = `❌ 发生异常：验证阻断：${result.message}`;
   } else {
     notifyContent = `❌ 发生异常：${result.message}`;
   }
@@ -223,9 +249,16 @@ async function main() {
   await sendResult(notify, 'RunAnytime 自动签到', notifyContent);
 }
 
-main().catch(async (err) => {
-  try {
-    await sendResult(getNotify(), 'RunAnytime 自动签到', `❌ 发生异常：执行异常: ${err.message}`);
-  } catch {}
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(async (err) => {
+    try {
+      await sendResult(getNotify(), 'RunAnytime 自动签到', `❌ 发生异常：执行异常: ${err.message}`);
+    } catch {}
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  analyzeResponse,
+  isTurnstileChallenge,
+};

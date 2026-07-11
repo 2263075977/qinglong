@@ -13,6 +13,8 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const TASK_NAME = '黑与白福利站 轻松农场';
 const LOG_PREFIX = '[hybgzs-farm]';
 const FARM_REFERER_PATH = '/entertainment/farm';
+const DEFAULT_ACTION = 'status';
+const FARM_ACTIONS = new Set(['status', 'harvest-all', 'care-all', 'plant-batch', 'auto']);
 const COOKIE_ENV_NAMES = [
   'HYB_FARM_COOKIE',
   'HYB_DASHBOARD_COOKIE',
@@ -104,6 +106,18 @@ function parseBoolean(raw, fallback = false) {
   return ['1', 'true', 'yes', 'y', 'on'].includes(String(raw).trim().toLowerCase());
 }
 
+function normalizeDefaultAction(raw = DEFAULT_ACTION) {
+  const action = String(raw || DEFAULT_ACTION).trim().toLowerCase();
+  if (!FARM_ACTIONS.has(action)) {
+    throw new HybFarmError(
+      `环境变量 HYB_FARM_DEFAULT_ACTION 无效: ${raw}\n` +
+        `允许值: ${[...FARM_ACTIONS].join(', ')}`,
+      { type: 'config_error' }
+    );
+  }
+  return action;
+}
+
 function getCookieFromEnv() {
   for (const envName of COOKIE_ENV_NAMES) {
     const cookie = normalizeCookie(process.env[envName]);
@@ -147,9 +161,9 @@ function getConfig() {
   };
 }
 
-function parseArgs(argv) {
+function parseArgs(argv, defaultAction = DEFAULT_ACTION) {
   const args = {
-    action: 'status',
+    action: normalizeDefaultAction(defaultAction),
     dryRun: false,
     execute: false,
     help: false,
@@ -158,10 +172,9 @@ function parseArgs(argv) {
     seedId: '',
   };
 
-  const actions = new Set(['status', 'harvest-all', 'care-all', 'plant-batch', 'auto']);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (actions.has(arg)) {
+    if (FARM_ACTIONS.has(arg)) {
       args.action = arg;
     } else if (arg === '--help' || arg === '-h') {
       args.help = true;
@@ -235,6 +248,7 @@ function printUsage() {
   HYB_FARM_QUANTITY      可选，默认种植数量
   HYB_FARM_MAX_PLANT     可选，auto 最大补种数量
   HYB_FARM_PLANT_BODY    可选，覆盖 plant-batch JSON 请求体
+  HYB_FARM_DEFAULT_ACTION 可选，无参数运行时的动作，默认 status
   HYB_FARM_AUTO_EXECUTE  可选，设为 1/true 时允许 auto 默认执行
   HYB_FARM_ACCOUNT       可选，通知中展示的账号备注
   HYB_FARM_BASE_URL      可选，默认为 ${DEFAULT_BASE_URL}
@@ -245,8 +259,13 @@ function printUsage() {
   node hyb-farm.js plant-batch --seed-id golden_apple --quantity 16
   node hyb-farm.js auto --seed-id golden_apple --execute
 
+青龙环境变量自动化（任务命令无需追加参数）:
+  HYB_FARM_DEFAULT_ACTION=auto    无参数运行时进入自动流程
+  HYB_FARM_AUTO_EXECUTE=1        允许真实收获、护理和种植；不设置时为 dry-run
+  HYB_FARM_SEED_ID=golden_apple  指定空地默认补种的种子
+
 青龙定时任务:
-  35 8,12,18 * * * node /ql/data/scripts/hyb-farm.js auto --seed-id golden_apple --execute`);
+  35 8,12,18 * * * task 仓库目录/gongyizhan/hyb-farm.js`);
 }
 
 function isQinglongEnvironment() {
@@ -523,6 +542,41 @@ function getNumber(value, fallback = 0) {
   return fallback;
 }
 
+function getExplicitArray(value, keys, predicate) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return [];
+
+  for (const key of keys) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+
+  const nested = value.data;
+  if (Array.isArray(nested)) return nested;
+  if (nested && typeof nested === 'object') {
+    for (const key of keys) {
+      if (Array.isArray(nested[key])) return nested[key];
+    }
+  }
+
+  return getBestArray(value, predicate);
+}
+
+function getSlotCount(value, plantedCount) {
+  const candidates = [
+    value?.maxSlots,
+    value?.data?.maxSlots,
+    value?.totalSlots,
+    value?.data?.totalSlots,
+    value?.baseSlots,
+    value?.data?.baseSlots,
+  ];
+  for (const candidate of candidates) {
+    const count = getNumber(candidate, null);
+    if (count !== null && count >= plantedCount) return Math.trunc(count);
+  }
+  return plantedCount;
+}
+
 function findArrays(value, predicate, results = []) {
   if (!value || typeof value !== 'object') return results;
   if (Array.isArray(value)) {
@@ -562,26 +616,37 @@ function isEmptyPlot(plot) {
   return 'plotId' in plot || 'plot_id' in plot || 'plotIndex' in plot;
 }
 
-function isMaturePlot(plot) {
+function isMaturePlot(plot, nowMs = Date.now()) {
   if (!plot || typeof plot !== 'object') return false;
   const status = String(plot.status || plot.state || '').toLowerCase();
-  return plot.isMature === true || plot.ready === true || plot.canHarvest === true ||
-    status === 'mature' || status === 'ready' || status === 'harvestable' || status.includes('成熟');
+  if (
+    plot.isMature === true || plot.ready === true || plot.canHarvest === true ||
+    status === 'mature' || status === 'ready' || status === 'harvestable' || status.includes('成熟')
+  ) {
+    return true;
+  }
+
+  const maturesAt = plot.maturesAt ?? plot.matureAt ?? plot.harvestAt;
+  if (maturesAt === undefined || maturesAt === null || maturesAt === '') return false;
+  let timestamp = typeof maturesAt === 'number' ? maturesAt : Date.parse(String(maturesAt));
+  if (Number.isFinite(timestamp) && timestamp > 0 && timestamp < 1e12) timestamp *= 1000;
+  return Number.isFinite(timestamp) && timestamp <= nowMs;
 }
 
 function isNeedsCarePlot(plot) {
   if (!plot || typeof plot !== 'object') return false;
   const status = String(plot.status || plot.state || '').toLowerCase();
-  return plot.needsWater === true || plot.needWater === true ||
+  return (Array.isArray(plot.conditions) && plot.conditions.length > 0) ||
+    plot.needsWater === true || plot.needWater === true ||
     plot.needsWeed === true || plot.hasWeed === true ||
     plot.needsPest === true || plot.hasPest === true ||
     plot.needsCare === true || status.includes('water') ||
     status.includes('weed') || status.includes('pest') || status.includes('护理');
 }
 
-function isGrowingPlot(plot) {
+function isGrowingPlot(plot, nowMs = Date.now()) {
   if (!plot || typeof plot !== 'object') return false;
-  if (isEmptyPlot(plot) || isMaturePlot(plot)) return false;
+  if (isEmptyPlot(plot) || isMaturePlot(plot, nowMs)) return false;
   return Boolean(plot.crop || plot.cropId || plot.seedId || plot.plantedAt || plot.growing === true);
 }
 
@@ -590,7 +655,7 @@ function getItemId(item) {
 }
 
 function getItemName(item) {
-  return item?.name || item?.displayName || item?.title || getItemId(item);
+  return item?.name || item?.seedName || item?.cropName || item?.displayName || item?.title || getItemId(item);
 }
 
 function getQuantity(item) {
@@ -611,7 +676,7 @@ async function fetchState(config) {
     try {
       const result = await requestJson(config, apiPath);
       assertSuccess(result, `获取 ${key} 失败`);
-      state[key] = getData(result);
+      state[key] = result;
     } catch (error) {
       if (key === 'energy') {
         state[key] = { unavailable: true, error: error.message };
@@ -624,32 +689,85 @@ async function fetchState(config) {
   return state;
 }
 
-function summarizeState(state) {
-  const plots = getBestArray(state.crops, isPlotLike);
-  const seeds = getBestArray(state.seeds, isSeedLike);
-  const inventory = getBestArray(state.inventory, isInventoryLike);
+function summarizeState(state, nowMs = Date.now()) {
+  const cropItems = getExplicitArray(state.crops, ['crops', 'plots'], isPlotLike);
+  const plots = cropItems.filter((plot) => !isEmptyPlot(plot));
+  const seeds = getExplicitArray(state.seeds, ['seeds'], isSeedLike);
+  const inventory = getExplicitArray(state.inventory, ['inventory', 'items'], isInventoryLike);
+  const totalSlots = getSlotCount(state.crops, plots.length);
   const plotSummary = {
-    total: plots.length,
-    mature: plots.filter(isMaturePlot).length,
-    empty: plots.filter(isEmptyPlot).length,
+    total: totalSlots,
+    mature: plots.filter((plot) => isMaturePlot(plot, nowMs)).length,
+    empty: Math.max(0, totalSlots - plots.length),
     needsCare: plots.filter(isNeedsCarePlot).length,
-    growing: plots.filter(isGrowingPlot).length,
+    growing: plots.filter((plot) => isGrowingPlot(plot, nowMs)).length,
   };
-  const topSeeds = seeds
-    .map((item) => ({ id: getItemId(item), name: getItemName(item), quantity: getQuantity(item) }))
+
+  const seedCatalog = new Map();
+  for (const item of seeds) {
+    const id = String(item?.id || item?.seedId || getItemId(item));
+    if (id && id !== 'unknown') seedCatalog.set(id, item);
+  }
+
+  const seedStockById = {};
+  for (const item of inventory) {
+    if (typeof item?.seedId !== 'string' || !item.seedId.trim()) continue;
+    const id = item.seedId.trim();
+    seedStockById[id] = (seedStockById[id] || 0) + getQuantity(item);
+  }
+
+  const seedSources = seeds.length
+    ? seeds
+    : inventory.filter((item) => typeof item?.seedId === 'string' && item.seedId.trim());
+  const topSeeds = seedSources
+    .map((item) => {
+      const id = String(item?.id || item?.seedId || getItemId(item));
+      return {
+        id,
+        name: getItemName(seedCatalog.get(id) || item),
+        quantity: seedStockById[id] || 0,
+      };
+    })
     .filter((item) => item.quantity > 0)
     .sort((left, right) => right.quantity - left.quantity)
     .slice(0, 8);
   const topInventory = inventory
-    .map((item) => ({ id: getItemId(item), name: getItemName(item), quantity: getQuantity(item) }))
+    .map((item) => {
+      const id = String(getItemId(item));
+      const catalogItem = typeof item?.seedId === 'string' ? seedCatalog.get(item.seedId) : null;
+      return { id, name: getItemName(catalogItem || item), quantity: getQuantity(item) };
+    })
     .filter((item) => item.quantity > 0)
     .sort((left, right) => right.quantity - left.quantity)
     .slice(0, 8);
-  const energy = state.energy && !state.energy.unavailable
-    ? getNumber(state.energy.energy ?? state.energy.current ?? state.energy.value, null)
-    : null;
 
-  return { energy, inventory: topInventory, plots, plotSummary, seeds: topSeeds };
+  let energy = null;
+  let energyMax = null;
+  let energyError = '';
+  if (state.energy?.unavailable) {
+    energyError = state.energy.error || '体力接口请求失败';
+  } else if (state.energy && typeof state.energy === 'object') {
+    const energyData = getData(state.energy);
+    energy = getNumber(
+      energyData?.currentEnergy ?? energyData?.energy ?? energyData?.current ?? energyData?.value,
+      null
+    );
+    energyMax = getNumber(energyData?.maxEnergy ?? energyData?.maximum ?? energyData?.max, null);
+    if (energy === null) energyError = '接口响应缺少 currentEnergy 字段';
+  } else {
+    energyError = '体力接口没有返回可识别数据';
+  }
+
+  return {
+    energy,
+    energyError,
+    energyMax,
+    inventory: topInventory,
+    plots,
+    plotSummary,
+    seedStockById,
+    seeds: topSeeds,
+  };
 }
 
 function formatItems(items) {
@@ -659,10 +777,15 @@ function formatItems(items) {
 
 function formatStatus(config, state) {
   const summary = summarizeState(state);
+  const energyText = summary.energy === null
+    ? `不可用（${summary.energyError || '未知原因'}）`
+    : summary.energyMax === null
+      ? String(summary.energy)
+      : `${summary.energy}/${summary.energyMax}`;
   const lines = [
     `账号: ${config.accountName || '当前账号'}`,
     `地块: 共 ${summary.plotSummary.total}，成熟 ${summary.plotSummary.mature}，空闲 ${summary.plotSummary.empty}，需护理 ${summary.plotSummary.needsCare}，生长中 ${summary.plotSummary.growing}`,
-    `体力: ${summary.energy === null ? '未知或接口不可用' : summary.energy}`,
+    `体力: ${energyText}`,
     `可用种子: ${formatItems(summary.seeds)}`,
     `仓库库存: ${formatItems(summary.inventory)}`,
   ];
@@ -683,16 +806,25 @@ function buildPlantBody(config, args, summary = null) {
     throw new HybFarmError('缺少种子 ID，请设置 --seed-id 或 HYB_FARM_SEED_ID', { type: 'config_error' });
   }
 
-  let quantity = args.quantity || config.defaultQuantity;
+  let quantity = args.quantity ?? config.defaultQuantity ?? null;
   if (quantity === null && summary) quantity = summary.plotSummary.empty;
   if (quantity === null) {
     throw new HybFarmError('缺少种植数量，请设置 --quantity 或 HYB_FARM_QUANTITY', { type: 'config_error' });
   }
 
-  const maxPlant = args.maxPlant || config.maxPlant;
+  if (summary) quantity = Math.min(quantity, summary.plotSummary.empty);
+
+  const maxPlant = args.maxPlant ?? config.maxPlant ?? null;
   if (maxPlant !== null) quantity = Math.min(quantity, maxPlant);
+  if (summary) {
+    const available = getNumber(summary.seedStockById?.[seedId], 0);
+    if (available <= 0) {
+      throw new HybFarmError(`种子 ${seedId} 库存不足，已跳过补种`, { type: 'skipped' });
+    }
+    quantity = Math.min(quantity, available);
+  }
   if (!Number.isFinite(quantity) || quantity <= 0) {
-    throw new HybFarmError(`种植数量无效: ${quantity}`, { type: 'config_error' });
+    throw new HybFarmError('没有可补种的空地或可用种子', { type: 'skipped' });
   }
 
   return { seedId, quantity };
@@ -716,6 +848,9 @@ function isFailureResult(result) {
 
 function resultFromError(action, error) {
   const message = error instanceof HybFarmError ? error.message : String(error);
+  if (error instanceof HybFarmError && error.type === 'skipped') {
+    return makeResult(action, 'skipped', message);
+  }
   if (error instanceof HybFarmError && error.type === 'auth_failed') {
     return makeResult(action, 'auth_failed', `${action}失败: Cookie 已失效或未登录，请更新 Cookie`);
   }
@@ -794,7 +929,7 @@ async function runAuto(config, args) {
 
   const latestState = dryRun ? initialState : await fetchState(config);
   const latestSummary = summarizeState(latestState);
-  if (latestSummary.plotSummary.empty > 0 || args.quantity || config.defaultQuantity || config.plantBodyRaw) {
+  if (latestSummary.plotSummary.empty > 0) {
     try {
       const body = buildPlantBody(config, args, latestSummary);
       if (body.quantity > 0) {
@@ -833,7 +968,9 @@ function formatSummary(config, state, results = [], statusOnly = false) {
 }
 
 async function run() {
-  const args = parseArgs(process.argv.slice(2));
+  loadDotEnv();
+  const defaultAction = normalizeDefaultAction(process.env.HYB_FARM_DEFAULT_ACTION || DEFAULT_ACTION);
+  const args = parseArgs(process.argv.slice(2), defaultAction);
   if (args.help) {
     printUsage();
     return;
@@ -920,6 +1057,7 @@ module.exports = {
   getConfig,
   normalizeBaseUrl,
   normalizeCookie,
+  normalizeDefaultAction,
   parseArgs,
   performCareAll,
   performHarvestAll,
