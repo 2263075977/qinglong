@@ -8,8 +8,10 @@
  *   RUNANYTIME_ACCOUNTS="完整 Cookie 字符串"
  *
  * 可选环境变量:
+ *   RUNANYTIME_USER_ID=8514
  *   RUNANYTIME_BROWSER_HEADLESS=true
  *   RUNANYTIME_BROWSER_TIMEOUT_MS=90000
+ *   RUNANYTIME_BROWSER_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
  *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
  */
 
@@ -19,6 +21,7 @@ const TASK_TITLE = 'RunAnytime 浏览器签到';
 const SITE_URL = 'https://runanytime.hxi.me';
 const PERSONAL_URL = `${SITE_URL}/console/personal`;
 const COOKIE_ENV = 'RUNANYTIME_ACCOUNTS';
+const DEFAULT_USER_ID = '8514';
 const DEFAULT_TIMEOUT_MS = 90000;
 const CHROMIUM_CANDIDATES = [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -90,6 +93,14 @@ function parsePositiveInteger(value, fallback) {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
+function normalizeUserId(value, fallback = DEFAULT_USER_ID) {
+  const userId = String(value || fallback).trim();
+  if (!/^\d+$/.test(userId) || userId === '0') {
+    throw new RunAnytimeBrowserError('config_error', `RUNANYTIME_USER_ID 无效: ${userId}`);
+  }
+  return userId;
+}
+
 function resolveChromiumExecutable(explicitPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
   if (explicitPath?.trim()) {
     const executablePath = explicitPath.trim();
@@ -139,12 +150,52 @@ async function readPageState(page) {
   const checkinButton = page.getByRole('button', { name: '立即签到', exact: true });
   if (await checkinButton.count() === 1) return { type: 'checkin_available', button: checkinButton };
 
-  const loginLink = page.getByRole('link', { name: '登录', exact: true });
-  if (/\/login(?:[/?#]|$)/i.test(page.url()) || await loginLink.count() === 1) {
+  if (/\/login(?:[/?#]|$)/i.test(page.url())) {
     return { type: 'auth_failed' };
   }
 
   return { type: 'unknown' };
+}
+
+async function waitForPageState(page, timeoutMs) {
+  const deadline = Date.now() + Math.min(timeoutMs, 20000);
+  let state = await readPageState(page);
+
+  while (state.type === 'unknown' && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    state = await readPageState(page);
+  }
+
+  return state;
+}
+
+async function verifySession(page) {
+  return page.evaluate(async () => {
+    try {
+      const response = await fetch('/api/user/self', {
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      });
+      const payload = await response.json().catch(() => null);
+      const message = typeof payload?.message === 'string' ? payload.message : '';
+      const lowerMessage = message.toLowerCase();
+      const authFailed = response.status === 401
+        || response.status === 403
+        || lowerMessage.includes('unauthorized')
+        || lowerMessage.includes('forbidden')
+        || lowerMessage.includes('not login')
+        || message.includes('未登录')
+        || message.includes('无权');
+
+      return {
+        authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
+        authFailed,
+        status: response.status,
+      };
+    } catch {
+      return { authenticated: false, authFailed: false, status: 0 };
+    }
+  });
 }
 
 async function runBrowserCheckin(config) {
@@ -161,10 +212,28 @@ async function runBrowserCheckin(config) {
 
   try {
     browser = await chromium.launch(launchOptions);
-    context = await browser.newContext({
+    const contextOptions = {
       locale: 'zh-CN',
       timezoneId: 'Asia/Shanghai',
       viewport: { width: 1365, height: 900 },
+    };
+    if (config.userAgent) contextOptions.userAgent = config.userAgent;
+
+    context = await browser.newContext(contextOptions);
+    await context.setExtraHTTPHeaders({ 'New-Api-User': config.userId });
+    await context.addInitScript(({ siteOrigin, user }) => {
+      if (window.location.origin === siteOrigin) {
+        window.localStorage.setItem('user', JSON.stringify(user));
+      }
+    }, {
+      siteOrigin: SITE_URL,
+      user: {
+        id: Number(config.userId),
+        username: `user_${config.userId}`,
+        role: 1,
+        status: 1,
+        group: 'default',
+      },
     });
     await context.addCookies(config.cookies);
 
@@ -172,7 +241,18 @@ async function runBrowserCheckin(config) {
     page.setDefaultTimeout(config.timeoutMs);
     await page.goto(PERSONAL_URL, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs });
 
-    const initialState = await readPageState(page);
+    const sessionState = await verifySession(page);
+    if (sessionState.authFailed) {
+      return { type: 'auth_failed', message: 'Cookie 已失效，用户信息接口要求重新登录' };
+    }
+    if (!sessionState.authenticated) {
+      return {
+        type: 'network_error',
+        message: `无法确认登录状态，用户信息接口 HTTP ${sessionState.status || '未知'}`,
+      };
+    }
+
+    const initialState = await waitForPageState(page, config.timeoutMs);
     if (initialState.type === 'already_checked') {
       return { type: 'already_checked', message: '今日已签到' };
     }
@@ -239,6 +319,8 @@ function printHelp() {
 可选环境变量:
   RUNANYTIME_BROWSER_HEADLESS      true/false，默认 true
   RUNANYTIME_BROWSER_TIMEOUT_MS    页面和签到超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
+  RUNANYTIME_USER_ID               New API 用户 ID，默认 ${DEFAULT_USER_ID}
+  RUNANYTIME_BROWSER_USER_AGENT    获取 Cookie 时浏览器的完整 User-Agent
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
 
 说明:
@@ -265,6 +347,8 @@ async function main() {
       cookies: parseCookieHeader(rawCookie),
       executablePath: resolveChromiumExecutable(),
       headless: parseBoolean(process.env.RUNANYTIME_BROWSER_HEADLESS, true),
+      userAgent: process.env.RUNANYTIME_BROWSER_USER_AGENT?.trim() || '',
+      userId: normalizeUserId(process.env.RUNANYTIME_USER_ID),
       timeoutMs: parsePositiveInteger(
         process.env.RUNANYTIME_BROWSER_TIMEOUT_MS,
         DEFAULT_TIMEOUT_MS
@@ -292,9 +376,11 @@ module.exports = {
   RunAnytimeBrowserError,
   formatResult,
   normalizeCookie,
+  normalizeUserId,
   parseBoolean,
   parseCookieHeader,
   parsePositiveInteger,
   resolveChromiumExecutable,
   runBrowserCheckin,
+  verifySession,
 };

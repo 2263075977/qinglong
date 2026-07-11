@@ -12,15 +12,18 @@
   JIANZHILE_USER_ID   可选，无法从 session 自动解析时填写
   JIANZHILE_URL       可选，默认 https://jianzhile.vip
   JIANZHILE_RETRIES   可选，验证码最大尝试次数，默认 2，最大 3
+  JIANZHILE_CODE_LEN  可选，验证码位数，默认 4
 """
 
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -259,22 +262,76 @@ def parse_json(text: str) -> dict[str, Any]:
         return {"message": text[:200]}
 
 
-def create_ocr() -> Any:
+def create_ocr() -> list[Any]:
     try:
         import ddddocr  # type: ignore
     except ImportError as error:
         raise CheckinError(
             "缺少 ddddocr，请先在青龙依赖管理中安装 Python3 依赖 ddddocr"
         ) from error
-    return ddddocr.DdddOcr(show_ad=False)
+    models = [ddddocr.DdddOcr(show_ad=False)]
+    try:
+        models.append(ddddocr.DdddOcr(show_ad=False, beta=True))
+    except (TypeError, ValueError):
+        # 兼容不支持 beta 参数的旧版 ddddocr。
+        pass
+    return models
 
 
-def recognize_captcha(ocr: Any, image: bytes) -> str:
-    raw = str(ocr.classification(image) or "").upper()
-    answer = re.sub(r"[^A-Z0-9]", "", raw)
-    if not re.fullmatch(r"[A-Z0-9]{4,8}", answer):
-        raise CheckinError(f"OCR 结果格式异常: {answer or '空'}")
-    return answer
+def captcha_variants(image: bytes) -> list[bytes]:
+    variants = [image]
+    try:
+        from PIL import Image, ImageEnhance, ImageFilter, ImageOps  # type: ignore
+
+        with Image.open(io.BytesIO(image)) as source:
+            rgb = Image.new("RGB", source.size, "white")
+            if source.mode == "RGBA":
+                rgb.paste(source, mask=source.getchannel("A"))
+            else:
+                rgb.paste(source.convert("RGB"))
+            enlarged = rgb.resize(
+                (rgb.width * 4, rgb.height * 4), Image.Resampling.LANCZOS
+            )
+            grayscale = ImageOps.autocontrast(enlarged.convert("L"))
+            sharpened = ImageEnhance.Contrast(
+                grayscale.filter(ImageFilter.MedianFilter(size=3))
+            ).enhance(2.0)
+            images = [enlarged, grayscale, sharpened]
+            for threshold in (110, 140, 170, 200):
+                images.append(
+                    grayscale.point(lambda value, level=threshold: 255 if value > level else 0)
+                )
+            for candidate in images:
+                output = io.BytesIO()
+                candidate.save(output, format="PNG")
+                variants.append(output.getvalue())
+    except (ImportError, OSError, ValueError):
+        pass
+    return variants
+
+
+def recognize_captcha(models: list[Any], image: bytes, expected_length: int) -> str:
+    readings: list[str] = []
+    variants = captcha_variants(image)
+    for model in models:
+        for variant in variants:
+            try:
+                raw = str(model.classification(variant) or "").upper()
+            except Exception:
+                continue
+            answer = re.sub(r"[^A-Z0-9]", "", raw)
+            if answer:
+                readings.append(answer)
+
+    valid = [
+        reading
+        for reading in readings
+        if re.fullmatch(rf"[A-Z0-9]{{{expected_length}}}", reading)
+    ]
+    if not valid:
+        summary = ", ".join(dict.fromkeys(readings)) or "空"
+        raise CheckinError(f"OCR 未识别出 {expected_length} 位验证码: {summary}")
+    return Counter(valid).most_common(1)[0][0]
 
 
 def already_checked_in(message: str) -> bool:
@@ -303,6 +360,7 @@ def run() -> int:
     user_id_text = env_text("JIANZHILE_USER_ID")
     user_id = int(user_id_text) if user_id_text else None
     retries = min(max(int(env_text("JIANZHILE_RETRIES", "2")), 1), 3)
+    code_length = min(max(int(env_text("JIANZHILE_CODE_LEN", "4")), 3), 8)
     client = JianzhileClient(env_text("JIANZHILE_URL", DEFAULT_URL), cookie, user_id)
 
     resolved_user_id = client.resolve_user_id()
@@ -322,11 +380,18 @@ def run() -> int:
         raise CheckinError(result.get("message") or "签到失败")
 
     # 先加载模型，再获取验证码，缩短 captcha_id 的存活时间消耗。
-    ocr = create_ocr()
+    ocr_models = create_ocr()
     last_message = "验证码识别失败"
     for attempt in range(1, retries + 1):
         captcha_id, image = client.fetch_captcha()
-        answer = recognize_captcha(ocr, image)
+        try:
+            answer = recognize_captcha(ocr_models, image, code_length)
+        except CheckinError as error:
+            last_message = str(error)
+            if attempt >= retries:
+                break
+            print(f"[简直了] 第 {attempt} 张验证码识别失败，重新获取验证码")
+            continue
         result = client.submit_checkin(captcha_id, answer)
         message = str(result.get("message") or "签到失败")
         if result.get("success"):
