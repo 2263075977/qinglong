@@ -1,4 +1,0 @@
-{"_example": "Fill with {\"file\": \"path\", \"reason\": \"why\"}. Seed rows are skipped."}
-{"file": ".trellis/spec/backend/index.md", "reason": "Backend coding standards"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Logging best practices"}
-{"file": "gongyizhan/hyb-dashboard.js", "reason": "Target file for CAP verification implementation"}
