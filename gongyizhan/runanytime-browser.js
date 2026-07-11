@@ -101,6 +101,20 @@ function normalizeUserId(value, fallback = DEFAULT_USER_ID) {
   return userId;
 }
 
+function validateDisplayAvailability(
+  headless,
+  platform = process.platform,
+  env = process.env
+) {
+  if (!headless && platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
+    throw new RunAnytimeBrowserError(
+      'config_error',
+      '有头模式需要 X Server；请设置 RUNANYTIME_BROWSER_HEADLESS=true，'
+        + '或使用 xvfb-run -a node gongyizhan/runanytime-browser.js'
+    );
+  }
+}
+
 function resolveChromiumExecutable(explicitPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
   if (explicitPath?.trim()) {
     const executablePath = explicitPath.trim();
@@ -354,6 +368,7 @@ async function main() {
         DEFAULT_TIMEOUT_MS
       ),
     };
+    validateDisplayAvailability(config.headless);
   } catch (error) {
     await sendResult(TASK_TITLE, `❌ 发生异常：${error.message}`);
     process.exitCode = 1;
@@ -382,5 +397,6 @@ module.exports = {
   parsePositiveInteger,
   resolveChromiumExecutable,
   runBrowserCheckin,
+  validateDisplayAvailability,
   verifySession,
 };
