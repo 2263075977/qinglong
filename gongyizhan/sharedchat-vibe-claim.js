@@ -1,0 +1,521 @@
+#!/usr/bin/env node
+/**
+ * cron: 5 0 * * *
+ * new Env('SharedChat Vibe Code 权益领取');
+ *
+ * 必填环境变量:
+ *   SHAREDCHAT_COOKIE="完整 Cookie 字符串"
+ *
+ * 可选环境变量:
+ *   SHAREDCHAT_CLAIM_REASON_PREFIX="用于学习 Codex 编程并完成个人项目"
+ *   SHAREDCHAT_TIMEOUT_MS=60000
+ *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+ */
+
+'use strict';
+
+const fs = require('node:fs');
+const { chromium } = require('playwright');
+
+const SITE_URL = 'https://new.sharedchat.cc';
+const DASHBOARD_URL = `${SITE_URL}/list/#/vibe-code/dashboard`;
+const QUOTA_PATH = '/frontend-api/vibe-code/quota';
+const CLAIM_PATH = '/frontend-api/vibe-code/codex/claim';
+const TASK_TITLE = 'SharedChat Vibe Code 权益领取';
+const LOG_PREFIX = '[sharedchat-vibe]';
+const DEFAULT_TIMEOUT_MS = 60000;
+const DEFAULT_REASON_PREFIX = '用于每日学习 Codex 编程并完成个人项目';
+const CHROMIUM_CANDIDATES = [
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/opt/google/chrome/chrome',
+];
+
+class SharedChatClaimError extends Error {
+  constructor(type, message) {
+    super(message);
+    this.name = 'SharedChatClaimError';
+    this.type = type;
+  }
+}
+
+function log(message) {
+  console.log(`${LOG_PREFIX} ${message}`);
+}
+
+function parsePositiveInteger(value, fallback) {
+  const number = Number.parseInt(String(value || ''), 10);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function normalizeCookie(cookie) {
+  return String(cookie || '')
+    .trim()
+    .replace(/^cookie\s*:\s*/i, '')
+    .replace(/[\r\n]+/g, '')
+    .replace(/;\s*/g, '; ');
+}
+
+function parseCookieHeader(cookie) {
+  const normalized = normalizeCookie(cookie);
+  const cookies = [];
+
+  for (const pair of normalized.split(';')) {
+    const item = pair.trim();
+    if (!item) continue;
+
+    const separator = item.indexOf('=');
+    if (separator <= 0) continue;
+
+    const name = item.slice(0, separator).trim();
+    const value = item.slice(separator + 1).trim();
+    if (!name) continue;
+
+    cookies.push({
+      name,
+      value,
+      domain: 'new.sharedchat.cc',
+      path: '/',
+      secure: true,
+      sameSite: 'Lax',
+    });
+  }
+
+  if (cookies.length === 0) {
+    throw new SharedChatClaimError('config_error', 'SHAREDCHAT_COOKIE 格式无效，未解析到 Cookie');
+  }
+
+  return cookies;
+}
+
+function shanghaiDateStamp(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+function buildClaimReason(prefix = DEFAULT_REASON_PREFIX, date = new Date()) {
+  const normalizedPrefix = String(prefix || DEFAULT_REASON_PREFIX).trim() || DEFAULT_REASON_PREFIX;
+  const reason = `${normalizedPrefix}，领取日期 ${shanghaiDateStamp(date)}`;
+
+  if (reason.length < 10) {
+    throw new SharedChatClaimError('config_error', '领取原因不能少于 10 个字');
+  }
+
+  return reason;
+}
+
+function resolveChromiumExecutable(explicitPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+  if (explicitPath?.trim()) {
+    const executablePath = explicitPath.trim();
+    if (!fs.existsSync(executablePath)) {
+      throw new SharedChatClaimError(
+        'config_error',
+        `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH 不存在: ${executablePath}`
+      );
+    }
+    return executablePath;
+  }
+
+  return CHROMIUM_CANDIDATES.find(candidate => fs.existsSync(candidate));
+}
+
+function extractMessage(payload) {
+  return typeof payload?.message === 'string' && payload.message.trim()
+    ? payload.message.trim()
+    : typeof payload?.msg === 'string' && payload.msg.trim()
+      ? payload.msg.trim()
+      : typeof payload?.data?.message === 'string' && payload.data.message.trim()
+        ? payload.data.message.trim()
+        : '';
+}
+
+function isAuthMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('unauthorized')
+    || text.includes('forbidden')
+    || text.includes('not login')
+    || text.includes('not logged')
+    || text.includes('expired')
+    || text.includes('未登录')
+    || text.includes('登录失效')
+    || text.includes('请登录')
+    || text.includes('无权限');
+}
+
+function isAlreadyClaimedMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('already claimed')
+    || text.includes('already subscribed')
+    || text.includes('今日已领取')
+    || text.includes('今天已领取')
+    || text.includes('已经领取')
+    || text.includes('已领取')
+    || text.includes('权益已生效');
+}
+
+function getCodexQuota(payload) {
+  const data = payload?.code === 1 && payload?.data ? payload.data : payload;
+  return data?.codex && typeof data.codex === 'object' ? data.codex : null;
+}
+
+function analyzeQuotaResponse(status, payload) {
+  const message = extractMessage(payload);
+
+  if (status === 401 || status === 403 || isAuthMessage(message)) {
+    return { type: 'auth_failed', message: 'Cookie 已失效或登录状态无效' };
+  }
+
+  const codex = getCodexQuota(payload);
+  if (!codex) {
+    return { type: 'schema_changed', message: '配额接口响应结构已变化' };
+  }
+
+  if (codex.isAuth === false) {
+    return { type: 'auth_failed', message: '当前账号无 Codex 权限或登录状态无效' };
+  }
+
+  const subscription = codex.subscriptions;
+  if (subscription && subscription.isActive === true) {
+    return {
+      type: 'already_claimed',
+      message: '今日权益已领取，Codex 套餐生效中',
+      packageName: subscription.subTypeName || '',
+      resetTime: subscription.periodResetTime || '',
+    };
+  }
+
+  return { type: 'claimable', message: '当前没有生效中的 Codex 权益' };
+}
+
+function analyzeClaimResponse(status, payload) {
+  const message = extractMessage(payload);
+
+  if (status === 401 || status === 403 || isAuthMessage(message)) {
+    return { type: 'auth_failed', message: 'Cookie 已失效或登录状态无效' };
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return { type: 'schema_changed', message: '领取接口未返回有效 JSON' };
+  }
+
+  if (payload.code !== 1 || !payload.data || typeof payload.data !== 'object') {
+    return {
+      type: 'error',
+      message: message || `领取失败: HTTP ${status}`,
+    };
+  }
+
+  if (payload.data.claimed === true) {
+    return { type: 'success', message: message || payload.data.message || '领取成功' };
+  }
+
+  if (payload.data.subscribed === true) {
+    return { type: 'already_claimed', message: message || payload.data.message || '权益已生效' };
+  }
+
+  if (isAlreadyClaimedMessage(message)) {
+    return { type: 'already_claimed', message: '今日权益已领取' };
+  }
+
+  const lowerMessage = message.toLowerCase();
+  if (lowerMessage.includes('fingerprint') || message.includes('浏览器') || message.includes('验证')) {
+    return { type: 'challenge_required', message: '浏览器指纹或验证未通过，请手动领取' };
+  }
+
+  return { type: 'error', message: message || '领取失败，接口未确认领取结果' };
+}
+
+async function notify(title, content) {
+  try {
+    const mod = require('./sendNotify');
+    const sendNotify = typeof mod === 'function'
+      ? mod
+      : typeof mod?.sendNotify === 'function'
+        ? mod.sendNotify
+        : typeof mod?.default === 'function'
+          ? mod.default
+          : null;
+
+    if (sendNotify) {
+      await Promise.resolve(sendNotify(title, content));
+      return true;
+    }
+  } catch (error) {
+    console.error(`${LOG_PREFIX} 青龙通知发送失败: ${error.message}`);
+  }
+
+  console.log(`\n${title}\n${content}`);
+  return false;
+}
+
+async function fetchJsonInPage(page, path, options = {}) {
+  const result = await page.evaluate(async ({ requestPath, requestOptions }) => {
+    try {
+      const response = await fetch(requestPath, {
+        method: requestOptions.method || 'GET',
+        credentials: 'include',
+        headers: {
+          Accept: 'application/json',
+          ...(requestOptions.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: requestOptions.body ? JSON.stringify(requestOptions.body) : undefined,
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
+      return { ok: response.ok, status: response.status, json };
+    } catch (error) {
+      return { ok: false, status: 0, json: null, networkError: error.message || String(error) };
+    }
+  }, { requestPath: path, requestOptions: options });
+
+  if (result.networkError) {
+    throw new SharedChatClaimError('network_error', '请求站点接口失败');
+  }
+
+  return result;
+}
+
+async function detectBlockingPage(page) {
+  const currentUrl = page.url();
+  if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
+    throw new SharedChatClaimError('auth_failed', 'Cookie 已失效，页面已跳转到登录入口');
+  }
+
+  const state = await page.evaluate(() => {
+    const title = document.title || '';
+    const text = (document.body?.innerText || '').slice(0, 5000);
+    return { title, text };
+  });
+  const content = `${state.title}\n${state.text}`.toLowerCase();
+  const challengeMarkers = [
+    'cf-chl-',
+    'cloudflare',
+    'turnstile',
+    'captcha',
+    'verify you are human',
+    '人机验证',
+    '安全验证',
+  ];
+
+  if (challengeMarkers.some(marker => content.includes(marker))) {
+    throw new SharedChatClaimError('challenge_required', '页面要求人工完成浏览器验证');
+  }
+}
+
+async function clickClaimThroughUi(page, reason, timeoutMs) {
+  const claimButton = page.getByRole('button', { name: '领取 Codex 权益', exact: true });
+  try {
+    await claimButton.waitFor({ state: 'visible', timeout: timeoutMs });
+  } catch {
+    throw new SharedChatClaimError('schema_changed', '未找到可见的“领取 Codex 权益”按钮');
+  }
+
+  if (await claimButton.count() !== 1) {
+    throw new SharedChatClaimError('schema_changed', '未找到唯一的“领取 Codex 权益”按钮');
+  }
+
+  await claimButton.click();
+
+  const reasonInput = page.locator('.el-message-box textarea');
+  await reasonInput.waitFor({ state: 'visible', timeout: timeoutMs });
+  if (await reasonInput.count() !== 1) {
+    throw new SharedChatClaimError('schema_changed', '领取原因输入框结构已变化');
+  }
+  await reasonInput.fill(reason);
+
+  const confirmButton = page.locator('.el-message-box__btns button').filter({ hasText: '领取' });
+  if (await confirmButton.count() !== 1) {
+    throw new SharedChatClaimError('schema_changed', '领取确认按钮结构已变化');
+  }
+
+  const responsePromise = page.waitForResponse(
+    response => response.url().includes(CLAIM_PATH) && response.request().method() === 'POST',
+    { timeout: timeoutMs }
+  );
+  await confirmButton.click();
+
+  let response;
+  try {
+    response = await responsePromise;
+  } catch {
+    throw new SharedChatClaimError(
+      'challenge_required',
+      '未捕获领取响应，浏览器指纹采集可能失败，请手动检查'
+    );
+  }
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {}
+
+  return analyzeClaimResponse(response.status(), payload);
+}
+
+function formatResult(result) {
+  if (result.type === 'success') {
+    return `✅ ${result.message}`;
+  }
+
+  if (result.type === 'already_claimed') {
+    const packageText = result.packageName ? `\n套餐: ${result.packageName}` : '';
+    const resetText = result.resetTime
+      ? `\n下次重置: ${new Date(result.resetTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
+      : '';
+    return `⏭️ ${result.message}${packageText}${resetText}`;
+  }
+
+  return `❌ 发生异常：${result.message}`;
+}
+
+async function runClaim(config) {
+  const launchOptions = {
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  };
+  if (config.executablePath) launchOptions.executablePath = config.executablePath;
+
+  let browser;
+  let context;
+  let page;
+
+  try {
+    browser = await chromium.launch(launchOptions);
+    context = await browser.newContext({
+      locale: 'zh-CN',
+      timezoneId: 'Asia/Shanghai',
+      viewport: { width: 1365, height: 900 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+        + '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+    });
+    await context.addCookies(config.cookies);
+
+    page = await context.newPage();
+    page.setDefaultTimeout(config.timeoutMs);
+    await page.goto(DASHBOARD_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.timeoutMs,
+    });
+    await detectBlockingPage(page);
+
+    const quotaBefore = await fetchJsonInPage(page, QUOTA_PATH);
+    const quotaState = analyzeQuotaResponse(quotaBefore.status, quotaBefore.json);
+    if (quotaState.type !== 'claimable') return quotaState;
+
+    log('当前未检测到生效权益，准备通过页面领取');
+    const claimResult = await clickClaimThroughUi(page, config.reason, config.timeoutMs);
+    if (claimResult.type !== 'success') return claimResult;
+
+    const quotaAfter = await fetchJsonInPage(page, QUOTA_PATH);
+    const verifiedState = analyzeQuotaResponse(quotaAfter.status, quotaAfter.json);
+    if (verifiedState.type !== 'already_claimed') {
+      throw new SharedChatClaimError('schema_changed', '领取接口成功，但配额复查未显示套餐生效');
+    }
+
+    return { type: 'success', message: claimResult.message || '领取成功' };
+  } catch (error) {
+    if (error instanceof SharedChatClaimError) {
+      return { type: error.type, message: error.message };
+    }
+
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+      return { type: 'network_error', message: '页面或接口请求超时' };
+    }
+
+    return { type: 'error', message: `执行失败: ${error?.message || String(error)}` };
+  } finally {
+    await page?.close().catch(() => {});
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
+  }
+}
+
+function printHelp() {
+  console.log(`${TASK_TITLE}
+
+用法:
+  node sharedchat-vibe-claim.js
+
+必填环境变量:
+  SHAREDCHAT_COOKIE                  new.sharedchat.cc 的完整登录 Cookie
+
+可选环境变量:
+  SHAREDCHAT_CLAIM_REASON_PREFIX     领取原因前缀，脚本会追加北京时间日期
+  SHAREDCHAT_TIMEOUT_MS              页面和接口超时毫秒数，默认 60000
+  PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
+
+青龙定时任务:
+  5 0 * * * node /ql/data/scripts/sharedchat-vibe-claim.js
+
+说明:
+  脚本仅支持单账号。遇到 CAPTCHA、Cloudflare 或浏览器验证时会停止并通知，
+  不会尝试绕过验证。`);
+}
+
+async function main() {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    printHelp();
+    return;
+  }
+
+  const rawCookie = process.env.SHAREDCHAT_COOKIE;
+  if (!rawCookie?.trim()) {
+    await notify(TASK_TITLE, '❌ 发生异常：未配置环境变量 SHAREDCHAT_COOKIE');
+    process.exitCode = 1;
+    return;
+  }
+
+  let config;
+  try {
+    config = {
+      cookies: parseCookieHeader(rawCookie),
+      executablePath: resolveChromiumExecutable(),
+      timeoutMs: parsePositiveInteger(process.env.SHAREDCHAT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+      reason: buildClaimReason(process.env.SHAREDCHAT_CLAIM_REASON_PREFIX),
+    };
+  } catch (error) {
+    await notify(TASK_TITLE, `❌ 发生异常：${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  log(`开始检查每日权益 - ${shanghaiDateStamp()}`);
+  const result = await runClaim(config);
+  await notify(TASK_TITLE, formatResult(result));
+
+  if (result.type !== 'success' && result.type !== 'already_claimed') {
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  main().catch(async (error) => {
+    await notify(TASK_TITLE, `❌ 发生异常：执行异常: ${error.message || String(error)}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  SharedChatClaimError,
+  analyzeClaimResponse,
+  analyzeQuotaResponse,
+  buildClaimReason,
+  formatResult,
+  getCodexQuota,
+  isAlreadyClaimedMessage,
+  normalizeCookie,
+  parseCookieHeader,
+  parsePositiveInteger,
+  resolveChromiumExecutable,
+  runClaim,
+  shanghaiDateStamp,
+};
