@@ -12,6 +12,7 @@
  *   RUNANYTIME_BROWSER_HEADLESS=true
  *   RUNANYTIME_BROWSER_TIMEOUT_MS=90000
  *   RUNANYTIME_BROWSER_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
+ *   RUNANYTIME_BROWSER_TRACE=false
  *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
  */
 
@@ -101,6 +102,25 @@ function normalizeUserId(value, fallback = DEFAULT_USER_ID) {
   return userId;
 }
 
+function isAuthMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('unauthorized')
+    || text.includes('forbidden')
+    || text.includes('not login')
+    || text.includes('not logged')
+    || text.includes('please login')
+    || text.includes('expired')
+    || text.includes('invalid token')
+    || text.includes('未登录')
+    || text.includes('请先登录')
+    || text.includes('请登录')
+    || text.includes('登录失效')
+    || text.includes('登录已失效')
+    || text.includes('登录过期')
+    || text.includes('无权')
+    || text.includes('无权限');
+}
+
 function validateDisplayAvailability(
   headless,
   platform = process.platform,
@@ -157,6 +177,67 @@ function formatResult(result) {
   return `❌ 发生异常：${result.message}`;
 }
 
+function sanitizeTraceUrl(value) {
+  let url;
+  try {
+    url = new URL(value, SITE_URL);
+  } catch {
+    return null;
+  }
+
+  if (url.origin === SITE_URL && url.pathname.startsWith('/api/')) {
+    for (const key of ['turnstile', 'pow_challenge', 'pow_nonce', 'token']) {
+      if (url.searchParams.has(key)) url.searchParams.set(key, '<redacted>');
+    }
+    return `${url.origin}${url.pathname}${url.search}`
+      .replaceAll('%3Credacted%3E', '<redacted>');
+  }
+
+  if (url.hostname === 'challenges.cloudflare.com') {
+    return `${url.origin}${url.pathname}`;
+  }
+
+  return null;
+}
+
+function attachRequestTrace(page, enabled) {
+  if (!enabled) return;
+
+  page.on('request', request => {
+    const url = sanitizeTraceUrl(request.url());
+    if (url) console.log(`[RunAnytime][请求] ${request.method()} ${url}`);
+  });
+  page.on('response', response => {
+    const url = sanitizeTraceUrl(response.url());
+    if (url) console.log(`[RunAnytime][响应] HTTP ${response.status()} ${url}`);
+  });
+}
+
+async function installApiUserHeader(context, userId) {
+  await context.route(`${SITE_URL}/api/**`, route => {
+    const headers = { ...route.request().headers() };
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === 'new-api-user') delete headers[key];
+    }
+    headers['new-api-user'] = String(userId);
+    return route.continue({ headers });
+  });
+}
+
+async function isChallengeVisible(page) {
+  const securityDialog = page.getByText('Security Check', { exact: true });
+  const chineseDialog = page.getByText('安全验证', { exact: true });
+  const chineseCheck = page.getByText('安全检查', { exact: true });
+  const widget = page.locator(
+    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile'
+  );
+
+  return await securityDialog.count() > 0
+    || await chineseDialog.count() > 0
+    || await chineseCheck.count() > 0
+    || await widget.count() > 0;
+}
+
 async function readPageState(page) {
   const alreadyButton = page.getByRole('button', { name: '今日已签到', exact: true });
   if (await alreadyButton.count() === 1) return { type: 'already_checked' };
@@ -168,11 +249,15 @@ async function readPageState(page) {
     return { type: 'auth_failed' };
   }
 
+  if (await isChallengeVisible(page)) {
+    return { type: 'challenge_required' };
+  }
+
   return { type: 'unknown' };
 }
 
 async function waitForPageState(page, timeoutMs) {
-  const deadline = Date.now() + Math.min(timeoutMs, 20000);
+  const deadline = Date.now() + timeoutMs;
   let state = await readPageState(page);
 
   while (state.type === 'unknown' && Date.now() < deadline) {
@@ -184,7 +269,7 @@ async function waitForPageState(page, timeoutMs) {
 }
 
 async function verifySession(page) {
-  return page.evaluate(async () => {
+  const result = await page.evaluate(async () => {
     try {
       const response = await fetch('/api/user/self', {
         credentials: 'include',
@@ -192,28 +277,37 @@ async function verifySession(page) {
       });
       const payload = await response.json().catch(() => null);
       const message = typeof payload?.message === 'string' ? payload.message : '';
-      const lowerMessage = message.toLowerCase();
-      const authFailed = response.status === 401
-        || response.status === 403
-        || lowerMessage.includes('unauthorized')
-        || lowerMessage.includes('forbidden')
-        || lowerMessage.includes('not login')
-        || message.includes('未登录')
-        || message.includes('无权');
 
       return {
         authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
-        authFailed,
+        message,
         status: response.status,
       };
     } catch {
-      return { authenticated: false, authFailed: false, status: 0 };
+      return { authenticated: false, message: '', status: 0 };
     }
   });
+
+  return {
+    authenticated: result.authenticated,
+    authFailed: result.status === 401
+      || result.status === 403
+      || isAuthMessage(result.message),
+    status: result.status,
+  };
 }
 
 async function runBrowserCheckin(config) {
-  const { chromium } = require('playwright');
+  let chromium;
+  try {
+    ({ chromium } = require('playwright'));
+  } catch {
+    return {
+      type: 'browser_error',
+      message: '未安装 Playwright，请在青龙环境安装 playwright 并准备 Chromium',
+    };
+  }
+
   const launchOptions = {
     headless: config.headless,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
@@ -234,7 +328,7 @@ async function runBrowserCheckin(config) {
     if (config.userAgent) contextOptions.userAgent = config.userAgent;
 
     context = await browser.newContext(contextOptions);
-    await context.setExtraHTTPHeaders({ 'New-Api-User': config.userId });
+    await installApiUserHeader(context, config.userId);
     await context.addInitScript(({ siteOrigin, user }) => {
       if (window.location.origin === siteOrigin) {
         window.localStorage.setItem('user', JSON.stringify(user));
@@ -252,6 +346,7 @@ async function runBrowserCheckin(config) {
     await context.addCookies(config.cookies);
 
     page = await context.newPage();
+    attachRequestTrace(page, config.trace);
     page.setDefaultTimeout(config.timeoutMs);
     await page.goto(PERSONAL_URL, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs });
 
@@ -273,6 +368,12 @@ async function runBrowserCheckin(config) {
     if (initialState.type === 'auth_failed') {
       return { type: 'auth_failed', message: 'Cookie 已失效，页面要求重新登录' };
     }
+    if (initialState.type === 'challenge_required') {
+      return {
+        type: 'challenge_required',
+        message: '页面加载时触发 Cloudflare/Turnstile 安全验证，请改用有头模式或网页手动签到',
+      };
+    }
     if (initialState.type !== 'checkin_available') {
       return { type: 'schema_changed', message: '未找到“立即签到”或“今日已签到”按钮' };
     }
@@ -289,9 +390,7 @@ async function runBrowserCheckin(config) {
         return { type: 'auth_failed', message: '签到过程中登录状态失效' };
       }
 
-      const securityDialog = page.getByText('Security Check', { exact: true });
-      const chineseDialog = page.getByText('安全验证', { exact: true });
-      const challengeVisible = await securityDialog.count() > 0 || await chineseDialog.count() > 0;
+      const challengeVisible = await isChallengeVisible(page);
       if (challengeVisible && Date.now() + 5000 >= deadline) {
         return {
           type: 'challenge_required',
@@ -309,6 +408,12 @@ async function runBrowserCheckin(config) {
   } catch (error) {
     if (error instanceof RunAnytimeBrowserError) {
       return { type: error.type, message: error.message };
+    }
+    if (page && await isChallengeVisible(page).catch(() => false)) {
+      return {
+        type: 'challenge_required',
+        message: 'Cloudflare/Turnstile 安全验证未能自动完成',
+      };
     }
     if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
       return { type: 'network_error', message: '页面加载或签到等待超时' };
@@ -335,6 +440,7 @@ function printHelp() {
   RUNANYTIME_BROWSER_TIMEOUT_MS    页面和签到超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
   RUNANYTIME_USER_ID               New API 用户 ID，默认 ${DEFAULT_USER_ID}
   RUNANYTIME_BROWSER_USER_AGENT    获取 Cookie 时浏览器的完整 User-Agent
+  RUNANYTIME_BROWSER_TRACE         true/false，输出脱敏请求路径与响应状态，默认 false
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
 
 说明:
@@ -361,6 +467,7 @@ async function main() {
       cookies: parseCookieHeader(rawCookie),
       executablePath: resolveChromiumExecutable(),
       headless: parseBoolean(process.env.RUNANYTIME_BROWSER_HEADLESS, true),
+      trace: parseBoolean(process.env.RUNANYTIME_BROWSER_TRACE, false),
       userAgent: process.env.RUNANYTIME_BROWSER_USER_AGENT?.trim() || '',
       userId: normalizeUserId(process.env.RUNANYTIME_USER_ID),
       timeoutMs: parsePositiveInteger(
@@ -389,7 +496,11 @@ if (require.main === module) {
 
 module.exports = {
   RunAnytimeBrowserError,
+  attachRequestTrace,
   formatResult,
+  installApiUserHeader,
+  isAuthMessage,
+  isChallengeVisible,
   normalizeCookie,
   normalizeUserId,
   parseBoolean,
@@ -397,6 +508,7 @@ module.exports = {
   parsePositiveInteger,
   resolveChromiumExecutable,
   runBrowserCheckin,
+  sanitizeTraceUrl,
   validateDisplayAvailability,
   verifySession,
 };

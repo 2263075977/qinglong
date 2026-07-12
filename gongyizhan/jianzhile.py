@@ -13,6 +13,8 @@
   JIANZHILE_URL       可选，默认 https://jianzhile.vip
   JIANZHILE_RETRIES   可选，验证码最大尝试次数，默认 2，最大 3
   JIANZHILE_CODE_LEN  可选，验证码位数，默认 4
+  JIANZHILE_NOTIFY    可选，设为 0/false/off 时关闭通知
+  JIANZHILE_NODE      可选，Node.js 命令，默认 node
 """
 
 from __future__ import annotations
@@ -22,10 +24,12 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -33,6 +37,7 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_URL = "https://jianzhile.vip"
+NOTIFY_TITLE = "简直了自动签到"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -52,6 +57,69 @@ class ApiResponse:
 
 def env_text(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def env_enabled(name: str, default: bool = True) -> bool:
+    value = env_text(name)
+    if not value:
+        return default
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
+def send_notification(content: str) -> bool:
+    if not env_enabled("JIANZHILE_NOTIFY"):
+        return False
+    notify_script = Path(__file__).with_name("sendNotify.js")
+    if not notify_script.exists():
+        print("[简直了] 通知失败: 未找到 sendNotify.js", file=sys.stderr)
+        return False
+
+    bridge = """
+const [notifyPath, title, content] = process.argv.slice(1);
+(async () => {
+  const mod = require(notifyPath);
+  const sendNotify = typeof mod === 'function'
+    ? mod
+    : mod?.sendNotify ?? mod?.default;
+  if (typeof sendNotify !== 'function') {
+    throw new Error('sendNotify.js 未导出通知函数');
+  }
+  const sent = await Promise.resolve(sendNotify(title, content));
+  if (!sent) process.exitCode = 2;
+})().catch((error) => {
+  console.error(error?.message || String(error));
+  process.exitCode = 1;
+});
+"""
+    try:
+        result = subprocess.run(
+            [
+                env_text("JIANZHILE_NODE", "node"),
+                "-e",
+                bridge,
+                str(notify_script.resolve()),
+                NOTIFY_TITLE,
+                content,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"[简直了] 通知失败: {error}", file=sys.stderr)
+        return False
+    if result.returncode == 0:
+        return True
+    detail = result.stderr.strip() or "青龙通知模块不可用"
+    print(f"[简直了] 通知失败: {detail}", file=sys.stderr)
+    return False
+
+
+def finish(message: str) -> int:
+    print(f"[简直了] {message}")
+    send_notification(message)
+    return 0
 
 
 def normalize_url(value: str) -> str:
@@ -369,14 +437,12 @@ def run() -> int:
     state = client.checkin_state()
     stats = state.get("stats") or {}
     if stats.get("checked_in_today"):
-        print("[简直了] 今日已签到")
-        return 0
+        return finish(f"今日已签到，用户 ID: {resolved_user_id}")
 
     if not state.get("captcha_enabled"):
         result = client.request("POST", "/api/user/checkin", {}).data
         if result.get("success"):
-            print("[简直了] 签到成功")
-            return 0
+            return finish(f"签到成功，用户 ID: {resolved_user_id}")
         raise CheckinError(result.get("message") or "签到失败")
 
     # 先加载模型，再获取验证码，缩短 captcha_id 的存活时间消耗。
@@ -397,11 +463,9 @@ def run() -> int:
         if result.get("success"):
             reward = (result.get("data") or {}).get("quota_awarded")
             suffix = f"，奖励: {reward}" if reward is not None else ""
-            print(f"[简直了] 签到成功{suffix}")
-            return 0
+            return finish(f"签到成功，用户 ID: {resolved_user_id}{suffix}")
         if already_checked_in(message):
-            print("[简直了] 今日已签到")
-            return 0
+            return finish(f"今日已签到，用户 ID: {resolved_user_id}")
         last_message = message
         if not retryable_captcha_error(message) or attempt >= retries:
             break
@@ -413,7 +477,9 @@ def main() -> None:
     try:
         raise SystemExit(run())
     except (CheckinError, ValueError) as error:
-        print(f"[简直了] 失败: {error}", file=sys.stderr)
+        message = f"签到失败: {error}"
+        print(f"[简直了] {message}", file=sys.stderr)
+        send_notification(message)
         raise SystemExit(1)
 
 
