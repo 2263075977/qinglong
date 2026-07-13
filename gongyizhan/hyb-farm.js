@@ -914,9 +914,11 @@ async function runAuto(config, args) {
   const initialState = await fetchState(config);
   const initialSummary = summarizeState(initialState);
   const results = [];
+  let harvestResult = null;
 
   if (initialSummary.plotSummary.mature > 0) {
-    results.push(await performHarvestAll(config, dryRun));
+    harvestResult = await performHarvestAll(config, dryRun);
+    results.push(harvestResult);
   } else {
     results.push(makeResult('一键收获', 'skipped', '没有成熟作物'));
   }
@@ -927,7 +929,8 @@ async function runAuto(config, args) {
     results.push(makeResult('一键务农', 'skipped', '没有需要护理的地块'));
   }
 
-  const latestState = dryRun ? initialState : await fetchState(config);
+  const shouldRefreshState = !dryRun && harvestResult?.type === 'success';
+  const latestState = shouldRefreshState ? await fetchState(config) : initialState;
   const latestSummary = summarizeState(latestState);
   if (latestSummary.plotSummary.empty > 0) {
     try {

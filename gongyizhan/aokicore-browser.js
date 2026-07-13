@@ -409,12 +409,58 @@ async function isTurnstileVisible(page) {
   const widget = page.locator(
     'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile'
   ).first();
-  return (await dialogText.count()) > 0 || (await widget.count()) > 0;
+  const dialogVisible = (await dialogText.count()) > 0
+    && await dialogText.isVisible().catch(() => false);
+  const widgetVisible = (await widget.count()) > 0
+    && await widget.isVisible().catch(() => false);
+  return dialogVisible || widgetVisible;
 }
 
 async function findCheckinButton(page) {
-  const button = page.getByRole('button', { name: /立即签到|Check in now/i }).first();
-  return (await button.count()) > 0 ? button : null;
+  const buttonNames = /立即签到|Check in now|今すぐチェックイン|Điểm danh ngay/i;
+  const roleButton = page.getByRole('button', { name: buttonNames }).first();
+  if ((await roleButton.count()) > 0 && await roleButton.isEnabled().catch(() => false)) {
+    return roleButton;
+  }
+
+  const textButtons = page.locator('button').filter({ hasText: buttonNames });
+  for (let index = 0; index < await textButtons.count(); index += 1) {
+    const candidate = textButtons.nth(index);
+    if (await candidate.isVisible().catch(() => false)
+      && await candidate.isEnabled().catch(() => false)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function readProfileState(page) {
+  if (/\/login(?:[/?#]|$)/i.test(page.url())) return { type: 'auth_failed' };
+
+  const checkinButton = await findCheckinButton(page);
+  if (checkinButton) return { type: 'checkin_available', button: checkinButton };
+
+  const checkedButton = page.getByRole('button', {
+    name: /已签到|Checked in|チェックイン済み|Đã check-in/i,
+  }).first();
+  if ((await checkedButton.count()) > 0
+    && await checkedButton.isVisible().catch(() => false)) {
+    return { type: 'already_checked' };
+  }
+
+  if (await isTurnstileVisible(page)) return { type: 'challenge_required' };
+  return { type: 'unknown' };
+}
+
+async function waitForProfileState(page, timeoutMs) {
+  const deadline = Date.now() + Math.min(timeoutMs, 30000);
+  let state = await readProfileState(page);
+
+  while (state.type === 'unknown' && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    state = await readProfileState(page);
+  }
+  return state;
 }
 
 async function prepareAuthenticatedContext(browser, cookieHeader, config) {
@@ -524,15 +570,36 @@ async function runAccount(browser, account, config) {
       };
     }
 
-    const button = await findCheckinButton(page);
-    if (!button) {
-      if (/\/login(?:[/?#]|$)/i.test(page.url())) {
-        return { type: 'auth_failed', message: `页面要求重新登录，请更新 ${COOKIE_ENV}` };
-      }
-      return { type: 'schema_changed', message: '未找到“立即签到”按钮，AokiCore 页面结构可能已变化' };
+    const profileState = await waitForProfileState(page, config.timeoutMs);
+    if (profileState.type === 'already_checked') {
+      const refreshedStatus = await fetchCheckinStatus(page);
+      return {
+        type: 'already_checked',
+        message: '今日已签到',
+        reward: readTodayReward(refreshedStatus.data),
+      };
+    }
+    if (profileState.type === 'auth_failed') {
+      return { type: 'auth_failed', message: `页面要求重新登录，请更新 ${COOKIE_ENV}` };
+    }
+    if (profileState.type === 'challenge_required') {
+      return {
+        type: 'challenge_required',
+        message: '页面在签到按钮出现前要求 Turnstile 验证，请改用有头模式或网页手动处理',
+      };
+    }
+    if (profileState.type !== 'checkin_available') {
+      let pathname = '';
+      try {
+        pathname = new URL(page.url()).pathname;
+      } catch {}
+      return {
+        type: 'schema_changed',
+        message: `等待页面渲染后仍未找到签到按钮${pathname ? `（当前路径 ${pathname}）` : ''}`,
+      };
     }
 
-    await button.click();
+    await profileState.button.click();
     const deadline = Date.now() + config.timeoutMs;
     while (Date.now() < deadline) {
       const status = await fetchCheckinStatus(page);
@@ -706,6 +773,7 @@ module.exports = {
   extractGobFieldInts,
   extractUserIdsFromCookie,
   fetchCheckinStatus,
+  findCheckinButton,
   formatShanghaiDate,
   formatAccountResult,
   formatResults,
@@ -717,9 +785,11 @@ module.exports = {
   parseCookiePairs,
   parsePositiveInteger,
   readTodayReward,
+  readProfileState,
   resolveChromiumExecutable,
   runBrowserCheckins,
   toPlaywrightCookies,
   validateDisplayAvailability,
   verifySession,
+  waitForProfileState,
 };
