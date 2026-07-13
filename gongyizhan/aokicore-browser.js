@@ -9,6 +9,7 @@
  *
  * 可选环境变量:
  *   AOKICORE_ACCOUNT_NAME="账户备注"
+ *   AOKICORE_USER_ID=1234
  *   AOKICORE_BROWSER_HEADLESS=true
  *   AOKICORE_BROWSER_TIMEOUT_MS=90000
  *   AOKICORE_BROWSER_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
@@ -68,6 +69,128 @@ function parseCookiePairs(value) {
   }
 
   return pairs;
+}
+
+function decodeBase64BufferLoose(value) {
+  const text = cleanString(value);
+  if (!text) return null;
+
+  for (const encoding of ['base64url', 'base64']) {
+    try {
+      const buffer = Buffer.from(text, encoding);
+      if (buffer.length > 0) return buffer;
+    } catch {}
+  }
+  return null;
+}
+
+function decodeGobSignedInt(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+
+  let encoded;
+  if (buffer[0] < 128) {
+    encoded = BigInt(buffer[0]);
+  } else {
+    const byteLength = 256 - buffer[0];
+    if (byteLength <= 0 || buffer.length !== byteLength + 1) return null;
+    encoded = 0n;
+    for (let index = 1; index < buffer.length; index += 1) {
+      encoded = (encoded << 8n) | BigInt(buffer[index]);
+    }
+  }
+
+  const value = (encoded & 1n) === 0n
+    ? encoded >> 1n
+    : -((encoded >> 1n) + 1n);
+  if (value <= 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(value);
+}
+
+function extractGobFieldInts(buffer, fieldName) {
+  if (!Buffer.isBuffer(buffer)) return [];
+  const values = [];
+  const marker = Buffer.concat([
+    Buffer.from(fieldName, 'utf8'),
+    Buffer.from([3]),
+    Buffer.from('int', 'utf8'),
+    Buffer.from([4]),
+  ]);
+
+  let offset = 0;
+  while (offset < buffer.length) {
+    const position = buffer.indexOf(marker, offset);
+    if (position < 0) break;
+
+    const encodedLength = buffer[position + marker.length];
+    const separator = buffer[position + marker.length + 1];
+    if (typeof encodedLength === 'number' && separator === 0) {
+      const valueLength = encodedLength - 1;
+      const start = position + marker.length + 2;
+      const end = start + valueLength;
+      if (valueLength > 0 && end <= buffer.length) {
+        const value = decodeGobSignedInt(buffer.subarray(start, end));
+        if (value != null && !values.includes(value)) values.push(value);
+      }
+    }
+    offset = position + marker.length;
+  }
+  return values;
+}
+
+function extractUserIdsFromCookie(cookieHeader) {
+  const values = [];
+  const add = value => {
+    if (Number.isSafeInteger(value) && value > 0 && !values.includes(value)) values.push(value);
+  };
+
+  const sessionValues = [];
+  for (const [name, value] of parseCookiePairs(cookieHeader)) {
+    if (name.toLowerCase() === 'session') sessionValues.push(value);
+  }
+
+  for (const sessionValue of sessionValues) {
+    let decodedValue = sessionValue;
+    try {
+      decodedValue = decodeURIComponent(sessionValue);
+    } catch {}
+
+    const outer = decodeBase64BufferLoose(decodedValue);
+    if (!outer) continue;
+    for (const value of extractGobFieldInts(outer, 'id')) add(value);
+
+    const text = outer.toString('utf8');
+    for (const segment of text.split('|')) {
+      const inner = decodeBase64BufferLoose(segment);
+      if (!inner) continue;
+      for (const value of extractGobFieldInts(inner, 'id')) add(value);
+    }
+  }
+  return values;
+}
+
+function normalizeUserId(value) {
+  const text = cleanString(value == null ? '' : String(value));
+  if (!text) return null;
+  if (!/^\d+$/.test(text) || text === '0') {
+    throw new AokiCoreBrowserError('config_error', `AOKICORE_USER_ID 无效: ${text}`);
+  }
+  const userId = Number(text);
+  if (!Number.isSafeInteger(userId)) {
+    throw new AokiCoreBrowserError('config_error', `AOKICORE_USER_ID 超出安全整数范围`);
+  }
+  return userId;
+}
+
+function buildUserIdCandidates(cookieHeader, explicitUserId) {
+  const candidates = [];
+  const add = value => {
+    if (Number.isSafeInteger(value) && value > 0 && !candidates.includes(value)) {
+      candidates.push(value);
+    }
+  };
+  add(normalizeUserId(explicitUserId));
+  for (const value of extractUserIdsFromCookie(cookieHeader)) add(value);
+  return candidates;
 }
 
 function toPlaywrightCookies(cookieHeader) {
@@ -160,6 +283,14 @@ function isAuthMessage(message) {
     || text.includes('未授权');
 }
 
+function isUserIdMessage(message) {
+  const text = cleanString(message).toLowerCase().replace(/[-_]/g, ' ');
+  return text.includes('user id')
+    || text.includes('用户 id')
+    || text.includes('用户id')
+    || text.includes('未提供用户');
+}
+
 function accountLabel(account) {
   return account.username ? `${account.siteName} / ${account.username}` : account.siteName;
 }
@@ -235,10 +366,11 @@ async function verifySession(page) {
         authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
         authFailed,
         status: response.status,
+        message,
         user: payload?.success === true && payload?.data ? payload.data : null,
       };
     } catch {
-      return { authenticated: false, authFailed: false, status: 0, user: null };
+      return { authenticated: false, authFailed: false, status: 0, message: '', user: null };
     }
   });
 }
@@ -295,23 +427,47 @@ async function prepareAuthenticatedContext(browser, cookieHeader, config) {
 
   const context = await browser.newContext(contextOptions);
   let page;
+  let apiUserId = '';
 
   try {
+    await context.route(`${SITE_ORIGIN}/api/**`, async route => {
+      const headers = route.request().headers();
+      if (apiUserId) headers['new-api-user'] = apiUserId;
+      await route.continue({ headers });
+    });
     await context.addCookies(toPlaywrightCookies(cookieHeader));
     page = await context.newPage();
     page.setDefaultTimeout(config.timeoutMs);
     await page.goto(SITE_ORIGIN, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs });
 
-    const session = await verifySession(page);
-    if (!session.authenticated) {
+    const userIdCandidates = buildUserIdCandidates(cookieHeader, config.userId);
+    if (userIdCandidates.length === 0) {
       await page.close().catch(() => {});
       await context.close().catch(() => {});
-      return { context: null, page: null, session };
+      return {
+        context: null,
+        page: null,
+        session: null,
+        userIdMissing: true,
+      };
     }
 
-    const userId = session.user?.id;
-    if (userId != null) {
-      await context.setExtraHTTPHeaders({ 'New-Api-User': String(userId) });
+    let session = null;
+    for (const userId of userIdCandidates) {
+      apiUserId = String(userId);
+      session = await verifySession(page);
+      if (session.authenticated) break;
+    }
+
+    if (!session?.authenticated) {
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+      return {
+        context: null,
+        page: null,
+        session,
+        userIdRejected: isUserIdMessage(session?.message),
+      };
     }
     await page.evaluate(user => {
       window.localStorage.setItem('user', JSON.stringify(user));
@@ -334,6 +490,12 @@ async function runAccount(browser, account, config) {
     context = prepared.context;
     page = prepared.page;
     if (!context || !page) {
+      if (prepared.userIdMissing || prepared.userIdRejected) {
+        return {
+          type: 'auth_failed',
+          message: '无法确定 AokiCore 用户 ID，请设置 AOKICORE_USER_ID 后重试',
+        };
+      }
       if (prepared.session?.authFailed) {
         return { type: 'auth_failed', message: `Cookie 已失效，请更新 ${COOKIE_ENV}` };
       }
@@ -468,6 +630,7 @@ function printHelp() {
 
 可选环境变量:
   AOKICORE_ACCOUNT_NAME           账户备注，仅用于通知显示
+  AOKICORE_USER_ID                New API 用户 ID；通常可从 session 自动提取
   AOKICORE_BROWSER_HEADLESS       true/false，默认 true
   AOKICORE_BROWSER_TIMEOUT_MS     页面和签到超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
   AOKICORE_BROWSER_USER_AGENT     获取 Cookie 时浏览器的完整 User-Agent
@@ -504,6 +667,7 @@ async function main() {
         DEFAULT_TIMEOUT_MS
       ),
       userAgent: cleanString(process.env.AOKICORE_BROWSER_USER_AGENT),
+      userId: normalizeUserId(process.env.AOKICORE_USER_ID),
     };
     validateDisplayAvailability(config.headless);
 
@@ -535,13 +699,20 @@ if (require.main === module) {
 
 module.exports = {
   AokiCoreBrowserError,
+  buildUserIdCandidates,
   cleanString,
+  decodeBase64BufferLoose,
+  decodeGobSignedInt,
+  extractGobFieldInts,
+  extractUserIdsFromCookie,
   fetchCheckinStatus,
   formatShanghaiDate,
   formatAccountResult,
   formatResults,
   isAuthMessage,
+  isUserIdMessage,
   normalizeCookieHeader,
+  normalizeUserId,
   parseBoolean,
   parseCookiePairs,
   parsePositiveInteger,

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron: 35 8,12,18 * * *
+// cron: 35 */2 * * *
 // new Env('黑与白福利站 轻松农场');
 // description: 黑与白福利站轻松农场状态查询、收获、护理和批量种植
 
@@ -265,7 +265,7 @@ function printUsage() {
   HYB_FARM_SEED_ID=golden_apple  指定空地默认补种的种子
 
 青龙定时任务:
-  35 8,12,18 * * * task 仓库目录/gongyizhan/hyb-farm.js`);
+  35 */2 * * * task 仓库目录/gongyizhan/hyb-farm.js`);
 }
 
 function isQinglongEnvironment() {
