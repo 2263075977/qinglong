@@ -23,6 +23,7 @@ const SITE_ORIGIN = 'https://ai.muapi.cn';
 const PROFILE_URL = `${SITE_ORIGIN}/profile`;
 const COOKIE_ENV = 'AOKICORE_ACCOUNTS';
 const DEFAULT_TIMEOUT_MS = 90000;
+const DEFAULT_QUOTA_PER_UNIT = 500000;
 const CHROMIUM_CANDIDATES = [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
@@ -316,29 +317,20 @@ async function sendResult(title, content) {
 }
 
 function formatAccountResult(result) {
-  const prefix = result.accountLabel ? `${result.accountLabel}: ` : '';
+  const label = result.accountLabel || 'AokiCore';
   if (result.type === 'success') {
-    const reward = result.reward != null ? `，奖励: ${result.reward}` : '';
-    return `- [成功] ${prefix}${result.message}${reward}`;
+    const reward = result.reward != null ? `，获得 ${result.reward} 额度` : '';
+    return `✅ ${label} 签到成功${reward}`;
   }
-  if (result.type === 'already_checked') return `- [跳过] ${prefix}今日已签到`;
+  if (result.type === 'already_checked') return `⏭️ ${label} 今日已签到`;
   if (result.type === 'challenge_required') {
-    return `- [失败] ${prefix}❌ 发生异常：验证阻断：${result.message}`;
+    return `❌ ${label} 发生异常：验证阻断：${result.message}`;
   }
-  return `- [失败] ${prefix}❌ 发生异常：${result.message}`;
+  return `❌ ${label} 发生异常：${result.message}`;
 }
 
 function formatResults(results) {
-  const success = results.filter(result => result.type === 'success').length;
-  const skipped = results.filter(result => result.type === 'already_checked').length;
-  const failed = results.length - success - skipped;
-  return [
-    `成功: ${success}`,
-    `跳过: ${skipped}`,
-    `失败: ${failed}`,
-    '',
-    ...results.map(formatAccountResult),
-  ].join('\n');
+  return results.map(formatAccountResult).join('\n');
 }
 
 async function verifySession(page) {
@@ -397,11 +389,42 @@ async function fetchCheckinStatus(page) {
   }, month);
 }
 
-function readTodayReward(statusData) {
+async function fetchQuotaPerUnit(page) {
+  return page.evaluate(async fallback => {
+    try {
+      const response = await fetch('/api/status', {
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      });
+      const payload = await response.json().catch(() => null);
+      const quotaPerUnit = Number(payload?.data?.quota_per_unit);
+      return Number.isFinite(quotaPerUnit) && quotaPerUnit > 0
+        ? quotaPerUnit
+        : fallback;
+    } catch {
+      return fallback;
+    }
+  }, DEFAULT_QUOTA_PER_UNIT);
+}
+
+function formatQuotaReward(rawQuota, quotaPerUnit = DEFAULT_QUOTA_PER_UNIT) {
+  const quota = Number(rawQuota);
+  const configuredUnit = Number(quotaPerUnit);
+  const unit = Number.isFinite(configuredUnit) && configuredUnit > 0
+    ? configuredUnit
+    : DEFAULT_QUOTA_PER_UNIT;
+  if (!Number.isFinite(quota) || quota <= 0) return undefined;
+
+  const reward = Math.round((quota / unit) * 1e6) / 1e6;
+  return reward > 0 ? String(reward) : undefined;
+}
+
+function readTodayReward(statusData, quotaPerUnit = DEFAULT_QUOTA_PER_UNIT) {
   const today = formatShanghaiDate();
   const records = statusData?.stats?.records;
   if (!Array.isArray(records)) return undefined;
-  return records.find(record => record?.checkin_date === today)?.quota_awarded;
+  const rawQuota = records.find(record => record?.checkin_date === today)?.quota_awarded;
+  return formatQuotaReward(rawQuota, quotaPerUnit);
 }
 
 async function isTurnstileVisible(page) {
@@ -551,6 +574,7 @@ async function runAccount(browser, account, config) {
       };
     }
 
+    const quotaPerUnit = await fetchQuotaPerUnit(page);
     const initialStatus = await fetchCheckinStatus(page);
     if (!initialStatus.ok) {
       if ([401, 403].includes(initialStatus.status) || isAuthMessage(initialStatus.message)) {
@@ -566,7 +590,7 @@ async function runAccount(browser, account, config) {
       return {
         type: 'already_checked',
         message: '今日已签到',
-        reward: readTodayReward(initialStatus.data),
+        reward: readTodayReward(initialStatus.data, quotaPerUnit),
       };
     }
 
@@ -576,7 +600,7 @@ async function runAccount(browser, account, config) {
       return {
         type: 'already_checked',
         message: '今日已签到',
-        reward: readTodayReward(refreshedStatus.data),
+        reward: readTodayReward(refreshedStatus.data, quotaPerUnit),
       };
     }
     if (profileState.type === 'auth_failed') {
@@ -607,7 +631,7 @@ async function runAccount(browser, account, config) {
         return {
           type: 'success',
           message: '浏览器签到成功',
-          reward: readTodayReward(status.data),
+          reward: readTodayReward(status.data, quotaPerUnit),
         };
       }
       if ([401, 403].includes(status.status) || isAuthMessage(status.message)) {
@@ -773,7 +797,9 @@ module.exports = {
   extractGobFieldInts,
   extractUserIdsFromCookie,
   fetchCheckinStatus,
+  fetchQuotaPerUnit,
   findCheckinButton,
+  formatQuotaReward,
   formatShanghaiDate,
   formatAccountResult,
   formatResults,
