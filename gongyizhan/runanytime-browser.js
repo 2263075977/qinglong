@@ -11,19 +11,30 @@
  *   RUNANYTIME_USER_ID=8514
  *   RUNANYTIME_BROWSER_HEADLESS=true
  *   RUNANYTIME_BROWSER_TIMEOUT_MS=90000
+ *   RUNANYTIME_POW_TIMEOUT_MS=60000
  *   RUNANYTIME_BROWSER_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
  *   RUNANYTIME_BROWSER_TRACE=false
  *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+ *
+ * 说明:
+ *   RunAnytime(New API 分支)签到采用 PoW 工作量证明。站点当前配置
+ *   pow_mode = "replace"，即 PoW 完全替代 Turnstile。脚本复刻前端流程：
+ *     1. GET  /api/user/pow/challenge?action=checkin  取 {challenge_id, prefix, difficulty}
+ *     2. 本地计算 SHA-256(prefix + nonce) 满足 difficulty 个前导零 bit 的 nonce
+ *     3. POST /api/user/checkin?pow_challenge=..&pow_nonce=..
+ *   全程在真实浏览器页面上下文内用 fetch + crypto.subtle 完成，无需人工过验证。
  */
 
 const fs = require('node:fs');
 
 const TASK_TITLE = 'RunAnytime 浏览器签到';
 const SITE_URL = 'https://runanytime.hxi.me';
+const SITE_HOST = 'runanytime.hxi.me';
 const PERSONAL_URL = `${SITE_URL}/console/personal`;
 const COOKIE_ENV = 'RUNANYTIME_ACCOUNTS';
 const DEFAULT_USER_ID = '8514';
 const DEFAULT_TIMEOUT_MS = 90000;
+const DEFAULT_POW_TIMEOUT_MS = 60000;
 const CHROMIUM_CANDIDATES = [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
@@ -67,7 +78,7 @@ function parseCookieHeader(cookie) {
     cookies.push({
       name,
       value,
-      domain: 'runanytime.hxi.me',
+      domain: SITE_HOST,
       path: '/',
       secure: true,
       sameSite: 'Lax',
@@ -171,10 +182,28 @@ async function sendResult(title, content) {
 }
 
 function formatResult(result) {
-  if (result.type === 'success') return `✅ ${result.message}`;
+  if (result.type === 'success') {
+    return result.reward ? `✅ 签到成功，获得 ${result.reward} 额度` : '✅ 签到成功';
+  }
   if (result.type === 'already_checked') return '⏭️ 今日已签到';
   if (result.type === 'challenge_required') return `❌ 发生异常：验证阻断：${result.message}`;
   return `❌ 发生异常：${result.message}`;
+}
+
+function formatShanghaiMonth(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.year}-${values.month}`;
+}
+
+function formatReward(rawQuota) {
+  const quota = Number(rawQuota);
+  if (!Number.isFinite(quota) || quota <= 0) return '';
+  return quota.toLocaleString('en-US');
 }
 
 function sanitizeTraceUrl(value) {
@@ -225,47 +254,16 @@ async function installApiUserHeader(context, userId) {
 }
 
 async function isChallengeVisible(page) {
-  const securityDialog = page.getByText('Security Check', { exact: true });
-  const chineseDialog = page.getByText('安全验证', { exact: true });
-  const chineseCheck = page.getByText('安全检查', { exact: true });
+  const dialog = page.getByText(/Security Check|安全验证|安全检查/i).first();
   const widget = page.locator(
     'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile'
-  );
+  ).first();
 
-  return await securityDialog.count() > 0
-    || await chineseDialog.count() > 0
-    || await chineseCheck.count() > 0
-    || await widget.count() > 0;
-}
-
-async function readPageState(page) {
-  const alreadyButton = page.getByRole('button', { name: '今日已签到', exact: true });
-  if (await alreadyButton.count() === 1) return { type: 'already_checked' };
-
-  const checkinButton = page.getByRole('button', { name: '立即签到', exact: true });
-  if (await checkinButton.count() === 1) return { type: 'checkin_available', button: checkinButton };
-
-  if (/\/login(?:[/?#]|$)/i.test(page.url())) {
-    return { type: 'auth_failed' };
-  }
-
-  if (await isChallengeVisible(page)) {
-    return { type: 'challenge_required' };
-  }
-
-  return { type: 'unknown' };
-}
-
-async function waitForPageState(page, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let state = await readPageState(page);
-
-  while (state.type === 'unknown' && Date.now() < deadline) {
-    await page.waitForTimeout(500);
-    state = await readPageState(page);
-  }
-
-  return state;
+  const dialogVisible = (await dialog.count()) > 0
+    && await dialog.isVisible().catch(() => false);
+  const widgetVisible = (await widget.count()) > 0
+    && await widget.isVisible().catch(() => false);
+  return dialogVisible || widgetVisible;
 }
 
 async function verifySession(page) {
@@ -277,7 +275,6 @@ async function verifySession(page) {
       });
       const payload = await response.json().catch(() => null);
       const message = typeof payload?.message === 'string' ? payload.message : '';
-
       return {
         authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
         message,
@@ -290,11 +287,130 @@ async function verifySession(page) {
 
   return {
     authenticated: result.authenticated,
-    authFailed: result.status === 401
-      || result.status === 403
-      || isAuthMessage(result.message),
+    authFailed: result.status === 401 || result.status === 403 || isAuthMessage(result.message),
     status: result.status,
   };
+}
+
+async function fetchStatus(page) {
+  return page.evaluate(async () => {
+    try {
+      const response = await fetch('/api/status', {
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      });
+      const payload = await response.json().catch(() => null);
+      return { ok: response.ok, status: response.status, data: payload?.data || null };
+    } catch {
+      return { ok: false, status: 0, data: null };
+    }
+  });
+}
+
+async function fetchCheckinStatus(page, month) {
+  return page.evaluate(async currentMonth => {
+    try {
+      const response = await fetch(`/api/user/checkin?month=${encodeURIComponent(currentMonth)}`, {
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      });
+      const payload = await response.json().catch(() => null);
+      return {
+        ok: response.ok && payload?.success === true && Boolean(payload?.data),
+        status: response.status,
+        message: typeof payload?.message === 'string' ? payload.message : '',
+        data: payload?.data || null,
+      };
+    } catch {
+      return { ok: false, status: 0, message: '', data: null };
+    }
+  }, month);
+}
+
+/**
+ * 在浏览器页面上下文内完成一次 PoW 签到：
+ *   1. 取 challenge
+ *   2. 用 crypto.subtle 复刻站点 worker 的 SHA-256 前导零 bit 求解
+ *   3. 携带 pow_challenge / pow_nonce POST 签到
+ * 返回原始 HTTP 状态与 JSON，供 Node 侧统一判定。
+ */
+async function performPowCheckin(page, powTimeoutMs) {
+  return page.evaluate(async maxSolveMs => {
+    const getJson = async (url, init) => {
+      const response = await fetch(url, {
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+        ...init,
+      });
+      const payload = await response.json().catch(() => null);
+      return { status: response.status, payload };
+    };
+
+    // 1. 获取 PoW challenge
+    const challengeResult = await getJson('/api/user/pow/challenge?action=checkin');
+    if (!challengeResult.payload?.success || !challengeResult.payload?.data) {
+      return {
+        stage: 'challenge',
+        status: challengeResult.status,
+        message: challengeResult.payload?.message || '获取 PoW challenge 失败',
+      };
+    }
+
+    const { challenge_id: challengeId, prefix, difficulty } = challengeResult.payload.data;
+    if (!prefix || typeof difficulty !== 'number') {
+      return { stage: 'challenge', status: challengeResult.status, message: 'PoW challenge 参数异常' };
+    }
+
+    // 2. 求解 nonce —— 与站点 worker (static/js/async/4736) 逐字节一致
+    const hasLeadingZeroBits = (bytes, bits) => {
+      if (bits <= 0) return true;
+      const fullBytes = Math.floor(bits / 8);
+      const remainder = bits % 8;
+      for (let i = 0; i < fullBytes && i < bytes.length; i++) {
+        if (bytes[i] !== 0) return false;
+      }
+      if (remainder > 0 && fullBytes < bytes.length) {
+        if ((bytes[fullBytes] & (255 << (8 - remainder))) !== 0) return false;
+      }
+      return true;
+    };
+
+    const encoder = new TextEncoder();
+    const solveDeadline = Date.now() + maxSolveMs;
+    let counter = 0;
+    let nonce = null;
+
+    for (;;) {
+      const candidate = counter.toString(16).padStart(8, '0');
+      const digest = await crypto.subtle.digest('SHA-256', encoder.encode(prefix + candidate));
+      if (hasLeadingZeroBits(new Uint8Array(digest), difficulty)) {
+        nonce = candidate;
+        break;
+      }
+      counter += 1;
+      if (counter > 0xffffffff) {
+        return { stage: 'solve', status: 0, message: 'PoW 求解耗尽计数仍无解' };
+      }
+      if ((counter & 0x3fff) === 0 && Date.now() > solveDeadline) {
+        return { stage: 'solve', status: 0, message: `PoW 求解超时（difficulty=${difficulty}）` };
+      }
+    }
+
+    // 3. 携带 PoW 提交签到（replace 模式无需 turnstile 参数）
+    const params = new URLSearchParams();
+    if (challengeId) params.set('pow_challenge', challengeId);
+    params.set('pow_nonce', nonce);
+    const submitResult = await getJson(`/api/user/checkin?${params.toString()}`, { method: 'POST' });
+
+    return {
+      stage: 'submit',
+      status: submitResult.status,
+      success: submitResult.payload?.success === true,
+      message: submitResult.payload?.message || '',
+      data: submitResult.payload?.data || null,
+      difficulty,
+    };
+  }, powTimeoutMs);
 }
 
 async function runBrowserCheckin(config) {
@@ -329,82 +445,110 @@ async function runBrowserCheckin(config) {
 
     context = await browser.newContext(contextOptions);
     await installApiUserHeader(context, config.userId);
-    await context.addInitScript(({ siteOrigin, user }) => {
-      if (window.location.origin === siteOrigin) {
-        window.localStorage.setItem('user', JSON.stringify(user));
-      }
-    }, {
-      siteOrigin: SITE_URL,
-      user: {
-        id: Number(config.userId),
-        username: `user_${config.userId}`,
-        role: 1,
-        status: 1,
-        group: 'default',
-      },
-    });
     await context.addCookies(config.cookies);
 
     page = await context.newPage();
     attachRequestTrace(page, config.trace);
     page.setDefaultTimeout(config.timeoutMs);
+
+    // 加载页面主要用于建立真实浏览器上下文（TLS、Cookie、可能的 cf_clearance）
     await page.goto(PERSONAL_URL, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs });
 
-    const sessionState = await verifySession(page);
-    if (sessionState.authFailed) {
-      return { type: 'auth_failed', message: 'Cookie 已失效，用户信息接口要求重新登录' };
-    }
-    if (!sessionState.authenticated) {
-      return {
-        type: 'network_error',
-        message: `无法确认登录状态，用户信息接口 HTTP ${sessionState.status || '未知'}`,
-      };
-    }
-
-    const initialState = await waitForPageState(page, config.timeoutMs);
-    if (initialState.type === 'already_checked') {
-      return { type: 'already_checked', message: '今日已签到' };
-    }
-    if (initialState.type === 'auth_failed') {
-      return { type: 'auth_failed', message: 'Cookie 已失效，页面要求重新登录' };
-    }
-    if (initialState.type === 'challenge_required') {
+    if (await isChallengeVisible(page)) {
       return {
         type: 'challenge_required',
-        message: '页面加载时触发 Cloudflare/Turnstile 安全验证，请改用有头模式或网页手动签到',
+        message: '页面加载即触发 Cloudflare 人机验证，请改用有头模式或网页手动签到',
       };
     }
-    if (initialState.type !== 'checkin_available') {
-      return { type: 'schema_changed', message: '未找到“立即签到”或“今日已签到”按钮' };
+
+    const session = await verifySession(page);
+    if (session.authFailed) {
+      return { type: 'auth_failed', message: `Cookie 已失效，请更新 ${COOKIE_ENV}` };
+    }
+    if (!session.authenticated) {
+      return {
+        type: 'network_error',
+        message: `无法确认登录状态，用户信息接口 HTTP ${session.status || '未知'}`,
+      };
     }
 
-    await initialState.button.click();
+    // 读取站点签到/PoW 配置，确认走 PoW 而非 Turnstile
+    const status = await fetchStatus(page);
+    const settings = status.data || {};
+    if (settings.checkin_enabled === false) {
+      return { type: 'error', message: '站点已关闭签到功能' };
+    }
+    const powEnabled = settings.pow_enabled === true;
+    const powMode = settings.pow_mode || '';
+    const turnstileRequired = settings.turnstile_check === true;
 
-    const deadline = Date.now() + config.timeoutMs;
-    while (Date.now() < deadline) {
-      const state = await readPageState(page);
-      if (state.type === 'already_checked') {
-        return { type: 'success', message: '浏览器签到成功' };
-      }
-      if (state.type === 'auth_failed') {
-        return { type: 'auth_failed', message: '签到过程中登录状态失效' };
-      }
-
-      const challengeVisible = await isChallengeVisible(page);
-      if (challengeVisible && Date.now() + 5000 >= deadline) {
-        return {
-          type: 'challenge_required',
-          message: 'Turnstile 未在超时内自动完成，请改用有头模式或网页手动签到',
-        };
-      }
-
-      await page.waitForTimeout(1000);
+    // 仅当 PoW 可独立完成签到时才自动处理；否则需要人工过 Turnstile
+    const powReplacesTurnstile = powEnabled && (powMode === 'replace' || !turnstileRequired);
+    if (turnstileRequired && !powReplacesTurnstile) {
+      return {
+        type: 'challenge_required',
+        message: `站点 PoW 模式为 "${powMode || '未知'}"，签到仍需 Turnstile，无头模式无法自动完成`,
+      };
+    }
+    if (!powEnabled) {
+      return {
+        type: 'schema_changed',
+        message: '站点未启用 PoW，签到机制已变更，请人工确认',
+      };
     }
 
-    return {
-      type: 'challenge_required',
-      message: '签到状态在超时内未更新，Turnstile 可能需要人工处理',
-    };
+    const month = formatShanghaiMonth();
+    const initialStatus = await fetchCheckinStatus(page, month);
+    if (!initialStatus.ok) {
+      if ([401, 403].includes(initialStatus.status) || isAuthMessage(initialStatus.message)) {
+        return { type: 'auth_failed', message: 'Cookie 已失效，签到状态接口要求重新登录' };
+      }
+      return {
+        type: 'network_error',
+        message: `无法获取签到状态，HTTP ${initialStatus.status || '未知'}`,
+      };
+    }
+    if (initialStatus.data?.stats?.checked_in_today === true) {
+      return { type: 'already_checked', message: '今日已签到' };
+    }
+
+    // 执行 PoW 签到
+    const result = await performPowCheckin(page, config.powTimeoutMs);
+    if (result.stage === 'challenge') {
+      if ([401, 403].includes(result.status) || isAuthMessage(result.message)) {
+        return { type: 'auth_failed', message: 'Cookie 已失效，PoW 接口要求重新登录' };
+      }
+      return { type: 'network_error', message: `获取 PoW challenge 失败：${result.message}` };
+    }
+    if (result.stage === 'solve') {
+      return { type: 'error', message: result.message };
+    }
+
+    if (result.success) {
+      return {
+        type: 'success',
+        message: '浏览器签到成功',
+        reward: formatReward(result.data?.quota_awarded),
+      };
+    }
+
+    // 提交失败的分类判定
+    if ([401, 403].includes(result.status) || isAuthMessage(result.message)) {
+      return { type: 'auth_failed', message: '签到过程中登录状态失效' };
+    }
+    if (/已签到|already/i.test(result.message)) {
+      return { type: 'already_checked', message: '今日已签到' };
+    }
+    if (/turnstile|人机|验证/i.test(result.message)) {
+      return {
+        type: 'challenge_required',
+        message: `站点要求 Turnstile：${result.message}`,
+      };
+    }
+    if (/pow|challenge|nonce|工作量/i.test(result.message)) {
+      return { type: 'error', message: `PoW 校验未通过：${result.message}（difficulty=${result.difficulty}）` };
+    }
+    return { type: 'error', message: `签到失败：${result.message || `HTTP ${result.status}`}` };
   } catch (error) {
     if (error instanceof RunAnytimeBrowserError) {
       return { type: error.type, message: error.message };
@@ -412,7 +556,7 @@ async function runBrowserCheckin(config) {
     if (page && await isChallengeVisible(page).catch(() => false)) {
       return {
         type: 'challenge_required',
-        message: 'Cloudflare/Turnstile 安全验证未能自动完成',
+        message: 'Cloudflare/Turnstile 人机验证未能自动完成',
       };
     }
     if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
@@ -436,16 +580,18 @@ function printHelp() {
   ${COOKIE_ENV}                    RunAnytime 完整登录 Cookie
 
 可选环境变量:
-  RUNANYTIME_BROWSER_HEADLESS      true/false，默认 true
-  RUNANYTIME_BROWSER_TIMEOUT_MS    页面和签到超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
   RUNANYTIME_USER_ID               New API 用户 ID，默认 ${DEFAULT_USER_ID}
+  RUNANYTIME_BROWSER_HEADLESS      true/false，默认 true
+  RUNANYTIME_BROWSER_TIMEOUT_MS    页面加载超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
+  RUNANYTIME_POW_TIMEOUT_MS        PoW 求解超时毫秒数，默认 ${DEFAULT_POW_TIMEOUT_MS}
   RUNANYTIME_BROWSER_USER_AGENT    获取 Cookie 时浏览器的完整 User-Agent
   RUNANYTIME_BROWSER_TRACE         true/false，输出脱敏请求路径与响应状态，默认 false
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
 
 说明:
-  脚本通过站点网页自身完成 PoW 与 Turnstile，不读取或保存验证 token。
-  无头模式若无法通过 Turnstile，请设置 RUNANYTIME_BROWSER_HEADLESS=false。`);
+  站点采用 PoW 工作量证明签到，pow_mode = "replace" 时 PoW 完全替代 Turnstile。
+  脚本在浏览器页面内完成 challenge 获取、SHA-256 前导零求解与签到提交，
+  不读取或保存任何验证 token，正常情况下无需人工干预。`);
 }
 
 async function main() {
@@ -470,10 +616,8 @@ async function main() {
       trace: parseBoolean(process.env.RUNANYTIME_BROWSER_TRACE, false),
       userAgent: process.env.RUNANYTIME_BROWSER_USER_AGENT?.trim() || '',
       userId: normalizeUserId(process.env.RUNANYTIME_USER_ID),
-      timeoutMs: parsePositiveInteger(
-        process.env.RUNANYTIME_BROWSER_TIMEOUT_MS,
-        DEFAULT_TIMEOUT_MS
-      ),
+      timeoutMs: parsePositiveInteger(process.env.RUNANYTIME_BROWSER_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+      powTimeoutMs: parsePositiveInteger(process.env.RUNANYTIME_POW_TIMEOUT_MS, DEFAULT_POW_TIMEOUT_MS),
     };
     validateDisplayAvailability(config.headless);
   } catch (error) {
@@ -498,6 +642,8 @@ module.exports = {
   RunAnytimeBrowserError,
   attachRequestTrace,
   formatResult,
+  formatReward,
+  formatShanghaiMonth,
   installApiUserHeader,
   isAuthMessage,
   isChallengeVisible,
@@ -506,6 +652,7 @@ module.exports = {
   parseBoolean,
   parseCookieHeader,
   parsePositiveInteger,
+  performPowCheckin,
   resolveChromiumExecutable,
   runBrowserCheckin,
   sanitizeTraceUrl,

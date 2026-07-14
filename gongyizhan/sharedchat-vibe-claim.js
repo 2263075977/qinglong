@@ -9,6 +9,8 @@
  * 可选环境变量:
  *   SHAREDCHAT_CLAIM_REASON_PREFIX="用于学习 Codex 编程并完成个人项目"
  *   SHAREDCHAT_TIMEOUT_MS=60000
+ *   SHAREDCHAT_CHALLENGE_WAIT_MS=15000
+ *   SHAREDCHAT_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
  *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
  */
 
@@ -25,6 +27,10 @@ const TASK_TITLE = 'SharedChat Vibe Code 权益领取';
 const LOG_PREFIX = '[sharedchat-vibe]';
 const DEFAULT_TIMEOUT_MS = 60000;
 const DEFAULT_REASON_PREFIX = '用于每日学习 Codex 编程并完成个人项目';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
+const DEFAULT_CHALLENGE_WAIT_MS = 15000;
+const CHALLENGE_POLL_INTERVAL_MS = 1000;
 const CHROMIUM_CANDIDATES = [
   '/usr/bin/chromium',
   '/usr/bin/chromium-browser',
@@ -284,30 +290,99 @@ async function fetchJsonInPage(page, path, options = {}) {
   return result;
 }
 
-async function detectBlockingPage(page) {
-  const currentUrl = page.url();
-  if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
-    throw new SharedChatClaimError('auth_failed', 'Cookie 已失效，页面已跳转到登录入口');
-  }
+/**
+ * 精准挑战检测：只认「真实可见的 Cloudflare/Turnstile widget」或「Cloudflare 全页拦截页」，
+ * 不再对 body.innerText 做宽泛关键词扫描（会把正常页面文案误判为验证）。
+ * 返回结构化信号供上层决定是否等待自愈或按拦截处理。
+ */
+async function detectChallengeSignal(page) {
+  return page.evaluate(() => {
+    const signal = {
+      blocked: false,
+      kind: '',
+      detail: '',
+      title: document.title || '',
+      url: location.href,
+    };
 
-  const state = await page.evaluate(() => {
-    const title = document.title || '';
-    const text = (document.body?.innerText || '').slice(0, 5000);
-    return { title, text };
+    // 1. 真实可见的挑战 widget（对齐同仓库 runanytime-browser 的 isChallengeVisible 思路）
+    const widgets = document.querySelectorAll(
+      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], '
+        + '.cf-turnstile, #cf-challenge-running, #challenge-form'
+    );
+    for (const el of widgets) {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const visible = style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && Number(style.opacity || '1') > 0
+        && rect.width > 0
+        && rect.height > 0;
+      if (visible) {
+        signal.blocked = true;
+        signal.kind = 'turnstile-widget';
+        signal.detail = `visible <${el.tagName.toLowerCase()}> `
+          + `${el.getAttribute('src') || el.className || el.id || ''}`.trim();
+        return signal;
+      }
+    }
+
+    // 2. Cloudflare 全页拦截页（Just a moment / Attention Required），需标题特征与挑战脚本同时命中
+    const title = signal.title.toLowerCase();
+    const interstitialTitle = /just a moment|attention required|checking your browser|请稍候/.test(title);
+    const challengeScript = /cf-chl-|__cf_chl|window\._cf_chl|challenges\.cloudflare\.com/i
+      .test(document.documentElement.innerHTML);
+    if (interstitialTitle && challengeScript) {
+      signal.blocked = true;
+      signal.kind = 'cloudflare-interstitial';
+      signal.detail = `title="${signal.title}"`;
+      return signal;
+    }
+
+    return signal;
   });
-  const content = `${state.title}\n${state.text}`.toLowerCase();
-  const challengeMarkers = [
-    'cf-chl-',
-    'cloudflare',
-    'turnstile',
-    'captcha',
-    'verify you are human',
-    '人机验证',
-    '安全验证',
-  ];
+}
 
-  if (challengeMarkers.some(marker => content.includes(marker))) {
-    throw new SharedChatClaimError('challenge_required', '页面要求人工完成浏览器验证');
+/**
+ * 等待 dashboard 就绪：
+ *   - 以「配额接口能返回有效 JSON」为页面可用的 ground truth（挑战已过 / SPA 已就绪）；
+ *   - 命中软挑战（Cloudflare 中间页）时轮询等待自愈，避免误杀可自动通过的验证；
+ *   - 超时后仍存在真实可见的挑战 widget / 拦截页，才按 challenge_required 中止并打印诊断。
+ * 返回首次拿到的配额探针结果，供上层复用，避免二次请求。
+ */
+async function waitForDashboardReady(page, config) {
+  const deadline = Date.now() + config.challengeWaitMs;
+  let lastSignal = null;
+
+  for (;;) {
+    const currentUrl = page.url();
+    if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
+      throw new SharedChatClaimError('auth_failed', 'Cookie 已失效，页面已跳转到登录入口');
+    }
+
+    const probe = await fetchJsonInPage(page, QUOTA_PATH).catch(() => null);
+    if (probe && probe.json && typeof probe.json === 'object') {
+      return probe;
+    }
+
+    lastSignal = await detectChallengeSignal(page).catch(() => null);
+
+    if (Date.now() >= deadline) {
+      if (lastSignal?.blocked) {
+        log(`验证拦截诊断: kind=${lastSignal.kind} ${lastSignal.detail} url=${lastSignal.url}`);
+        throw new SharedChatClaimError(
+          'challenge_required',
+          `页面要求人工完成浏览器验证（${lastSignal.kind}）`
+        );
+      }
+      log(`页面未就绪诊断: url=${currentUrl} title=${lastSignal?.title || ''}`);
+      throw new SharedChatClaimError(
+        'network_error',
+        '页面加载后配额接口无有效响应，可能被前置验证或网络拦截'
+      );
+    }
+
+    await page.waitForTimeout(CHALLENGE_POLL_INTERVAL_MS);
   }
 }
 
@@ -380,7 +455,12 @@ function formatResult(result) {
 async function runClaim(config) {
   const launchOptions = {
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
   };
   if (config.executablePath) launchOptions.executablePath = config.executablePath;
 
@@ -394,9 +474,18 @@ async function runClaim(config) {
       locale: 'zh-CN',
       timezoneId: 'Asia/Shanghai',
       viewport: { width: 1365, height: 900 },
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-        + '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+      userAgent: config.userAgent,
     });
+
+    // 反检测：抹除 headless 自动化特征，补齐真实 Chrome 运行时对象，降低触发人机验证概率
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      if (!window.chrome) {
+        window.chrome = { runtime: {}, app: {}, csi: () => {}, loadTimes: () => {} };
+      }
+      Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+    });
+
     await context.addCookies(config.cookies);
 
     page = await context.newPage();
@@ -405,9 +494,8 @@ async function runClaim(config) {
       waitUntil: 'domcontentloaded',
       timeout: config.timeoutMs,
     });
-    await detectBlockingPage(page);
 
-    const quotaBefore = await fetchJsonInPage(page, QUOTA_PATH);
+    const quotaBefore = await waitForDashboardReady(page, config);
     const quotaState = analyzeQuotaResponse(quotaBefore.status, quotaBefore.json);
     if (quotaState.type !== 'claimable') return quotaState;
 
@@ -451,14 +539,17 @@ function printHelp() {
 可选环境变量:
   SHAREDCHAT_CLAIM_REASON_PREFIX     领取原因前缀，脚本会追加北京时间日期
   SHAREDCHAT_TIMEOUT_MS              页面和接口超时毫秒数，默认 60000
+  SHAREDCHAT_CHALLENGE_WAIT_MS       软验证自愈等待毫秒数，默认 15000
+  SHAREDCHAT_USER_AGENT             浏览器 User-Agent，建议与获取 Cookie 时一致
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
 
 青龙定时任务:
   5 0 * * * node /ql/data/scripts/sharedchat-vibe-claim.js
 
 说明:
-  脚本仅支持单账号。遇到 CAPTCHA、Cloudflare 或浏览器验证时会停止并通知，
-  不会尝试绕过验证。`);
+  脚本仅支持单账号。已内置基础反自动化检测（抹除 webdriver 特征等），
+  并对可自动通过的软验证做自愈等待；若最终仍出现需人工点击的 Turnstile/
+  Cloudflare 拦截，会停止并通知，不尝试破解验证码。`);
 }
 
 async function main() {
@@ -480,6 +571,11 @@ async function main() {
       cookies: parseCookieHeader(rawCookie),
       executablePath: resolveChromiumExecutable(),
       timeoutMs: parsePositiveInteger(process.env.SHAREDCHAT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+      challengeWaitMs: parsePositiveInteger(
+        process.env.SHAREDCHAT_CHALLENGE_WAIT_MS,
+        DEFAULT_CHALLENGE_WAIT_MS
+      ),
+      userAgent: process.env.SHAREDCHAT_USER_AGENT?.trim() || DEFAULT_USER_AGENT,
       reason: buildClaimReason(process.env.SHAREDCHAT_CLAIM_REASON_PREFIX),
     };
   } catch (error) {
@@ -509,6 +605,7 @@ module.exports = {
   analyzeClaimResponse,
   analyzeQuotaResponse,
   buildClaimReason,
+  detectChallengeSignal,
   formatResult,
   getCodexQuota,
   isAlreadyClaimedMessage,
@@ -518,4 +615,5 @@ module.exports = {
   resolveChromiumExecutable,
   runClaim,
   shanghaiDateStamp,
+  waitForDashboardReady,
 };
