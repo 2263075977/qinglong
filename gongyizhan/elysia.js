@@ -10,7 +10,7 @@ const { chromium } = require('playwright');
 
 // 配置
 const CONFIG = {
-  URL: 'https://elysia.h-e.top/console/personal',
+  URL: 'https://elysiver.h-e.top/console/personal',
   ENV: 'ELYSIA_ACCOUNTS',
   USER_ID: '944',
   HEADLESS: true,
