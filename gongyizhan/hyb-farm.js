@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// cron: 35 */2 * * *
+// cron: */30 * * * *
 // new Env('黑与白福利站 轻松农场');
-// description: 黑与白福利站轻松农场状态查询、收获、护理和批量种植
+// description: 黑与白福利站轻松农场自动收获、护理、补种杨桃、变现与补货
 
 const fs = require('fs');
 const http = require('http');
@@ -22,6 +22,19 @@ const COOKIE_ENV_NAMES = [
   'HYB_COOKIE',
   'HYB_CARDS_COOKIE',
 ];
+
+// 主种锁定杨桃 starfruit（VIP 最优，10h 周期契合 30min cron）。
+// 名字/ID 双匹配，回退到 HYB_FARM_SEED_ID，再回退到内置常量。
+const MAIN_SEED_ID = 'starfruit';
+const MAIN_SEED_ALIASES = ['starfruit', '杨桃'];
+const MAX_SLIPPAGE_BPS = 300; // 回收滑点保护：超过 3% 自动拒绝
+const DEFAULT_MIN_ENERGY = 10; // 护理前保留的体力阈值
+const DEFAULT_SELL_RATIO = 0.95; // 当前回收价 ≥ 7 日均价 × 该比例才卖（躲低谷）
+const DEFAULT_FORCE_SELL_USAGE = 0.85; // 仓库使用率 ≥ 该值时无视价格强制卖（防满仓卡死）
+// 卖出前保留的种子数，默认 0。安全前提：用户更新脚本前会手动一次性把 starfruit 种子全部种下（库存清零），
+// 此后库存中出现的 starfruit 均为收获的果实（种子/果实同池），故 0 保留不会误卖种子。
+// 若日后会“买种子囤着分批种”，需调高此值兜底，否则未种的种子会被当盈余卖出。
+const DEFAULT_SEED_RESERVE = 0;
 
 class HybFarmError extends Error {
   constructor(message, details = {}) {
@@ -106,6 +119,18 @@ function parseBoolean(raw, fallback = false) {
   return ['1', 'true', 'yes', 'y', 'on'].includes(String(raw).trim().toLowerCase());
 }
 
+function parseFloatOrDefault(raw, fallback) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const value = Number.parseFloat(String(raw));
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function parseNonNegativeInteger(raw, fallback = 0) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const value = Number.parseInt(String(raw), 10);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function normalizeDefaultAction(raw = DEFAULT_ACTION) {
   const action = String(raw || DEFAULT_ACTION).trim().toLowerCase();
   if (!FARM_ACTIONS.has(action)) {
@@ -158,6 +183,16 @@ function getConfig() {
     plantBodyRaw: (process.env.HYB_FARM_PLANT_BODY || '').trim(),
     timeoutMs: parsePositiveInteger(process.env.HYB_FARM_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     autoExecute: parseBoolean(process.env.HYB_FARM_AUTO_EXECUTE, false),
+    // 主种：默认锁定杨桃 starfruit，HYB_FARM_SEED_ID 可覆盖
+    mainSeedId: (process.env.HYB_FARM_SEED_ID || MAIN_SEED_ID).trim(),
+    minEnergy: parseNonNegativeInteger(process.env.HYB_FARM_MIN_ENERGY, DEFAULT_MIN_ENERGY),
+    // 卖出/补货开关与保护参数
+    autoSell: parseBoolean(process.env.HYB_FARM_AUTO_SELL, true),
+    autoBuy: parseBoolean(process.env.HYB_FARM_AUTO_BUY, true),
+    sellRatio: parseFloatOrDefault(process.env.HYB_FARM_SELL_RATIO, DEFAULT_SELL_RATIO),
+    forceSellUsage: parseFloatOrDefault(process.env.HYB_FARM_FORCE_SELL_USAGE, DEFAULT_FORCE_SELL_USAGE),
+    seedReserve: parseNonNegativeInteger(process.env.HYB_FARM_SEED_RESERVE, DEFAULT_SEED_RESERVE),
+    maxBuyCost: parsePositiveInteger(process.env.HYB_FARM_MAX_BUY_COST, null),
   };
 }
 
@@ -228,7 +263,7 @@ function printUsage() {
   harvest-all   一键收获成熟作物
   care-all      一键务农，处理浇水/除草/杀虫等护理
   plant-batch   批量种植，默认请求体为 { seedId, quantity }
-  auto          自动流程：查询 -> 收获 -> 护理 -> 按空地补种
+  auto          自动流程：收获 -> 护理 -> 补货 -> 补种杨桃 -> 卖出盈余
 
 选项:
   --seed-id <id>      种子 ID，例如 golden_apple
@@ -244,28 +279,35 @@ function printUsage() {
   HYBGZS_COOKIE          兼容，完整浏览器 Cookie 字符串
   HYB_COOKIE             兼容，完整浏览器 Cookie 字符串
   HYB_CARDS_COOKIE       兼容，可复用 50 连抽脚本 Cookie
-  HYB_FARM_SEED_ID       可选，默认种子 ID
+  HYB_FARM_SEED_ID       可选，主种 ID，覆盖默认杨桃 ${MAIN_SEED_ID}
   HYB_FARM_QUANTITY      可选，默认种植数量
   HYB_FARM_MAX_PLANT     可选，auto 最大补种数量
   HYB_FARM_PLANT_BODY    可选，覆盖 plant-batch JSON 请求体
   HYB_FARM_DEFAULT_ACTION 可选，无参数运行时的动作，默认 status
   HYB_FARM_AUTO_EXECUTE  可选，设为 1/true 时允许 auto 默认执行
+  HYB_FARM_MIN_ENERGY    可选，护理前保留的体力阈值，默认 ${DEFAULT_MIN_ENERGY}
+  HYB_FARM_AUTO_SELL     可选，auto 自动卖出盈余果实，默认开启，设 0 关闭
+  HYB_FARM_AUTO_BUY      可选，auto 种子不足时自动补货，默认开启，设 0 关闭
+  HYB_FARM_SELL_RATIO    可选，当前价 ≥ 7日均价×该值才卖，默认 ${DEFAULT_SELL_RATIO}
+  HYB_FARM_FORCE_SELL_USAGE 可选，仓库使用率 ≥ 该值时无视价格强制卖，默认 ${DEFAULT_FORCE_SELL_USAGE}
+  HYB_FARM_SEED_RESERVE  可选，卖出前额外保留的种子数，默认 ${DEFAULT_SEED_RESERVE}
+  HYB_FARM_MAX_BUY_COST  可选，单次补货含税总价上限，默认无上限
   HYB_FARM_ACCOUNT       可选，通知中展示的账号备注
   HYB_FARM_BASE_URL      可选，默认为 ${DEFAULT_BASE_URL}
   HYB_FARM_TIMEOUT_MS    可选，请求超时时间（毫秒），默认为 ${DEFAULT_TIMEOUT_MS}
 
 示例:
   node hyb-farm.js status
-  node hyb-farm.js plant-batch --seed-id golden_apple --quantity 16
-  node hyb-farm.js auto --seed-id golden_apple --execute
+  node hyb-farm.js plant-batch --seed-id starfruit --quantity 16
+  node hyb-farm.js auto --execute
 
 青龙环境变量自动化（任务命令无需追加参数）:
   HYB_FARM_DEFAULT_ACTION=auto    无参数运行时进入自动流程
-  HYB_FARM_AUTO_EXECUTE=1        允许真实收获、护理和种植；不设置时为 dry-run
-  HYB_FARM_SEED_ID=golden_apple  指定空地默认补种的种子
+  HYB_FARM_AUTO_EXECUTE=1        允许真实收获、护理、补货、种植与卖出；不设置时为 dry-run
+  （主种默认锁定杨桃 starfruit，如需改种用 HYB_FARM_SEED_ID 覆盖）
 
 青龙定时任务:
-  35 */2 * * * task 仓库目录/gongyizhan/hyb-farm.js`);
+  */30 * * * * task 仓库目录/gongyizhan/hyb-farm.js`);
 }
 
 function isQinglongEnvironment() {
@@ -633,13 +675,29 @@ function isMaturePlot(plot, nowMs = Date.now()) {
   return Number.isFinite(timestamp) && timestamp <= nowMs;
 }
 
+// 实测（2026-07-14 抓包）debuff 以成对时间戳表示：
+//   thirstyStartedAt / weedStartedAt / pestStartedAt  —— 缺水/杂草/虫害的发生时刻
+//   thirstyHealedAt  / weedHealedAt  / pestHealedAt   —— 对应的治愈时刻
+// 「需护理」= 某类 StartedAt 有值，且尚未治愈（HealedAt 为空或早于 StartedAt）。
+function hasActiveDebuff(plot, kind) {
+  const started = plot[`${kind}StartedAt`];
+  if (started === undefined || started === null || started === '') return false;
+  const startedMs = Date.parse(String(started));
+  const healed = plot[`${kind}HealedAt`];
+  if (healed === undefined || healed === null || healed === '') return true;
+  const healedMs = Date.parse(String(healed));
+  // 治愈时刻早于发生时刻 → 当前这次 debuff 未被治愈，仍需护理
+  return Number.isFinite(startedMs) && Number.isFinite(healedMs) && healedMs < startedMs;
+}
+
 function isNeedsCarePlot(plot) {
   if (!plot || typeof plot !== 'object') return false;
+  if (hasActiveDebuff(plot, 'thirsty') || hasActiveDebuff(plot, 'weed') || hasActiveDebuff(plot, 'pest')) {
+    return true;
+  }
+  // 兜底：conditions 数组或状态文字（结构变动时仍能识别）
   const status = String(plot.status || plot.state || '').toLowerCase();
   return (Array.isArray(plot.conditions) && plot.conditions.length > 0) ||
-    plot.needsWater === true || plot.needWater === true ||
-    plot.needsWeed === true || plot.hasWeed === true ||
-    plot.needsPest === true || plot.hasPest === true ||
     plot.needsCare === true || status.includes('water') ||
     status.includes('weed') || status.includes('pest') || status.includes('护理');
 }
@@ -662,23 +720,112 @@ function getQuantity(item) {
   return getNumber(item?.quantity ?? item?.count ?? item?.amount ?? item?.stock, 0);
 }
 
+// 解析仓库容量。返回 { capacity, used, usage(0~1) }，字段缺失时对应值为 null。
+function parseWarehouse(state) {
+  const inv = state?.inventory;
+  if (!inv || typeof inv !== 'object') return { capacity: null, used: null, usage: null };
+  // warehouse 可能在顶层，也可能嵌在 data 下
+  const wh = inv.warehouse || inv.data?.warehouse || getData(inv)?.warehouse || null;
+  if (!wh || typeof wh !== 'object') return { capacity: null, used: null, usage: null };
+  const capacity = getNumber(wh.capacity ?? wh.maxCapacity ?? wh.max ?? wh.total, null);
+  const used = getNumber(wh.usedCapacity ?? wh.used ?? wh.usage ?? wh.current, null);
+  const usage = capacity && capacity > 0 && used !== null ? used / capacity : null;
+  return { capacity, used, usage };
+}
+
+// 解析真实可补种空地数。
+// ⚠️ 实测（2026-07-14）：plots.freeSlots 不是"空闲地块数"，而是"免费档槽位数"
+//   （freeSlots 6 / unlockedSlots 8 / vipBonusSlots 2 = totalSlots 16，是槽位分档计数）。
+//   真正能补种的地 = unlockedPlotIndexes 里未被 crops.plotIndex 占用的槽位。
+// 回退：拿不到 unlockedPlotIndexes 时返回 null，由调用方用 总槽−已占 推算。
+function parseFreeSlots(state) {
+  const plots = state?.plots;
+  if (!plots || plots.unavailable || typeof plots !== 'object') return null;
+  const data = getData(plots);
+  const unlocked = Array.isArray(data?.unlockedPlotIndexes) ? data.unlockedPlotIndexes : null;
+  if (!unlocked || !unlocked.length) return null;
+
+  const cropItems = getExplicitArray(state.crops, ['crops', 'plots'], isPlotLike);
+  const occupied = new Set();
+  for (const c of cropItems) {
+    if (!c || typeof c !== 'object') continue;
+    if (!(c.seedId || c.cropId || c.crop || c.plantedAt)) continue; // 只算真种着作物的
+    const idx = getNumber(c.plotIndex, null);
+    if (idx !== null) occupied.add(Math.trunc(idx));
+  }
+  const free = unlocked.filter((i) => !occupied.has(Math.trunc(getNumber(i, -1)))).length;
+  return Math.max(0, free);
+}
+
+// 解析回收价与 7 日均价。返回 Map<seedId, { price, avg7 }>，price/avg7 均为回收口径。
+// 实测结构（2026-07-14 抓包核对）：
+//   data[]           → 每种作物当前回收价 {seedId, recyclePrice}（无趋势）
+//   market.items[]   → 市场价 {seedId, unitPrice, trend:[{avgUnitPrice}...]}（7 日趋势在这）
+//   recycleValueMultiplier → 回收价 ≈ 市场价 × 该系数（实测 0.516，近似常数）
+// 因回收价与市场价成固定比例，用「市场 7 日均价 × 系数」换算出回收口径的 avg7，
+// 与当前回收价比值即可判断是否处于低谷。
+function parseRecyclePrices(state) {
+  const prices = new Map();
+  const raw = state?.recyclePrices;
+  if (!raw || raw.unavailable) return prices;
+  const multiplier = getNumber(raw?.recycleValueMultiplier, null);
+
+  // 当前回收价：data[] → {seedId, recyclePrice}
+  const list = Array.isArray(raw?.data) ? raw.data
+    : getExplicitArray(raw, ['prices', 'data'], (item) =>
+        item && typeof item === 'object' && ('seedId' in item || 'id' in item));
+
+  // 市场 7 日趋势：market.items[].trend[].avgUnitPrice
+  const marketItems = Array.isArray(raw?.market?.items) ? raw.market.items : [];
+  const avg7MarketById = new Map();
+  for (const m of marketItems) {
+    const id = String(m?.seedId || '').trim();
+    if (!id) continue;
+    const trend = Array.isArray(m?.trend) ? m.trend : [];
+    const nums = trend
+      .map((t) => getNumber(t?.avgUnitPrice ?? t?.avgPrice ?? t?.price, null))
+      .filter((n) => n !== null && n > 0);
+    if (nums.length) avg7MarketById.set(id, nums.reduce((a, b) => a + b, 0) / nums.length);
+    else {
+      // 趋势缺失时退回市场当前价，至少有个参照
+      const cur = getNumber(m?.unitPrice, null);
+      if (cur !== null && cur > 0) avg7MarketById.set(id, cur);
+    }
+  }
+
+  for (const item of list) {
+    const id = String(item?.seedId || item?.id || '').trim();
+    if (!id) continue;
+    const price = getNumber(item?.recyclePrice ?? item?.price ?? item?.unitPrice, null);
+    // 市场 7 日均价 × 回收系数 → 回收口径的 avg7
+    const avg7Market = avg7MarketById.get(id) ?? null;
+    let avg7 = null;
+    if (avg7Market !== null && multiplier !== null) avg7 = avg7Market * multiplier;
+    if (price !== null || avg7 !== null) prices.set(id, { price, avg7 });
+  }
+  return prices;
+}
+
 async function fetchState(config) {
   console.log(`${LOG_PREFIX} 开始查询农场状态`);
+  // required：这几个接口失败直接抛错；optional：失败降级不影响主流程
   const endpoints = [
-    ['crops', '/api/farm/crops'],
-    ['seeds', '/api/farm/seeds'],
-    ['inventory', '/api/farm/inventory'],
-    ['energy', '/api/farm/energy/status'],
+    ['crops', '/api/farm/crops', true],
+    ['seeds', '/api/farm/seeds', true],
+    ['inventory', '/api/farm/inventory', true],
+    ['energy', '/api/farm/energy/status', false],
+    ['plots', '/api/farm/plots', false],
+    ['recyclePrices', '/api/farm/recycle/prices?includeTrend=1&granularity=day&trendRange=7', false],
   ];
   const state = {};
 
-  for (const [key, apiPath] of endpoints) {
+  for (const [key, apiPath, required] of endpoints) {
     try {
       const result = await requestJson(config, apiPath);
       assertSuccess(result, `获取 ${key} 失败`);
       state[key] = result;
     } catch (error) {
-      if (key === 'energy') {
+      if (!required) {
         state[key] = { unavailable: true, error: error.message };
         continue;
       }
@@ -694,11 +841,14 @@ function summarizeState(state, nowMs = Date.now()) {
   const plots = cropItems.filter((plot) => !isEmptyPlot(plot));
   const seeds = getExplicitArray(state.seeds, ['seeds'], isSeedLike);
   const inventory = getExplicitArray(state.inventory, ['inventory', 'items'], isInventoryLike);
+  // 空地数优先用 /api/farm/plots 的 freeSlots（权威），缺失时回退到 crops 推算
+  const authoritativeFree = parseFreeSlots(state);
   const totalSlots = getSlotCount(state.crops, plots.length);
+  const emptyByCrops = Math.max(0, totalSlots - plots.length);
   const plotSummary = {
     total: totalSlots,
     mature: plots.filter((plot) => isMaturePlot(plot, nowMs)).length,
-    empty: Math.max(0, totalSlots - plots.length),
+    empty: authoritativeFree !== null ? authoritativeFree : emptyByCrops,
     needsCare: plots.filter(isNeedsCarePlot).length,
     growing: plots.filter((plot) => isGrowingPlot(plot, nowMs)).length,
   };
@@ -767,12 +917,20 @@ function summarizeState(state, nowMs = Date.now()) {
     plotSummary,
     seedStockById,
     seeds: topSeeds,
+    warehouse: parseWarehouse(state),
+    recyclePrices: parseRecyclePrices(state),
   };
 }
 
 function formatItems(items) {
   if (!items.length) return '无可展示库存';
   return items.map((item) => `${item.name}(${item.id}) x${item.quantity}`).join('，');
+}
+
+function formatWarehouse(warehouse) {
+  if (!warehouse || warehouse.capacity === null || warehouse.used === null) return '容量未知';
+  const pct = warehouse.usage === null ? '?' : `${Math.round(warehouse.usage * 100)}%`;
+  return `${warehouse.used}/${warehouse.capacity}（${pct}）`;
 }
 
 function formatStatus(config, state) {
@@ -786,6 +944,7 @@ function formatStatus(config, state) {
     `账号: ${config.accountName || '当前账号'}`,
     `地块: 共 ${summary.plotSummary.total}，成熟 ${summary.plotSummary.mature}，空闲 ${summary.plotSummary.empty}，需护理 ${summary.plotSummary.needsCare}，生长中 ${summary.plotSummary.growing}`,
     `体力: ${energyText}`,
+    `仓库: ${formatWarehouse(summary.warehouse)}`,
     `可用种子: ${formatItems(summary.seeds)}`,
     `仓库库存: ${formatItems(summary.inventory)}`,
   ];
@@ -839,6 +998,8 @@ function getResultIcon(type) {
   if (type === 'skipped') return '⏭️';
   if (type === 'dry_run') return '🧪';
   if (type === 'challenge_required') return '🧩';
+  if (type === 'warehouse_full') return '📦';
+  if (type === 'vip_required') return '👑';
   return '❌';
 }
 
@@ -893,8 +1054,31 @@ async function postAction(config, action, apiPath, body = {}) {
 }
 
 async function performHarvestAll(config, dryRun = false) {
-  if (dryRun) return makeResult('一键收获', 'dry_run', 'dry-run，未执行 POST /api/farm/harvest-all');
-  return postAction(config, '一键收获', '/api/farm/harvest-all', {});
+  const action = '一键收获';
+  // destroyIfFull=false：仓满时不销毁多余作物，宁可停下也不丢东西，改由通知提醒去卖
+  if (dryRun) return makeResult(action, 'dry_run', 'dry-run，未执行 POST /api/farm/harvest-all');
+  try {
+    const result = await requestJson(config, '/api/farm/harvest-all', {
+      method: 'POST',
+      body: { destroyIfFull: false },
+    });
+    // 仓满可能以 success:false 形式返回，先判仓满再断言
+    if (isWarehouseFull(result)) {
+      return makeResult(action, 'warehouse_full', '仓库已满，部分作物未能收获，请尽快去卖出腾空间');
+    }
+    assertSuccess(result, `${action}失败`);
+    const data = getData(result);
+    const destroyed = getNumber(data?.destroyedCount, 0);
+    const base = makeResult(action, 'success', summarizeActionData(data), { data });
+    if (destroyed > 0) base.message += `（销毁 ${destroyed}）`;
+    return base;
+  } catch (error) {
+    // 仓满也可能以 HTTP 错误 / 抛异常形式出现
+    if (error instanceof HybFarmError && isWarehouseFull(error.details?.response || error.details)) {
+      return makeResult(action, 'warehouse_full', '仓库已满，部分作物未能收获，请尽快去卖出腾空间');
+    }
+    return resultFromError(action, error);
+  }
 }
 
 async function performCareAll(config, dryRun = false) {
@@ -903,9 +1087,161 @@ async function performCareAll(config, dryRun = false) {
 }
 
 async function performPlantBatch(config, body, dryRun = false) {
+  const action = '批量种植';
   const label = `批量种植 ${body.seedId || 'custom'} x${body.quantity || '?'}`;
-  if (dryRun) return makeResult('批量种植', 'dry_run', `dry-run，计划 ${label}`);
-  return postAction(config, '批量种植', '/api/farm/plant-batch', body);
+  if (dryRun) return makeResult(action, 'dry_run', `dry-run，计划 ${label}`);
+  const result = await postAction(config, action, '/api/farm/plant-batch', body);
+  // VIP 专属作物在 VIP 失效时种植失败 → 标成 vip_required 以便单独发通知提醒续费
+  if (isFailureResult(result) && isVipMessage(result.message)) {
+    return makeResult(action, 'vip_required', `种植 ${body.seedId} 失败，疑似 VIP 已过期：${result.message}`);
+  }
+  return result;
+}
+
+// 从 seeds 目录用 名字/ID 双匹配定位主种（杨桃 starfruit）。返回 { seedId, seed } 或 null。
+function resolveMainSeed(config, state) {
+  const seeds = getExplicitArray(state.seeds, ['seeds'], isSeedLike);
+  const wanted = String(config.mainSeedId || '').trim().toLowerCase();
+  // 别名（starfruit/杨桃）只在目标确为默认主种时启用；用户覆盖 HYB_FARM_SEED_ID 后只按其精确匹配
+  const useAliases = wanted === MAIN_SEED_ID.toLowerCase();
+  const aliases = useAliases ? MAIN_SEED_ALIASES.map((a) => a.toLowerCase()) : [];
+  const matches = (v) => {
+    const s = String(v || '').trim().toLowerCase();
+    return s !== '' && (s === wanted || aliases.includes(s));
+  };
+  for (const seed of seeds) {
+    if (matches(seed?.id) || matches(seed?.seedId) || matches(seed?.name)) {
+      return { seedId: String(seed.id || seed.seedId).trim(), seed };
+    }
+  }
+  return null;
+}
+
+// VIP 专属作物在 VIP 失效时种植会失败，识别这类消息以便单独发通知提醒续费。
+function isVipMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('vip') || text.includes('会员') || text.includes('特权') ||
+    text.includes('权限不足') || text.includes('专属');
+}
+
+// 仓满错误码 WAREHOUSE_FULL（藏在 error.data.error.code 或消息里）。
+function isWarehouseFull(result) {
+  const code = String(
+    result?.data?.error?.code || result?.error?.code || result?.code || ''
+  ).toUpperCase();
+  if (code === 'WAREHOUSE_FULL') return true;
+  const text = String(getMessage(result)).toLowerCase();
+  return text.includes('warehouse_full') || text.includes('仓库已满') || text.includes('仓库满');
+}
+
+// 决定是否卖出：force（仓将满）无视价格；否则要求当前价 ≥ 7 日均价 × sellRatio（躲低谷）。
+function shouldSell(config, warehouse, priceInfo) {
+  const force = warehouse?.usage !== null && warehouse?.usage !== undefined &&
+    warehouse.usage >= config.forceSellUsage;
+  if (force) return { sell: true, force: true, reason: `仓库使用率 ${(warehouse.usage * 100).toFixed(0)}% ≥ ${(config.forceSellUsage * 100).toFixed(0)}%，强制卖出` };
+  const price = priceInfo?.price ?? null;
+  const avg7 = priceInfo?.avg7 ?? null;
+  // 没有均价参照就默认卖（实测回收价几乎不波动，等高价无意义）
+  if (avg7 === null || price === null) return { sell: true, force: false, reason: '无 7 日均价参照，按稳定价卖出' };
+  if (price >= avg7 * config.sellRatio) {
+    return { sell: true, force: false, reason: `当前价 ${price} ≥ 均价 ${avg7.toFixed(0)}×${config.sellRatio}` };
+  }
+  return { sell: false, force: false, reason: `当前价 ${price} < 均价 ${avg7.toFixed(0)}×${config.sellRatio}，低谷跳过` };
+}
+
+// 卖出主种的果实盈余（两步：quote 拿即时价 → recycle 带滑点保护）。
+// 前置：本轮补种已完成，seedStockById 反映补种后剩余，因此卖的都是纯盈余果实，不会误卖种子。
+async function runSell(config, seedId, summary, dryRun = false) {
+  const action = '交易所卖出';
+  if (!config.autoSell) return makeResult(action, 'skipped', '未开启自动卖出（HYB_FARM_AUTO_SELL=0）');
+  const stock = getNumber(summary.seedStockById?.[seedId], 0);
+  const sellable = stock - config.seedReserve;
+  if (sellable <= 0) {
+    return makeResult(action, 'skipped', `${seedId} 盈余不足（库存 ${stock}，保留 ${config.seedReserve}）`);
+  }
+
+  const priceInfo = summary.recyclePrices?.get(seedId) || null;
+  const decision = shouldSell(config, summary.warehouse, priceInfo);
+  if (!decision.sell) return makeResult(action, 'skipped', decision.reason);
+
+  if (dryRun) {
+    return makeResult(action, 'dry_run', `dry-run，计划卖出 ${seedId} x${sellable}（${decision.reason}）`);
+  }
+
+  try {
+    const quote = await requestJson(config, '/api/farm/recycle/quote', {
+      method: 'POST',
+      body: { seedId, quantity: sellable },
+    });
+    assertSuccess(quote, '获取回收报价失败');
+    const quoteData = getData(quote);
+    const unitPrice = getNumber(quoteData?.unitPrice ?? quoteData?.price ?? quoteData?.expectedUnitPrice, null);
+    if (unitPrice === null) {
+      return makeResult(action, 'error', '回收报价缺少 unitPrice 字段，已跳过卖出');
+    }
+    const result = await requestJson(config, '/api/farm/recycle', {
+      method: 'POST',
+      body: { seedId, quantity: sellable, expectedUnitPrice: unitPrice, maxSlippageBps: MAX_SLIPPAGE_BPS },
+    });
+    assertSuccess(result, '回收卖出失败');
+    const data = getData(result);
+    const gained = getNumber(data?.totalQuota ?? data?.total ?? data?.gained, null);
+    const msg = `卖出 ${seedId} x${sellable} @${unitPrice}${gained !== null ? `，获得 ${gained}` : ''}（${decision.reason}）`;
+    return makeResult(action, 'success', msg, { data });
+  } catch (error) {
+    return resultFromError(action, error);
+  }
+}
+
+// 从菜场买最低价挂单补足种子（两步：market 列表挑最低价 → quote 校验含税总价 → purchase）。
+async function runBuy(config, seedId, needed, dryRun = false) {
+  const action = '菜场补货';
+  if (!config.autoBuy) return makeResult(action, 'skipped', '未开启自动补货（HYB_FARM_AUTO_BUY=0）');
+  if (needed <= 0) return makeResult(action, 'skipped', '库存充足，无需补货');
+
+  try {
+    const market = await requestJson(config, `/api/farm/market?seedId=${encodeURIComponent(seedId)}&page=1&limit=20`);
+    assertSuccess(market, '获取菜场挂单失败');
+    const listings = getExplicitArray(market, ['listings', 'data'], (i) =>
+      i && typeof i === 'object' && ('pricePerUnit' in i || 'price' in i));
+    const valid = listings
+      .map((l) => ({
+        listingId: l?.id || l?.listingId,
+        pricePerUnit: getNumber(l?.pricePerUnit ?? l?.price, null),
+        quantity: getNumber(l?.quantity ?? l?.amount, 0),
+      }))
+      .filter((l) => l.listingId && l.pricePerUnit !== null && l.quantity > 0)
+      .sort((a, b) => a.pricePerUnit - b.pricePerUnit);
+    if (!valid.length) return makeResult(action, 'skipped', `菜场无 ${seedId} 可买挂单`);
+
+    const best = valid[0];
+    const buyQty = Math.min(needed, best.quantity);
+    if (dryRun) {
+      return makeResult(action, 'dry_run', `dry-run，计划买 ${seedId} x${buyQty} @${best.pricePerUnit}`);
+    }
+
+    const quote = await requestJson(config, '/api/farm/market/quote', {
+      method: 'POST',
+      body: { listingId: best.listingId, quantity: buyQty },
+    });
+    assertSuccess(quote, '获取菜场报价失败');
+    const quoteData = getData(quote);
+    const total = getNumber(quoteData?.buyerPaysTotal ?? quoteData?.total ?? quoteData?.totalCost, null);
+    if (config.maxBuyCost !== null && total !== null && total > config.maxBuyCost) {
+      return makeResult(action, 'skipped', `含税总价 ${total} 超过上限 ${config.maxBuyCost}，已跳过补货`);
+    }
+
+    const result = await requestJson(config, '/api/farm/market/purchase', {
+      method: 'POST',
+      body: { listingId: best.listingId, quantity: buyQty },
+    });
+    assertSuccess(result, '菜场购买失败');
+    const tax = getNumber(quoteData?.taxAmount, null);
+    const msg = `买入 ${seedId} x${buyQty} @${best.pricePerUnit}${total !== null ? `，含税总价 ${total}` : ''}${tax !== null ? `（税 ${tax}）` : ''}`;
+    return makeResult(action, 'success', msg, { data: getData(result), boughtQty: buyQty });
+  } catch (error) {
+    return resultFromError(action, error);
+  }
 }
 
 async function runAuto(config, args) {
@@ -916,6 +1252,7 @@ async function runAuto(config, args) {
   const results = [];
   let harvestResult = null;
 
+  // 1. 收获成熟作物（destroyIfFull=false，仓满走单独通知）
   if (initialSummary.plotSummary.mature > 0) {
     harvestResult = await performHarvestAll(config, dryRun);
     results.push(harvestResult);
@@ -923,35 +1260,67 @@ async function runAuto(config, args) {
     results.push(makeResult('一键收获', 'skipped', '没有成熟作物'));
   }
 
+  // 2. 护理：需护理 + 体力充足才做（体力不足留给别的用途）
   if (initialSummary.plotSummary.needsCare > 0) {
-    results.push(await performCareAll(config, dryRun));
+    const energy = initialSummary.energy;
+    if (energy !== null && energy < config.minEnergy) {
+      results.push(makeResult('一键务农', 'skipped', `体力 ${energy} 低于阈值 ${config.minEnergy}，跳过护理`));
+    } else {
+      results.push(await performCareAll(config, dryRun));
+    }
   } else {
     results.push(makeResult('一键务农', 'skipped', '没有需要护理的地块'));
   }
 
-  const shouldRefreshState = !dryRun && harvestResult?.type === 'success';
-  const latestState = shouldRefreshState ? await fetchState(config) : initialState;
-  const latestSummary = summarizeState(latestState);
-  if (latestSummary.plotSummary.empty > 0) {
+  // 收获后刷新一次状态，拿到最新空地与库存
+  const shouldRefreshAfterHarvest = !dryRun && harvestResult?.type === 'success';
+  let workState = shouldRefreshAfterHarvest ? await fetchState(config) : initialState;
+  let workSummary = summarizeState(workState);
+
+  // 3. 定位主种（杨桃）。定位不到就回退到 config.mainSeedId 原样使用
+  const resolved = resolveMainSeed(config, workState);
+  const seedId = resolved ? resolved.seedId : config.mainSeedId;
+
+  // 4. 补种前先补货：空地数 > 主种库存时，去菜场买最低价补足
+  const empty = workSummary.plotSummary.empty;
+  if (empty > 0) {
+    const stock = getNumber(workSummary.seedStockById?.[seedId], 0);
+    const shortfall = empty - stock;
+    if (shortfall > 0) {
+      const buyResult = await runBuy(config, seedId, shortfall, dryRun);
+      results.push(buyResult);
+      // 买成功后刷新库存，让后续补种能用上新买的种子
+      if (!dryRun && buyResult.type === 'success') {
+        workState = await fetchState(config);
+        workSummary = summarizeState(workState);
+      }
+    }
+  }
+
+  // 5. 补种主种到空地
+  if (workSummary.plotSummary.empty > 0) {
     try {
-      const body = buildPlantBody(config, args, latestSummary);
+      const body = buildPlantBody(config, { ...args, seedId }, workSummary);
       if (body.quantity > 0) {
         results.push(await performPlantBatch(config, body, dryRun));
       } else {
-        results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
+        results.push(makeResult('批量种植', 'skipped', '没有可补种的空地或种子'));
       }
     } catch (error) {
-      if (latestSummary.plotSummary.empty > 0) {
-        results.push(resultFromError('批量种植', error));
-      } else {
-        results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
-      }
+      results.push(resultFromError('批量种植', error));
     }
   } else {
     results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
   }
 
-  return { dryRun, results, state: latestState };
+  // 6. 卖出盈余：补种已消耗种子，此处刷新后的库存即纯果实盈余，不会误卖种子
+  const plantSucceeded = !dryRun && results.some((r) => r.action === '批量种植' && r.type === 'success');
+  const sellState = plantSucceeded ? await fetchState(config) : workState;
+  const sellSummary = plantSucceeded ? summarizeState(sellState) : workSummary;
+  results.push(await runSell(config, seedId, sellSummary, dryRun));
+
+  const finalState = plantSucceeded ? sellState : workState;
+  return { dryRun, results, state: finalState };
 }
 
 function formatSummary(config, state, results = [], statusOnly = false) {
@@ -1023,6 +1392,23 @@ async function run() {
   for (const result of autoResult.results) {
     console.log(`${LOG_PREFIX} ${formatResult(result)}`);
   }
+
+  // 仓满 / VIP失效或种植失败 —— 单独各发一条（仿 f799c2b 签到失败分离发送）
+  const warehouseFull = autoResult.results.filter((r) => r.type === 'warehouse_full');
+  const vipIssues = autoResult.results.filter((r) => r.type === 'vip_required');
+  if (warehouseFull.length > 0) {
+    await sendQinglongNotification(
+      `${TASK_NAME} · 仓库已满`,
+      `📦 仓库已满，作物未能全部收获\n\n${warehouseFull.map(formatResult).join('\n')}\n\n请尽快去交易所卖出腾空间。`
+    );
+  }
+  if (vipIssues.length > 0) {
+    await sendQinglongNotification(
+      `${TASK_NAME} · VIP 失效`,
+      `👑 主种为 VIP 专属作物，种植失败，疑似 VIP 已过期\n\n${vipIssues.map(formatResult).join('\n')}\n\n请续费 VIP 或用 HYB_FARM_SEED_ID 改种非 VIP 作物。`
+    );
+  }
+
   await sendQinglongNotification(TASK_NAME, formatSummary(config, autoResult.state, autoResult.results));
   if (autoResult.results.some(isFailureResult)) process.exitCode = 1;
 }
@@ -1062,14 +1448,21 @@ module.exports = {
   normalizeCookie,
   normalizeDefaultAction,
   parseArgs,
+  parseWarehouse,
+  parseFreeSlots,
+  parseRecyclePrices,
   performCareAll,
   performHarvestAll,
   performPlantBatch,
   requestJson,
+  resolveMainSeed,
   run,
   runAuto,
+  runBuy,
+  runSell,
   scrubBody,
   scrubResponse,
   sendQinglongNotification,
+  shouldSell,
   summarizeState,
 };
