@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // cron: */30 * * * *
 // new Env('黑与白福利站 轻松农场');
-// description: 黑与白福利站轻松农场自动收获、护理、补种杨桃、变现与补货
+// description: 黑与白福利站轻松农场自动收获、护理、补种杨桃与变现
 
 const fs = require('fs');
 const http = require('http');
@@ -186,13 +186,11 @@ function getConfig() {
     // 主种：默认锁定杨桃 starfruit，HYB_FARM_SEED_ID 可覆盖
     mainSeedId: (process.env.HYB_FARM_SEED_ID || MAIN_SEED_ID).trim(),
     minEnergy: parseNonNegativeInteger(process.env.HYB_FARM_MIN_ENERGY, DEFAULT_MIN_ENERGY),
-    // 卖出/补货开关与保护参数
+    // 卖出开关与保护参数
     autoSell: parseBoolean(process.env.HYB_FARM_AUTO_SELL, true),
-    autoBuy: parseBoolean(process.env.HYB_FARM_AUTO_BUY, true),
     sellRatio: parseFloatOrDefault(process.env.HYB_FARM_SELL_RATIO, DEFAULT_SELL_RATIO),
     forceSellUsage: parseFloatOrDefault(process.env.HYB_FARM_FORCE_SELL_USAGE, DEFAULT_FORCE_SELL_USAGE),
     seedReserve: parseNonNegativeInteger(process.env.HYB_FARM_SEED_RESERVE, DEFAULT_SEED_RESERVE),
-    maxBuyCost: parsePositiveInteger(process.env.HYB_FARM_MAX_BUY_COST, null),
   };
 }
 
@@ -263,7 +261,7 @@ function printUsage() {
   harvest-all   一键收获成熟作物
   care-all      一键务农，处理浇水/除草/杀虫等护理
   plant-batch   批量种植，默认请求体为 { seedId, quantity }
-  auto          自动流程：收获 -> 护理 -> 补货 -> 补种杨桃 -> 卖出盈余
+  auto          自动流程：收获 -> 护理 -> 补种杨桃 -> 卖出盈余
 
 选项:
   --seed-id <id>      种子 ID，例如 golden_apple
@@ -287,11 +285,9 @@ function printUsage() {
   HYB_FARM_AUTO_EXECUTE  可选，设为 1/true 时允许 auto 默认执行
   HYB_FARM_MIN_ENERGY    可选，护理前保留的体力阈值，默认 ${DEFAULT_MIN_ENERGY}
   HYB_FARM_AUTO_SELL     可选，auto 自动卖出盈余果实，默认开启，设 0 关闭
-  HYB_FARM_AUTO_BUY      可选，auto 种子不足时自动补货，默认开启，设 0 关闭
   HYB_FARM_SELL_RATIO    可选，当前价 ≥ 7日均价×该值才卖，默认 ${DEFAULT_SELL_RATIO}
   HYB_FARM_FORCE_SELL_USAGE 可选，仓库使用率 ≥ 该值时无视价格强制卖，默认 ${DEFAULT_FORCE_SELL_USAGE}
   HYB_FARM_SEED_RESERVE  可选，卖出前额外保留的种子数，默认 ${DEFAULT_SEED_RESERVE}
-  HYB_FARM_MAX_BUY_COST  可选，单次补货含税总价上限，默认无上限
   HYB_FARM_ACCOUNT       可选，通知中展示的账号备注
   HYB_FARM_BASE_URL      可选，默认为 ${DEFAULT_BASE_URL}
   HYB_FARM_TIMEOUT_MS    可选，请求超时时间（毫秒），默认为 ${DEFAULT_TIMEOUT_MS}
@@ -303,7 +299,7 @@ function printUsage() {
 
 青龙环境变量自动化（任务命令无需追加参数）:
   HYB_FARM_DEFAULT_ACTION=auto    无参数运行时进入自动流程
-  HYB_FARM_AUTO_EXECUTE=1        允许真实收获、护理、补货、种植与卖出；不设置时为 dry-run
+  HYB_FARM_AUTO_EXECUTE=1        允许真实收获、护理、种植与卖出；不设置时为 dry-run
   （主种默认锁定杨桃 starfruit，如需改种用 HYB_FARM_SEED_ID 覆盖）
 
 青龙定时任务:
@@ -1200,57 +1196,6 @@ async function runSell(config, seedId, summary, dryRun = false) {
   }
 }
 
-// 从菜场买最低价挂单补足种子（两步：market 列表挑最低价 → quote 校验含税总价 → purchase）。
-async function runBuy(config, seedId, needed, dryRun = false) {
-  const action = '菜场补货';
-  if (!config.autoBuy) return makeResult(action, 'skipped', '未开启自动补货（HYB_FARM_AUTO_BUY=0）');
-  if (needed <= 0) return makeResult(action, 'skipped', '库存充足，无需补货');
-
-  try {
-    const market = await requestJson(config, `/api/farm/market?seedId=${encodeURIComponent(seedId)}&page=1&limit=20`);
-    assertSuccess(market, '获取菜场挂单失败');
-    const listings = getExplicitArray(market, ['listings', 'data'], (i) =>
-      i && typeof i === 'object' && ('pricePerUnit' in i || 'price' in i));
-    const valid = listings
-      .map((l) => ({
-        listingId: l?.id || l?.listingId,
-        pricePerUnit: getNumber(l?.pricePerUnit ?? l?.price, null),
-        quantity: getNumber(l?.quantity ?? l?.amount, 0),
-      }))
-      .filter((l) => l.listingId && l.pricePerUnit !== null && l.quantity > 0)
-      .sort((a, b) => a.pricePerUnit - b.pricePerUnit);
-    if (!valid.length) return makeResult(action, 'skipped', `菜场无 ${seedId} 可买挂单`);
-
-    const best = valid[0];
-    const buyQty = Math.min(needed, best.quantity);
-    if (dryRun) {
-      return makeResult(action, 'dry_run', `dry-run，计划买 ${seedId} x${buyQty} @${best.pricePerUnit}`);
-    }
-
-    const quote = await requestJson(config, '/api/farm/market/quote', {
-      method: 'POST',
-      body: { listingId: best.listingId, quantity: buyQty },
-    });
-    assertSuccess(quote, '获取菜场报价失败');
-    const quoteData = getData(quote);
-    const total = getNumber(quoteData?.buyerPaysTotal ?? quoteData?.total ?? quoteData?.totalCost, null);
-    if (config.maxBuyCost !== null && total !== null && total > config.maxBuyCost) {
-      return makeResult(action, 'skipped', `含税总价 ${total} 超过上限 ${config.maxBuyCost}，已跳过补货`);
-    }
-
-    const result = await requestJson(config, '/api/farm/market/purchase', {
-      method: 'POST',
-      body: { listingId: best.listingId, quantity: buyQty },
-    });
-    assertSuccess(result, '菜场购买失败');
-    const tax = getNumber(quoteData?.taxAmount, null);
-    const msg = `买入 ${seedId} x${buyQty} @${best.pricePerUnit}${total !== null ? `，含税总价 ${total}` : ''}${tax !== null ? `（税 ${tax}）` : ''}`;
-    return makeResult(action, 'success', msg, { data: getData(result), boughtQty: buyQty });
-  } catch (error) {
-    return resultFromError(action, error);
-  }
-}
-
 async function runAuto(config, args) {
   const shouldExecute = args.execute || config.autoExecute;
   const dryRun = args.dryRun || !shouldExecute;
@@ -1281,30 +1226,14 @@ async function runAuto(config, args) {
 
   // 收获后刷新一次状态，拿到最新空地与库存
   const shouldRefreshAfterHarvest = !dryRun && harvestResult?.type === 'success';
-  let workState = shouldRefreshAfterHarvest ? await fetchState(config) : initialState;
-  let workSummary = summarizeState(workState);
+  const workState = shouldRefreshAfterHarvest ? await fetchState(config) : initialState;
+  const workSummary = summarizeState(workState);
 
   // 3. 定位主种（杨桃）。定位不到就回退到 config.mainSeedId 原样使用
   const resolved = resolveMainSeed(config, workState);
   const seedId = resolved ? resolved.seedId : config.mainSeedId;
 
-  // 4. 补种前先补货：空地数 > 主种库存时，去菜场买最低价补足
-  const empty = workSummary.plotSummary.empty;
-  if (empty > 0) {
-    const stock = getNumber(workSummary.seedStockById?.[seedId], 0);
-    const shortfall = empty - stock;
-    if (shortfall > 0) {
-      const buyResult = await runBuy(config, seedId, shortfall, dryRun);
-      results.push(buyResult);
-      // 买成功后刷新库存，让后续补种能用上新买的种子
-      if (!dryRun && buyResult.type === 'success') {
-        workState = await fetchState(config);
-        workSummary = summarizeState(workState);
-      }
-    }
-  }
-
-  // 5. 补种主种到空地
+  // 4. 补种主种到空地（种子不足时按现有库存尽量补，不再从菜场买入以免撞回收冷却）
   if (workSummary.plotSummary.empty > 0) {
     try {
       const body = buildPlantBody(config, { ...args, seedId }, workSummary);
@@ -1320,7 +1249,7 @@ async function runAuto(config, args) {
     results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
   }
 
-  // 6. 卖出盈余：仅在本轮真收获了果实时才卖。
+  // 5. 卖出盈余：仅在本轮真收获了果实时才卖。
   //    关键安全前提——种子与果实同池，库存无法区分二者。只有本轮收获成功，
   //    才能确定库存里新增的是果实；否则（没成熟/没收获）库存里全是种子，绝不能卖。
   //    补种在收获后进行，会先消耗掉种子，故收获后刷新的库存即纯果实盈余。
@@ -1478,7 +1407,6 @@ module.exports = {
   resolveMainSeed,
   run,
   runAuto,
-  runBuy,
   runSell,
   scrubBody,
   scrubResponse,
