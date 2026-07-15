@@ -376,6 +376,13 @@ async function sendQinglongNotification(title, body) {
 
 function getMessage(value) {
   if (!value || typeof value !== 'object') return '';
+  // error 可能是字符串，也可能是对象 {code, message}（实测结构）
+  const err = value.error;
+  if (err && typeof err === 'object') {
+    const nested = String(err.message || err.msg || err.reason || '').trim();
+    if (nested) return err.code !== undefined ? `${nested}（code ${err.code}）` : nested;
+    if (err.code !== undefined) return `错误码 ${err.code}`;
+  }
   return String(value.error || value.message || value.msg || value.reason || '').trim();
 }
 
@@ -1313,13 +1320,26 @@ async function runAuto(config, args) {
     results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
   }
 
-  // 6. 卖出盈余：补种已消耗种子，此处刷新后的库存即纯果实盈余，不会误卖种子
-  const plantSucceeded = !dryRun && results.some((r) => r.action === '批量种植' && r.type === 'success');
-  const sellState = plantSucceeded ? await fetchState(config) : workState;
-  const sellSummary = plantSucceeded ? summarizeState(sellState) : workSummary;
-  results.push(await runSell(config, seedId, sellSummary, dryRun));
+  // 6. 卖出盈余：仅在本轮真收获了果实时才卖。
+  //    关键安全前提——种子与果实同池，库存无法区分二者。只有本轮收获成功，
+  //    才能确定库存里新增的是果实；否则（没成熟/没收获）库存里全是种子，绝不能卖。
+  //    补种在收获后进行，会先消耗掉种子，故收获后刷新的库存即纯果实盈余。
+  const harvestSucceeded = !dryRun && harvestResult?.type === 'success';
+  let finalState = workState;
+  if (harvestSucceeded) {
+    // 补种可能又消耗了库存，卖出前用最新状态
+    const plantSucceeded = results.some((r) => r.action === '批量种植' && r.type === 'success');
+    const sellState = plantSucceeded ? await fetchState(config) : workState;
+    const sellSummary = plantSucceeded ? summarizeState(sellState) : workSummary;
+    results.push(await runSell(config, seedId, sellSummary, dryRun));
+    finalState = sellState;
+  } else if (dryRun && config.autoSell) {
+    // dry-run 时给个提示，说明真实运行的卖出取决于是否收获
+    results.push(makeResult('交易所卖出', 'skipped', '本轮未收获果实，跳过卖出（种子/果实同池，避免误卖种子）'));
+  } else {
+    results.push(makeResult('交易所卖出', 'skipped', '本轮未收获果实，跳过卖出'));
+  }
 
-  const finalState = plantSucceeded ? sellState : workState;
   return { dryRun, results, state: finalState };
 }
 
