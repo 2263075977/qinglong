@@ -9,7 +9,7 @@ const https = require('https');
 const path = require('path');
 
 const DEFAULT_BASE_URL = 'https://up.x666.me';
-const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 45000;
 const QUOTA_PER_TIME = 500;
 const TASK_NAME = '薄荷签到';
 
@@ -223,6 +223,9 @@ function requestJson(config, apiPath, options = {}) {
   };
 
   return new Promise((resolve, reject) => {
+    // 标记超时：req.destroy() 会触发 'error' 事件，靠此标志避免超时被二次包裹成"网络请求失败"
+    let timedOut = false;
+
     const req = client.request(requestOptions, (res) => {
       let body = '';
       res.setEncoding('utf8');
@@ -254,10 +257,22 @@ function requestJson(config, apiPath, options = {}) {
     });
 
     req.setTimeout(config.timeoutMs, () => {
-      req.destroy(new SignInError(`请求超时（${config.timeoutMs}ms）: ${method} ${apiPath}`));
+      timedOut = true;
+      req.destroy();
     });
 
     req.on('error', (error) => {
+      if (timedOut) {
+        reject(new SignInError(
+          `请求超时（${config.timeoutMs}ms）: ${method} ${apiPath}\n` +
+          `接口在超时时间内未返回数据，常见原因：\n` +
+          `  1. Cookie/token 已失效（服务器对无效会话响应缓慢，最终卡到超时）\n` +
+          `  2. 站点服务器繁忙或临时故障\n` +
+          `若确认 token 仍在有效期，多为服务器临时繁忙，可稍后重试`,
+          { isTimeout: true }
+        ));
+        return;
+      }
       reject(new SignInError(
         `网络请求失败: ${error.message}\n` +
         `请求: ${method} ${apiPath}\n` +
@@ -353,13 +368,16 @@ async function run() {
     assertSuccess(userInfo, '会话验证失败');
   } catch (error) {
     const errorMsg = error instanceof SignInError ? error.message : String(error);
-    console.error(`[up.x666] ❌ 会话验证失败`);
+    // 超时归为“接口无响应”而非“会话失效”，避免误导用户去换仍然有效的 Cookie
+    const isTimeout = error instanceof SignInError && error.details && error.details.isTimeout === true;
+    const label = isTimeout ? '接口响应超时' : '会话验证失败';
+    console.error(`[up.x666] ❌ ${label}`);
     console.error(`[up.x666] 错误详情: ${errorMsg}`);
 
-    await sendQinglongNotification(
-      TASK_NAME,
-      `❌ 发生异常：会话验证失败\n\n${errorMsg}\n\n请更新环境变量 UP_X666_COOKIE`
-    );
+    const notifyBody = isTimeout
+      ? `❌ 发生异常：${label}\n\n${errorMsg}\n\n若 token 已失效请更新环境变量 UP_X666_COOKIE`
+      : `❌ 发生异常：${label}\n\n${errorMsg}\n\n请更新环境变量 UP_X666_COOKIE`;
+    await sendQinglongNotification(TASK_NAME, notifyBody);
     throw error;
   }
 
