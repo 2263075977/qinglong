@@ -260,12 +260,12 @@ function printUsage() {
   status        查询农场、种子、仓库、体力状态，默认动作，只读
   harvest-all   一键收获成熟作物
   care-all      一键务农，处理浇水/除草/杀虫等护理
-  plant-batch   批量种植，默认请求体为 { seedId, quantity }
+  plant-batch   批量种植，数量默认取空闲地块最大值
   auto          自动流程：收获 -> 护理 -> 补种杨桃 -> 卖出盈余
 
 选项:
   --seed-id <id>      种子 ID，例如 golden_apple
-  --quantity <n>      种植数量；auto 未设置时使用空地数量
+  --quantity <n>      种植数量；未设置时使用空地数量，不按库存截断
   --max-plant <n>     auto 最大补种数量
   --dry-run           只展示计划，不执行 POST 动作
   --execute           允许 auto 执行 POST；auto 默认 dry-run
@@ -278,7 +278,7 @@ function printUsage() {
   HYB_COOKIE             兼容，完整浏览器 Cookie 字符串
   HYB_CARDS_COOKIE       兼容，可复用 50 连抽脚本 Cookie
   HYB_FARM_SEED_ID       可选，主种 ID，覆盖默认杨桃 ${MAIN_SEED_ID}
-  HYB_FARM_QUANTITY      可选，默认种植数量
+  HYB_FARM_QUANTITY      可选，默认种植数量；未设置时按空地最大
   HYB_FARM_MAX_PLANT     可选，auto 最大补种数量
   HYB_FARM_PLANT_BODY    可选，覆盖 plant-batch JSON 请求体
   HYB_FARM_DEFAULT_ACTION 可选，无参数运行时的动作，默认 status
@@ -978,15 +978,8 @@ function buildPlantBody(config, args, summary = null) {
 
   const maxPlant = args.maxPlant ?? config.maxPlant ?? null;
   if (maxPlant !== null) quantity = Math.min(quantity, maxPlant);
-  if (summary) {
-    const available = getNumber(summary.seedStockById?.[seedId], 0);
-    if (available <= 0) {
-      throw new HybFarmError(`种子 ${seedId} 库存不足，已跳过补种`, { type: 'skipped' });
-    }
-    quantity = Math.min(quantity, available);
-  }
   if (!Number.isFinite(quantity) || quantity <= 0) {
-    throw new HybFarmError('没有可补种的空地或可用种子', { type: 'skipped' });
+    throw new HybFarmError('没有可补种的空地', { type: 'skipped' });
   }
 
   return { seedId, quantity };
@@ -1099,6 +1092,76 @@ async function performPlantBatch(config, body, dryRun = false) {
     return makeResult(action, 'vip_required', `种植 ${body.seedId} 失败，疑似 VIP 已过期：${result.message}`);
   }
   return result;
+}
+
+function describePlantRemainder(config, args, summary, plantedTotal) {
+  const empty = summary.plotSummary.empty;
+  const requested = args.quantity ?? config.defaultQuantity ?? null;
+  const maxPlant = args.maxPlant ?? config.maxPlant ?? null;
+  const prefix = `已补种 ${plantedTotal} 块，仍有 ${empty} 块空地`;
+
+  if (requested !== null && plantedTotal >= requested) {
+    return `${prefix}；已达到指定种植数量 ${requested}`;
+  }
+  if (maxPlant !== null && plantedTotal >= maxPlant) {
+    return `${prefix}；已达到最大补种数量 ${maxPlant}`;
+  }
+  return `${prefix}；本轮安全补种目标已完成`;
+}
+
+async function plantEmptySlots(config, args, state, summary, seedId, dryRun = false) {
+  const results = [];
+  let currentState = state;
+  let currentSummary = summary;
+  let targetBody;
+
+  try {
+    targetBody = buildPlantBody(config, { ...args, seedId }, currentSummary);
+  } catch (error) {
+    results.push(resultFromError('批量种植', error));
+    return { results, state: currentState, summary: currentSummary };
+  }
+
+  let remaining = targetBody.quantity;
+  let plantedTotal = 0;
+
+  while (remaining > 0 && currentSummary.plotSummary.empty > 0) {
+    // 对齐页面“最大”：按空地提交，不按当前库存截断；接口会处理超出库存的种植量。
+    const quantity = Math.min(remaining, currentSummary.plotSummary.empty);
+    if (quantity <= 0) break;
+
+    const result = await performPlantBatch(config, { ...targetBody, quantity }, dryRun);
+    results.push(result);
+    if (dryRun || result.type !== 'success') break;
+
+    const emptyBefore = currentSummary.plotSummary.empty;
+    currentState = await fetchState(config);
+    currentSummary = summarizeState(currentState);
+    const planted = Math.max(0, emptyBefore - currentSummary.plotSummary.empty);
+
+    if (planted <= 0) {
+      results.push(makeResult(
+        '补种核验',
+        'error',
+        `接口返回成功，但空地仍为 ${currentSummary.plotSummary.empty} 块；已停止重试`
+      ));
+      break;
+    }
+
+    plantedTotal += planted;
+    remaining = Math.max(0, remaining - planted);
+  }
+
+  const hasFailure = results.some(isFailureResult);
+  if (!dryRun && !hasFailure && currentSummary.plotSummary.empty > 0) {
+    results.push(makeResult(
+      '补种核验',
+      'skipped',
+      describePlantRemainder(config, args, currentSummary, plantedTotal)
+    ));
+  }
+
+  return { results, state: currentState, summary: currentSummary };
 }
 
 // 从 seeds 目录用 名字/ID 双匹配定位主种（杨桃 starfruit）。返回 { seedId, seed } 或 null。
@@ -1226,25 +1289,19 @@ async function runAuto(config, args) {
 
   // 收获后刷新一次状态，拿到最新空地与库存
   const shouldRefreshAfterHarvest = !dryRun && harvestResult?.type === 'success';
-  const workState = shouldRefreshAfterHarvest ? await fetchState(config) : initialState;
-  const workSummary = summarizeState(workState);
+  let workState = shouldRefreshAfterHarvest ? await fetchState(config) : initialState;
+  let workSummary = summarizeState(workState);
 
   // 3. 定位主种（杨桃）。定位不到就回退到 config.mainSeedId 原样使用
   const resolved = resolveMainSeed(config, workState);
   const seedId = resolved ? resolved.seedId : config.mainSeedId;
 
-  // 4. 补种主种到空地（种子不足时按现有库存尽量补，不再从菜场买入以免撞回收冷却）
+  // 4. 补种主种到空地。每次成功后按权威状态核验，接口部分完成时继续补齐本轮安全目标。
   if (workSummary.plotSummary.empty > 0) {
-    try {
-      const body = buildPlantBody(config, { ...args, seedId }, workSummary);
-      if (body.quantity > 0) {
-        results.push(await performPlantBatch(config, body, dryRun));
-      } else {
-        results.push(makeResult('批量种植', 'skipped', '没有可补种的空地或种子'));
-      }
-    } catch (error) {
-      results.push(resultFromError('批量种植', error));
-    }
+    const plantRun = await plantEmptySlots(config, args, workState, workSummary, seedId, dryRun);
+    results.push(...plantRun.results);
+    workState = plantRun.state;
+    workSummary = plantRun.summary;
   } else {
     results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
   }
@@ -1254,14 +1311,9 @@ async function runAuto(config, args) {
   //    才能确定库存里新增的是果实；否则（没成熟/没收获）库存里全是种子，绝不能卖。
   //    补种在收获后进行，会先消耗掉种子，故收获后刷新的库存即纯果实盈余。
   const harvestSucceeded = !dryRun && harvestResult?.type === 'success';
-  let finalState = workState;
   if (harvestSucceeded) {
-    // 补种可能又消耗了库存，卖出前用最新状态
-    const plantSucceeded = results.some((r) => r.action === '批量种植' && r.type === 'success');
-    const sellState = plantSucceeded ? await fetchState(config) : workState;
-    const sellSummary = plantSucceeded ? summarizeState(sellState) : workSummary;
-    results.push(await runSell(config, seedId, sellSummary, dryRun));
-    finalState = sellState;
+    // plantEmptySlots 已在每次真实种植后刷新库存，此处直接使用最新状态。
+    results.push(await runSell(config, seedId, workSummary, dryRun));
   } else if (dryRun && config.autoSell) {
     // dry-run 时给个提示，说明真实运行的卖出取决于是否收获
     results.push(makeResult('交易所卖出', 'skipped', '本轮未收获果实，跳过卖出（种子/果实同池，避免误卖种子）'));
@@ -1269,7 +1321,7 @@ async function runAuto(config, args) {
     results.push(makeResult('交易所卖出', 'skipped', '本轮未收获果实，跳过卖出'));
   }
 
-  return { dryRun, results, state: finalState };
+  return { dryRun, results, state: workState };
 }
 
 function formatSummary(config, state, results = [], statusOnly = false) {
@@ -1310,11 +1362,18 @@ async function run() {
   }
 
   if (args.action === 'plant-batch') {
-    const body = buildPlantBody(config, args);
-    const result = await performPlantBatch(config, body, args.dryRun);
-    console.log(`${LOG_PREFIX} ${formatResult(result)}`);
-    await sendQinglongNotification(TASK_NAME, formatSummary(config, {}, [result]));
-    if (isFailureResult(result)) process.exitCode = 1;
+    const state = await fetchState(config);
+    const summary = summarizeState(state);
+    const seedId = (args.seedId || config.defaultSeedId || '').trim();
+    const plantRun = await plantEmptySlots(config, args, state, summary, seedId, args.dryRun);
+    for (const result of plantRun.results) {
+      console.log(`${LOG_PREFIX} ${formatResult(result)}`);
+    }
+    await sendQinglongNotification(
+      TASK_NAME,
+      formatSummary(config, plantRun.state, plantRun.results)
+    );
+    if (plantRun.results.some(isFailureResult)) process.exitCode = 1;
     return;
   }
 
@@ -1400,6 +1459,7 @@ module.exports = {
   parseWarehouse,
   parseFreeSlots,
   parseRecyclePrices,
+  plantEmptySlots,
   performCareAll,
   performHarvestAll,
   performPlantBatch,
