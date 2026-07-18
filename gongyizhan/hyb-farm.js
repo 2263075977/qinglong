@@ -736,28 +736,16 @@ function parseWarehouse(state) {
   return { capacity, used, usage };
 }
 
-// 解析真实可补种空地数。
-// ⚠️ 实测（2026-07-14）：plots.freeSlots 不是"空闲地块数"，而是"免费档槽位数"
-//   （freeSlots 6 / unlockedSlots 8 / vipBonusSlots 2 = totalSlots 16，是槽位分档计数）。
-//   真正能补种的地 = unlockedPlotIndexes 里未被 crops.plotIndex 占用的槽位。
-// 回退：拿不到 unlockedPlotIndexes 时返回 null，由调用方用 总槽−已占 推算。
+// 与网页“选择种子 -> 最大”保持一致：
+// availableSlots = /api/farm/crops.maxSlots - plantedCrops.length。
+// /api/farm/plots 的 freeSlots / unlockedPlotIndexes 用于地块分档和解锁，
+// 不是种植弹窗的可用槽位数，用它推算会少算免费或 VIP 地块。
 function parseFreeSlots(state) {
-  const plots = state?.plots;
-  if (!plots || plots.unavailable || typeof plots !== 'object') return null;
-  const data = getData(plots);
-  const unlocked = Array.isArray(data?.unlockedPlotIndexes) ? data.unlockedPlotIndexes : null;
-  if (!unlocked || !unlocked.length) return null;
-
-  const cropItems = getExplicitArray(state.crops, ['crops', 'plots'], isPlotLike);
-  const occupied = new Set();
-  for (const c of cropItems) {
-    if (!c || typeof c !== 'object') continue;
-    if (!(c.seedId || c.cropId || c.crop || c.plantedAt)) continue; // 只算真种着作物的
-    const idx = getNumber(c.plotIndex, null);
-    if (idx !== null) occupied.add(Math.trunc(idx));
-  }
-  const free = unlocked.filter((i) => !occupied.has(Math.trunc(getNumber(i, -1)))).length;
-  return Math.max(0, free);
+  const crops = state?.crops;
+  const cropItems = getExplicitArray(crops, ['crops', 'plots'], isPlotLike);
+  const plantedCount = cropItems.filter((plot) => !isEmptyPlot(plot)).length;
+  const totalSlots = getSlotCount(crops, plantedCount);
+  return Math.max(0, totalSlots - plantedCount);
 }
 
 // 解析回收价与 7 日均价。返回 Map<seedId, { price, avg7 }>，price/avg7 均为回收口径。
@@ -844,14 +832,11 @@ function summarizeState(state, nowMs = Date.now()) {
   const plots = cropItems.filter((plot) => !isEmptyPlot(plot));
   const seeds = getExplicitArray(state.seeds, ['seeds'], isSeedLike);
   const inventory = getExplicitArray(state.inventory, ['inventory', 'items'], isInventoryLike);
-  // 空地数优先用 /api/farm/plots 的 freeSlots（权威），缺失时回退到 crops 推算
-  const authoritativeFree = parseFreeSlots(state);
   const totalSlots = getSlotCount(state.crops, plots.length);
-  const emptyByCrops = Math.max(0, totalSlots - plots.length);
   const plotSummary = {
     total: totalSlots,
     mature: plots.filter((plot) => isMaturePlot(plot, nowMs)).length,
-    empty: authoritativeFree !== null ? authoritativeFree : emptyByCrops,
+    empty: parseFreeSlots(state),
     needsCare: plots.filter(isNeedsCarePlot).length,
     growing: plots.filter((plot) => isGrowingPlot(plot, nowMs)).length,
   };
