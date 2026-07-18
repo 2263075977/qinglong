@@ -4,6 +4,7 @@
 // description: 黑与白福利站轻松农场自动收获、护理、补种杨桃与变现
 
 const fs = require('fs');
+const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const path = require('path');
@@ -14,7 +15,31 @@ const TASK_NAME = '黑与白福利站 轻松农场';
 const LOG_PREFIX = '[hybgzs-farm]';
 const FARM_REFERER_PATH = '/entertainment/farm';
 const DEFAULT_ACTION = 'status';
+const NOTIFICATION_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const NOTIFICATION_STATE_FILENAME = 'hyb-farm-notification-state.json';
 const FARM_ACTIONS = new Set(['status', 'harvest-all', 'care-all', 'plant-batch', 'auto']);
+const IMPORTANT_SUCCESS_ACTIONS = new Set(['一键收获', '交易所卖出']);
+const ISSUE_DEFINITIONS = [
+  ['auth_failed', 'Cookie 失效', '🍪'],
+  ['challenge_required', 'Cloudflare 验证', '🧩'],
+  ['warehouse_full', '仓库已满', '📦'],
+  ['vip_required', 'VIP 失效', '👑'],
+  ['schema_changed', '响应结构异常', '🧱'],
+  ['api_error', '接口异常', '❌'],
+  ['network_error', '网络异常', '🌐'],
+  ['config_error', '配置异常', '⚙️'],
+  ['runtime_error', '运行异常', '❌'],
+];
+const IMPORTANT_ISSUE_TYPES = new Set(ISSUE_DEFINITIONS.map(([type]) => type));
+const FAILURE_RESULT_TYPES = new Set([
+  'error',
+  'auth_failed',
+  'schema_changed',
+  'api_error',
+  'network_error',
+  'config_error',
+  'runtime_error',
+]);
 const COOKIE_ENV_NAMES = [
   'HYB_FARM_COOKIE',
   'HYB_DASHBOARD_COOKIE',
@@ -194,6 +219,115 @@ function getConfig() {
   };
 }
 
+function getNotificationAccountConfig() {
+  const cookieConfig = getCookieFromEnv();
+  return {
+    accountName: (process.env.HYB_FARM_ACCOUNT || '').trim(),
+    cookie: cookieConfig?.cookie || '',
+  };
+}
+
+function getAccountIdentity(config = {}) {
+  const accountName = String(config.accountName || '').trim();
+  const cookie = normalizeCookie(config.cookie);
+  const source = accountName ? `account:${accountName}` : `cookie:${cookie || 'missing'}`;
+  const digest = crypto.createHash('sha256').update(source).digest('hex');
+  return {
+    key: `sha256:${digest}`,
+    label: accountName || `Cookie#${digest.slice(0, 12)}`,
+  };
+}
+
+function getNotificationStateFile(env = process.env) {
+  const qlDataDir = String(env.QL_DATA_DIR || '').trim();
+  if (qlDataDir) return path.join(qlDataDir, 'config', NOTIFICATION_STATE_FILENAME);
+
+  const qlDir = String(env.QL_DIR || '').trim();
+  if (qlDir) return path.join(qlDir, 'config', NOTIFICATION_STATE_FILENAME);
+
+  const homeDir = String(env.HOME || env.USERPROFILE || '').trim() || __dirname;
+  return path.join(homeDir, '.hyb-farm', NOTIFICATION_STATE_FILENAME);
+}
+
+function makeEmptyNotificationState() {
+  return { version: 1, accounts: {} };
+}
+
+function normalizeNotificationState(value) {
+  const normalized = makeEmptyNotificationState();
+  if (!value || typeof value !== 'object' || !value.accounts || typeof value.accounts !== 'object') {
+    return normalized;
+  }
+
+  for (const [accountKey, cooldowns] of Object.entries(value.accounts)) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(accountKey) || !cooldowns || typeof cooldowns !== 'object') {
+      continue;
+    }
+
+    const validCooldowns = {};
+    for (const [type, timestamp] of Object.entries(cooldowns)) {
+      if (!IMPORTANT_ISSUE_TYPES.has(type) || !Number.isFinite(timestamp) || timestamp < 0) continue;
+      validCooldowns[type] = timestamp;
+    }
+    if (Object.keys(validCooldowns).length > 0) normalized.accounts[accountKey] = validCooldowns;
+  }
+
+  return normalized;
+}
+
+function logNotificationError(logger, message) {
+  const log = logger && typeof logger.error === 'function' ? logger.error.bind(logger) : console.error;
+  log(`${LOG_PREFIX} ${message}`);
+}
+
+function readNotificationState(file, logger = console) {
+  try {
+    if (!fs.existsSync(file)) return makeEmptyNotificationState();
+    return normalizeNotificationState(JSON.parse(fs.readFileSync(file, 'utf8')));
+  } catch (error) {
+    logNotificationError(logger, `读取通知冷却状态失败，按无冷却继续: ${error.message}`);
+    return makeEmptyNotificationState();
+  }
+}
+
+function writeNotificationStateAtomic(file, state) {
+  const directory = path.dirname(file);
+  const tempFile = path.join(
+    directory,
+    `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`
+  );
+
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    fs.writeFileSync(tempFile, `${JSON.stringify(normalizeNotificationState(state), null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    fs.renameSync(tempFile, file);
+  } finally {
+    try {
+      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    } catch {
+      // 临时文件清理由状态写入边界尽力完成，不影响农场主流程。
+    }
+  }
+}
+
+function isIssueCooling(state, accountKey, type, nowMs = Date.now()) {
+  const lastNotifiedAt = state?.accounts?.[accountKey]?.[type];
+  return Number.isFinite(lastNotifiedAt) && nowMs - lastNotifiedAt < NOTIFICATION_COOLDOWN_MS;
+}
+
+function recordIssueCooldowns(state, accountKey, issueTypes, nowMs = Date.now()) {
+  const nextState = normalizeNotificationState(state);
+  const cooldowns = { ...(nextState.accounts[accountKey] || {}) };
+  for (const type of issueTypes) {
+    if (IMPORTANT_ISSUE_TYPES.has(type)) cooldowns[type] = nowMs;
+  }
+  if (Object.keys(cooldowns).length > 0) nextState.accounts[accountKey] = cooldowns;
+  return nextState;
+}
+
 function parseArgs(argv, defaultAction = DEFAULT_ACTION) {
   const args = {
     action: normalizeDefaultAction(defaultAction),
@@ -362,8 +496,8 @@ async function sendQinglongNotification(title, body) {
   }
 
   try {
-    await Promise.resolve(notify.sendNotify(title, body));
-    return true;
+    const result = await Promise.resolve(notify.sendNotify(title, body));
+    return result !== false;
   } catch (error) {
     console.error(`${LOG_PREFIX} 青龙通知发送失败: ${error.message}`);
     return false;
@@ -587,9 +721,9 @@ function getNumber(value, fallback = 0) {
   return fallback;
 }
 
-function getExplicitArray(value, keys, predicate) {
+function getKnownArray(value, keys) {
   if (Array.isArray(value)) return value;
-  if (!value || typeof value !== 'object') return [];
+  if (!value || typeof value !== 'object') return null;
 
   for (const key of keys) {
     if (Array.isArray(value[key])) return value[key];
@@ -603,10 +737,18 @@ function getExplicitArray(value, keys, predicate) {
     }
   }
 
+  return null;
+}
+
+function getExplicitArray(value, keys, predicate) {
+  const known = getKnownArray(value, keys);
+  if (known) return known;
+  if (!value || typeof value !== 'object') return [];
+
   return getBestArray(value, predicate);
 }
 
-function getSlotCount(value, plantedCount) {
+function getSlotCount(value, plantedCount, fallback = plantedCount) {
   const candidates = [
     value?.maxSlots,
     value?.data?.maxSlots,
@@ -619,7 +761,45 @@ function getSlotCount(value, plantedCount) {
     const count = getNumber(candidate, null);
     if (count !== null && count >= plantedCount) return Math.trunc(count);
   }
-  return plantedCount;
+  return fallback;
+}
+
+function describeResponseShape(value) {
+  const data = value?.data;
+  return {
+    dataKeys: data && typeof data === 'object' && !Array.isArray(data)
+      ? Object.keys(data).slice(0, 20)
+      : [],
+    dataType: Array.isArray(data) ? `array(${data.length})` : typeof data,
+    topLevelKeys: value && typeof value === 'object' ? Object.keys(value).slice(0, 20) : [],
+  };
+}
+
+function validateStateResponse(key, result) {
+  const contracts = {
+    crops: { keys: ['crops', 'plots', 'plantedCrops'], predicate: isPlotLike },
+    seeds: { keys: ['seeds'], predicate: isSeedLike },
+    inventory: { keys: ['inventory', 'items'], predicate: isInventoryLike },
+  };
+  const contract = contracts[key];
+  if (!contract) return result;
+
+  const items = getKnownArray(result, contract.keys);
+  if (!items || (items.length > 0 && !items.some(contract.predicate))) {
+    throw new HybFarmError(`获取 ${key} 失败: 接口响应缺少可识别的列表结构`, {
+      type: 'schema_changed',
+      responseShape: describeResponseShape(result),
+    });
+  }
+
+  if (key === 'crops' && getSlotCount(result, items.length, null) === null) {
+    throw new HybFarmError('获取 crops 失败: 接口响应缺少可识别的地块容量字段', {
+      type: 'schema_changed',
+      responseShape: describeResponseShape(result),
+    });
+  }
+
+  return result;
 }
 
 function findArrays(value, predicate, results = []) {
@@ -742,7 +922,7 @@ function parseWarehouse(state) {
 // 不是种植弹窗的可用槽位数，用它推算会少算免费或 VIP 地块。
 function parseFreeSlots(state) {
   const crops = state?.crops;
-  const cropItems = getExplicitArray(crops, ['crops', 'plots'], isPlotLike);
+  const cropItems = getExplicitArray(crops, ['crops', 'plots', 'plantedCrops'], isPlotLike);
   const plantedCount = cropItems.filter((plot) => !isEmptyPlot(plot)).length;
   const totalSlots = getSlotCount(crops, plantedCount);
   return Math.max(0, totalSlots - plantedCount);
@@ -814,10 +994,14 @@ async function fetchState(config) {
     try {
       const result = await requestJson(config, apiPath);
       assertSuccess(result, `获取 ${key} 失败`);
+      if (required) validateStateResponse(key, result);
       state[key] = result;
     } catch (error) {
       if (!required) {
-        state[key] = { unavailable: true, error: error.message };
+        const errorType = error instanceof HybFarmError ? error.type : 'api_error';
+        const errorMessage = error?.message || String(error);
+        console.error(`${LOG_PREFIX} 可选接口 ${key} 请求失败，主流程继续: ${errorMessage}`);
+        state[key] = { unavailable: true, error: errorMessage, errorType };
         continue;
       }
       throw error;
@@ -828,7 +1012,7 @@ async function fetchState(config) {
 }
 
 function summarizeState(state, nowMs = Date.now()) {
-  const cropItems = getExplicitArray(state.crops, ['crops', 'plots'], isPlotLike);
+  const cropItems = getExplicitArray(state.crops, ['crops', 'plots', 'plantedCrops'], isPlotLike);
   const plots = cropItems.filter((plot) => !isEmptyPlot(plot));
   const seeds = getExplicitArray(state.seeds, ['seeds'], isSeedLike);
   const inventory = getExplicitArray(state.inventory, ['inventory', 'items'], isInventoryLike);
@@ -929,7 +1113,7 @@ function formatStatus(config, state) {
       ? String(summary.energy)
       : `${summary.energy}/${summary.energyMax}`;
   const lines = [
-    `账号: ${config.accountName || '当前账号'}`,
+    `账号: ${getAccountIdentity(config).label}`,
     `地块: 共 ${summary.plotSummary.total}，成熟 ${summary.plotSummary.mature}，空闲 ${summary.plotSummary.empty}，需护理 ${summary.plotSummary.needsCare}，生长中 ${summary.plotSummary.growing}`,
     `体力: ${energyText}`,
     `仓库: ${formatWarehouse(summary.warehouse)}`,
@@ -985,7 +1169,7 @@ function getResultIcon(type) {
 }
 
 function isFailureResult(result) {
-  return result.type === 'error' || result.type === 'auth_failed' || result.type === 'schema_changed';
+  return FAILURE_RESULT_TYPES.has(result.type);
 }
 
 function resultFromError(action, error) {
@@ -1001,6 +1185,9 @@ function resultFromError(action, error) {
   }
   if (error instanceof HybFarmError && error.type === 'schema_changed') {
     return makeResult(action, 'schema_changed', `${action}失败: 接口结构变化或返回非预期内容`);
+  }
+  if (error instanceof HybFarmError && IMPORTANT_ISSUE_TYPES.has(error.type)) {
+    return makeResult(action, error.type, `${action}失败: ${message}`);
   }
   return makeResult(action, 'error', `${action}失败: ${message}`);
 }
@@ -1120,8 +1307,13 @@ async function plantEmptySlots(config, args, state, summary, seedId, dryRun = fa
     if (dryRun || result.type !== 'success') break;
 
     const emptyBefore = currentSummary.plotSummary.empty;
-    currentState = await fetchState(config);
-    currentSummary = summarizeState(currentState);
+    try {
+      currentState = await fetchState(config);
+      currentSummary = summarizeState(currentState);
+    } catch (error) {
+      results.push(resultFromError('补种核验', error));
+      break;
+    }
     const planted = Math.max(0, emptyBefore - currentSummary.plotSummary.empty);
 
     if (planted <= 0) {
@@ -1252,7 +1444,7 @@ async function runAuto(config, args) {
   const results = [];
   let harvestResult = null;
 
-  // 1. 收获成熟作物（destroyIfFull=false，仓满走单独通知）
+  // 1. 收获成熟作物（destroyIfFull=false，仓满归入本轮重要异常）
   if (initialSummary.plotSummary.mature > 0) {
     harvestResult = await performHarvestAll(config, dryRun);
     results.push(harvestResult);
@@ -1274,7 +1466,15 @@ async function runAuto(config, args) {
 
   // 收获后刷新一次状态，拿到最新空地与库存
   const shouldRefreshAfterHarvest = !dryRun && harvestResult?.type === 'success';
-  let workState = shouldRefreshAfterHarvest ? await fetchState(config) : initialState;
+  let workState = initialState;
+  if (shouldRefreshAfterHarvest) {
+    try {
+      workState = await fetchState(config);
+    } catch (error) {
+      results.push(resultFromError('收获后状态刷新', error));
+      return { dryRun, results, state: initialState };
+    }
+  }
   let workSummary = summarizeState(workState);
 
   // 3. 定位主种（杨桃）。定位不到就回退到 config.mainSeedId 原样使用
@@ -1315,6 +1515,8 @@ function formatSummary(config, state, results = [], statusOnly = false) {
 
   if (hasState) {
     lines.push('', formatStatus(config, state));
+  } else {
+    lines.push('', `账号: ${getAccountIdentity(config).label}`);
   }
 
   if (!statusOnly) {
@@ -1323,6 +1525,177 @@ function formatSummary(config, state, results = [], statusOnly = false) {
   }
 
   return lines.join('\n');
+}
+
+function normalizeIssueType(type) {
+  if (type === 'error') return 'api_error';
+  return IMPORTANT_ISSUE_TYPES.has(type) ? type : null;
+}
+
+function getIssueDefinition(type) {
+  const definition = ISSUE_DEFINITIONS.find(([candidate]) => candidate === type);
+  return definition
+    ? { type: definition[0], title: definition[1], icon: definition[2] }
+    : { type, title: '运行异常', icon: '❌' };
+}
+
+function collectRoundIssues(state = {}, results = []) {
+  const issuesByType = new Map();
+  const addIssue = (rawType, message, source) => {
+    const type = normalizeIssueType(rawType);
+    const text = String(message || '').trim();
+    if (!type || !text) return;
+
+    const issue = issuesByType.get(type) || { type, entries: [] };
+    if (!issue.entries.some((entry) => entry.message === text && entry.source === source)) {
+      issue.entries.push({ message: text, source });
+    }
+    issuesByType.set(type, issue);
+  };
+
+  for (const result of results) {
+    addIssue(result?.type, formatResult(result), 'result');
+  }
+
+  if (state && typeof state === 'object') {
+    for (const [key, value] of Object.entries(state)) {
+      if (!value?.unavailable) continue;
+      addIssue(
+        value.errorType || 'api_error',
+        `${key} 接口不可用: ${value.error || '未知错误'}`,
+        'state'
+      );
+    }
+
+    if (Object.keys(state).length > 0) {
+      try {
+        const summary = summarizeState(state);
+        if (summary.warehouse.capacity !== null && summary.warehouse.capacity > 0 &&
+            summary.warehouse.used !== null &&
+            summary.warehouse.used >= summary.warehouse.capacity) {
+          addIssue(
+            'warehouse_full',
+            `仓库容量 ${summary.warehouse.used}/${summary.warehouse.capacity}，请尽快卖出腾空间`,
+            'state'
+          );
+        }
+        if (state.inventory && !state.inventory.unavailable &&
+            (summary.warehouse.capacity === null || summary.warehouse.used === null)) {
+          addIssue('schema_changed', 'inventory 响应缺少可识别的仓库容量字段', 'state');
+        }
+        if (state.energy && !state.energy.unavailable && summary.energy === null) {
+          addIssue('schema_changed', `energy 响应异常: ${summary.energyError}`, 'state');
+        }
+        if (state.recyclePrices && !state.recyclePrices.unavailable &&
+            !Array.isArray(state.recyclePrices.data)) {
+          addIssue('schema_changed', 'recyclePrices 响应缺少 data 列表', 'state');
+        }
+      } catch (error) {
+        addIssue('runtime_error', `汇总农场状态失败: ${error.message || String(error)}`, 'state');
+      }
+    }
+  }
+
+  const priority = new Map(ISSUE_DEFINITIONS.map(([type], index) => [type, index]));
+  return [...issuesByType.values()].sort(
+    (left, right) => (priority.get(left.type) ?? Number.MAX_SAFE_INTEGER) -
+      (priority.get(right.type) ?? Number.MAX_SAFE_INTEGER)
+  );
+}
+
+function buildNotificationPlan(config, round = {}, cooldownState = makeEmptyNotificationState(), nowMs = Date.now()) {
+  const state = round.state && typeof round.state === 'object' ? round.state : {};
+  const results = Array.isArray(round.results) ? round.results : [];
+  const issues = collectRoundIssues(state, results);
+  const importantSuccess = results.some(
+    (result) => result?.type === 'success' && IMPORTANT_SUCCESS_ACTIONS.has(result.action)
+  );
+  const account = getAccountIdentity(config);
+  const dueIssues = issues.filter(
+    (issue) => !isIssueCooling(cooldownState, account.key, issue.type, nowMs)
+  );
+
+  if (!importantSuccess && dueIssues.length === 0) return null;
+
+  const primaryIssue = issues[0] || null;
+  const title = primaryIssue
+    ? `${TASK_NAME} · ${getIssueDefinition(primaryIssue.type).title}`
+    : TASK_NAME;
+  const statusOnly = results.length === 0;
+  const lines = [formatSummary(config, state, results, statusOnly)];
+  const supplementalIssues = issues
+    .map((issue) => ({
+      issue,
+      entries: issue.entries.filter((entry) => entry.source !== 'result'),
+    }))
+    .filter(({ entries }) => entries.length > 0);
+
+  if (supplementalIssues.length > 0) {
+    lines.push('', '重要异常:');
+    for (const { issue, entries } of supplementalIssues) {
+      const definition = getIssueDefinition(issue.type);
+      lines.push(`${definition.icon} ${definition.title}: ${entries.map((entry) => entry.message).join('；')}`);
+    }
+  }
+
+  return {
+    accountKey: account.key,
+    body: lines.join('\n'),
+    dueIssueTypes: dueIssues.map((issue) => issue.type),
+    importantSuccess,
+    issueTypes: issues.map((issue) => issue.type),
+    title,
+  };
+}
+
+async function sendRoundNotification(config, round = {}, dependencies = {}) {
+  const logger = dependencies.logger || console;
+  try {
+    const stateFile = dependencies.stateFile || getNotificationStateFile();
+    const nowMs = Number.isFinite(dependencies.nowMs) ? dependencies.nowMs : Date.now();
+    const cooldownState = readNotificationState(stateFile, logger);
+    const plan = buildNotificationPlan(config, round, cooldownState, nowMs);
+    if (!plan) {
+      const suppressedIssues = collectRoundIssues(round.state, round.results);
+      if (suppressedIssues.length > 0) {
+        const log = typeof logger.log === 'function' ? logger.log.bind(logger) : console.log;
+        log(`${LOG_PREFIX} 重复异常仍在 12 小时冷却内，本轮仅写日志: ${suppressedIssues.map((issue) => issue.type).join(', ')}`);
+      }
+      return { reason: suppressedIssues.length > 0 ? 'cooldown' : 'not_important', sent: false };
+    }
+
+    const notify = dependencies.sendNotification || sendQinglongNotification;
+    let sent = false;
+    try {
+      sent = await Promise.resolve(notify(plan.title, plan.body)) === true;
+    } catch (error) {
+      logNotificationError(logger, `重要事件通知失败: ${error.message || String(error)}`);
+    }
+
+    if (!sent) {
+      logNotificationError(logger, '重要事件通知未确认发送成功，本轮不记录冷却时间');
+      return { plan, reason: 'send_failed', sent: false };
+    }
+
+    if (plan.issueTypes.length > 0) {
+      try {
+        const nextState = recordIssueCooldowns(
+          cooldownState,
+          plan.accountKey,
+          plan.issueTypes,
+          nowMs
+        );
+        writeNotificationStateAtomic(stateFile, nextState);
+      } catch (error) {
+        logNotificationError(logger, `写入通知冷却状态失败，农场结果不受影响: ${error.message}`);
+      }
+    }
+
+    return { plan, reason: 'sent', sent: true };
+  } catch (error) {
+    logNotificationError(logger, `处理重要事件通知失败，农场结果不受影响: ${error.message || String(error)}`);
+    return { reason: 'notification_error', sent: false };
+  }
 }
 
 async function run() {
@@ -1342,7 +1715,7 @@ async function run() {
     const state = await fetchState(config);
     const text = formatSummary(config, state, [], true);
     console.log(text);
-    await sendQinglongNotification(TASK_NAME, text);
+    await sendRoundNotification(config, { state, results: [] });
     return;
   }
 
@@ -1354,10 +1727,7 @@ async function run() {
     for (const result of plantRun.results) {
       console.log(`${LOG_PREFIX} ${formatResult(result)}`);
     }
-    await sendQinglongNotification(
-      TASK_NAME,
-      formatSummary(config, plantRun.state, plantRun.results)
-    );
+    await sendRoundNotification(config, { state: plantRun.state, results: plantRun.results });
     if (plantRun.results.some(isFailureResult)) process.exitCode = 1;
     return;
   }
@@ -1365,7 +1735,7 @@ async function run() {
   if (args.action === 'harvest-all') {
     const result = await performHarvestAll(config, args.dryRun);
     console.log(`${LOG_PREFIX} ${formatResult(result)}`);
-    await sendQinglongNotification(TASK_NAME, formatSummary(config, {}, [result]));
+    await sendRoundNotification(config, { state: {}, results: [result] });
     if (isFailureResult(result)) process.exitCode = 1;
     return;
   }
@@ -1373,7 +1743,7 @@ async function run() {
   if (args.action === 'care-all') {
     const result = await performCareAll(config, args.dryRun);
     console.log(`${LOG_PREFIX} ${formatResult(result)}`);
-    await sendQinglongNotification(TASK_NAME, formatSummary(config, {}, [result]));
+    await sendRoundNotification(config, { state: {}, results: [result] });
     if (isFailureResult(result)) process.exitCode = 1;
     return;
   }
@@ -1386,60 +1756,54 @@ async function run() {
     console.log(`${LOG_PREFIX} ${formatResult(result)}`);
   }
 
-  // 仓满 / VIP失效或种植失败 —— 单独各发一条（仿 f799c2b 签到失败分离发送）
-  const warehouseFull = autoResult.results.filter((r) => r.type === 'warehouse_full');
-  const vipIssues = autoResult.results.filter((r) => r.type === 'vip_required');
-  if (warehouseFull.length > 0) {
-    await sendQinglongNotification(
-      `${TASK_NAME} · 仓库已满`,
-      `📦 仓库已满，作物未能全部收获\n\n${warehouseFull.map(formatResult).join('\n')}\n\n请尽快去交易所卖出腾空间。`
-    );
-  }
-  if (vipIssues.length > 0) {
-    await sendQinglongNotification(
-      `${TASK_NAME} · VIP 失效`,
-      `👑 主种为 VIP 专属作物，种植失败，疑似 VIP 已过期\n\n${vipIssues.map(formatResult).join('\n')}\n\n请续费 VIP 或用 HYB_FARM_SEED_ID 改种非 VIP 作物。`
-    );
-  }
-
-  await sendQinglongNotification(TASK_NAME, formatSummary(config, autoResult.state, autoResult.results));
+  await sendRoundNotification(config, { state: autoResult.state, results: autoResult.results });
   if (autoResult.results.some(isFailureResult)) process.exitCode = 1;
 }
 
 if (require.main === module) {
-  run().catch((error) => {
+  run().catch(async (error) => {
     const errorMsg = error instanceof HybFarmError && error.type === 'auth_failed'
       ? 'Cookie 已失效或未登录，请更新 HYB_FARM_COOKIE'
       : error instanceof HybFarmError && error.type === 'challenge_required'
         ? '站点要求 CAP/Cloudflare 验证，请在浏览器完成验证后重试'
         : error instanceof HybFarmError
           ? error.message
-          : `未知错误: ${error.message || String(error)}`;
+          : `未知错误: ${error?.message || String(error)}`;
 
     console.error(`${LOG_PREFIX} 执行失败: ${errorMsg}`);
     if (error instanceof HybFarmError && error.details && Object.keys(error.details).length > 0) {
       console.error(`${LOG_PREFIX} 详细信息: ${JSON.stringify(scrubResponse(error.details), null, 2)}`);
     }
 
-    sendQinglongNotification(TASK_NAME, `❌ 发生异常：执行失败\n\n${errorMsg}`)
-      .finally(() => {
-        process.exitCode = 1;
-      });
+    const rawType = error instanceof HybFarmError ? error.type : 'runtime_error';
+    const type = normalizeIssueType(rawType) || 'runtime_error';
+    await sendRoundNotification(getNotificationAccountConfig(), {
+      state: {},
+      results: [makeResult('执行', type, errorMsg)],
+    });
+    process.exitCode = 1;
   });
 }
 
 module.exports = {
   COOKIE_ENV_NAMES,
   HybFarmError,
+  NOTIFICATION_COOLDOWN_MS,
+  buildNotificationPlan,
   buildPlantBody,
   classifyFailure,
+  collectRoundIssues,
   fetchState,
   formatStatus,
   formatSummary,
+  getAccountIdentity,
   getConfig,
+  getNotificationStateFile,
+  isIssueCooling,
   normalizeBaseUrl,
   normalizeCookie,
   normalizeDefaultAction,
+  normalizeNotificationState,
   parseArgs,
   parseWarehouse,
   parseFreeSlots,
@@ -1450,12 +1814,17 @@ module.exports = {
   performPlantBatch,
   requestJson,
   resolveMainSeed,
+  readNotificationState,
+  recordIssueCooldowns,
   run,
   runAuto,
   runSell,
   scrubBody,
   scrubResponse,
   sendQinglongNotification,
+  sendRoundNotification,
   shouldSell,
   summarizeState,
+  validateStateResponse,
+  writeNotificationStateAtomic,
 };
