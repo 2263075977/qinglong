@@ -31,6 +31,9 @@ const DEFAULT_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
   + '(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36';
 const DEFAULT_CHALLENGE_WAIT_MS = 15000;
 const CHALLENGE_POLL_INTERVAL_MS = 1000;
+const CLAIM_ATTEMPT_LIMIT = 2;
+const CLAIM_VERIFICATION_ATTEMPTS = 4;
+const CLAIM_VERIFICATION_INTERVAL_MS = 1500;
 const CHROMIUM_CANDIDATES = [
   '/usr/bin/chromium',
   '/usr/bin/chromium-browser',
@@ -165,6 +168,19 @@ function isAlreadyClaimedMessage(message) {
     || text.includes('权益已生效');
 }
 
+function isSuccessMessage(message) {
+  const text = String(message || '').trim().toLowerCase();
+  return [
+    'success',
+    'successful',
+    'ok',
+    'claim success',
+    'claimed successfully',
+    '领取成功',
+    '操作成功',
+  ].includes(text);
+}
+
 function getCodexQuota(payload) {
   const data = payload?.code === 1 && payload?.data ? payload.data : payload;
   return data?.codex && typeof data.codex === 'object' ? data.codex : null;
@@ -210,18 +226,19 @@ function analyzeClaimResponse(status, payload) {
     return { type: 'schema_changed', message: '领取接口未返回有效 JSON' };
   }
 
-  if (payload.code !== 1 || !payload.data || typeof payload.data !== 'object') {
+  if (status < 200 || status >= 300) {
     return {
       type: 'error',
       message: message || `领取失败: HTTP ${status}`,
     };
   }
 
-  if (payload.data.claimed === true) {
+  const data = payload.data;
+  if (payload.code === 1 && data && typeof data === 'object' && data.claimed === true) {
     return { type: 'success', message: message || payload.data.message || '领取成功' };
   }
 
-  if (payload.data.subscribed === true) {
+  if (payload.code === 1 && data && typeof data === 'object' && data.subscribed === true) {
     return { type: 'already_claimed', message: message || payload.data.message || '权益已生效' };
   }
 
@@ -232,6 +249,13 @@ function analyzeClaimResponse(status, payload) {
   const lowerMessage = message.toLowerCase();
   if (lowerMessage.includes('fingerprint') || message.includes('浏览器') || message.includes('验证')) {
     return { type: 'challenge_required', message: '浏览器指纹或验证未通过，请手动领取' };
+  }
+
+  if (payload.success === true || isSuccessMessage(message)) {
+    return {
+      type: 'pending_verification',
+      message: '领取接口已受理，等待配额状态确认',
+    };
   }
 
   return { type: 'error', message: message || '领取失败，接口未确认领取结果' };
@@ -436,6 +460,57 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
   return analyzeClaimResponse(response.status(), payload);
 }
 
+async function waitForClaimActivation(page, dependencies = {}) {
+  const fetchQuota = dependencies.fetchQuota || fetchJsonInPage;
+  const wait = dependencies.wait || (delayMs => page.waitForTimeout(delayMs));
+  const verificationAttempts = dependencies.verificationAttempts
+    || CLAIM_VERIFICATION_ATTEMPTS;
+  const verificationIntervalMs = dependencies.verificationIntervalMs
+    || CLAIM_VERIFICATION_INTERVAL_MS;
+  let quotaState = null;
+
+  for (let attempt = 0; attempt < verificationAttempts; attempt += 1) {
+    if (attempt > 0) await wait(verificationIntervalMs);
+
+    const quota = await fetchQuota(page, QUOTA_PATH);
+    quotaState = analyzeQuotaResponse(quota.status, quota.json);
+    if (quotaState.type !== 'claimable') return quotaState;
+  }
+
+  return quotaState;
+}
+
+async function claimWithVerification(page, config, dependencies = {}) {
+  const claim = dependencies.claim || clickClaimThroughUi;
+  const logProgress = dependencies.log || log;
+  const claimAttemptLimit = dependencies.claimAttemptLimit || CLAIM_ATTEMPT_LIMIT;
+
+  for (let attempt = 1; attempt <= claimAttemptLimit; attempt += 1) {
+    const claimResult = await claim(page, config.reason, config.timeoutMs);
+    if (!['success', 'pending_verification'].includes(claimResult.type)) {
+      return claimResult;
+    }
+
+    const verifiedState = await waitForClaimActivation(page, dependencies);
+    if (verifiedState?.type === 'already_claimed') {
+      return {
+        type: 'success',
+        message: claimResult.type === 'success' ? claimResult.message : '领取成功',
+      };
+    }
+    if (verifiedState?.type !== 'claimable') return verifiedState;
+
+    if (attempt < claimAttemptLimit) {
+      logProgress('领取结果尚未生效，配额仍显示可领取，准备重试一次');
+    }
+  }
+
+  return {
+    type: 'api_error',
+    message: '两次领取请求后配额仍未显示权益生效，请稍后重试',
+  };
+}
+
 function formatResult(result) {
   if (result.type === 'success') {
     return `✅ ${result.message}`;
@@ -500,16 +575,7 @@ async function runClaim(config) {
     if (quotaState.type !== 'claimable') return quotaState;
 
     log('当前未检测到生效权益，准备通过页面领取');
-    const claimResult = await clickClaimThroughUi(page, config.reason, config.timeoutMs);
-    if (claimResult.type !== 'success') return claimResult;
-
-    const quotaAfter = await fetchJsonInPage(page, QUOTA_PATH);
-    const verifiedState = analyzeQuotaResponse(quotaAfter.status, quotaAfter.json);
-    if (verifiedState.type !== 'already_claimed') {
-      throw new SharedChatClaimError('schema_changed', '领取接口成功，但配额复查未显示套餐生效');
-    }
-
-    return { type: 'success', message: claimResult.message || '领取成功' };
+    return claimWithVerification(page, config);
   } catch (error) {
     if (error instanceof SharedChatClaimError) {
       return { type: error.type, message: error.message };
@@ -605,10 +671,12 @@ module.exports = {
   analyzeClaimResponse,
   analyzeQuotaResponse,
   buildClaimReason,
+  claimWithVerification,
   detectChallengeSignal,
   formatResult,
   getCodexQuota,
   isAlreadyClaimedMessage,
+  isSuccessMessage,
   normalizeCookie,
   parseCookieHeader,
   parsePositiveInteger,
@@ -616,4 +684,5 @@ module.exports = {
   runClaim,
   shanghaiDateStamp,
   waitForDashboardReady,
+  waitForClaimActivation,
 };
