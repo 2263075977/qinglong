@@ -575,7 +575,9 @@ async function runClaim(config) {
     if (quotaState.type !== 'claimable') return quotaState;
 
     log('当前未检测到生效权益，准备通过页面领取');
-    return claimWithVerification(page, config);
+    // 必须 await：否则 runClaim 会立即返回并触发 finally 关闭浏览器，
+    // 令仍在进行的领取流程（waitFor 按钮/接口）被中断并伪装成「未找到按钮」
+    return await claimWithVerification(page, config);
   } catch (error) {
     if (error instanceof SharedChatClaimError) {
       return { type: error.type, message: error.message };
