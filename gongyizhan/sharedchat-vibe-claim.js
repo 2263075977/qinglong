@@ -192,6 +192,8 @@ function isAuthMessage(message) {
     || text.includes('expired')
     || text.includes('未登录')
     || text.includes('登录失效')
+    || text.includes('登录状态过期')
+    || text.includes('重新登录')
     || text.includes('请登录')
     || text.includes('无权限');
 }
@@ -279,6 +281,22 @@ function analyzeClaimResponse(status, payload) {
 
   if (payload.code === 1 && data && typeof data === 'object' && data.subscribed === true) {
     return { type: 'already_claimed', message: message || payload.data.message || '权益已生效' };
+  }
+
+  // 服务端顶层可能返回 code:1 + msg:"success"（表示请求被受理），但 data 里明确标记失败：
+  // claimed:false 且带详细 message（如"登录状态过期"）。此时应采信 data 的结论，不能被顶层假成功骗过去。
+  if (payload.code === 1 && data && typeof data === 'object' && data.claimed === false) {
+    const dataMessage = typeof data.message === 'string' ? data.message.trim() : '';
+    if (dataMessage) {
+      if (isAuthMessage(dataMessage)) {
+        return { type: 'auth_failed', message: dataMessage };
+      }
+      if (isAlreadyClaimedMessage(dataMessage)) {
+        return { type: 'already_claimed', message: dataMessage };
+      }
+      // 其他明确的失败原因
+      return { type: 'error', message: dataMessage };
+    }
   }
 
   if (isAlreadyClaimedMessage(message)) {
@@ -559,6 +577,7 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
   let payload = null;
   try {
     payload = await response.json();
+    log(`领取响应 body: ${JSON.stringify(payload)}`);
   } catch {}
 
   return analyzeClaimResponse(response.status(), payload);
@@ -591,16 +610,19 @@ async function claimWithVerification(page, config, dependencies = {}) {
 
   for (let attempt = 1; attempt <= claimAttemptLimit; attempt += 1) {
     const claimResult = await claim(page, config.reason, config.timeoutMs);
-    if (!['success', 'pending_verification'].includes(claimResult.type)) {
+
+    // 领取接口已用 claimed:true 权威确认领取成功（analyzeClaimResponse 映射为 success），
+    // 直接采信返回。不再用配额接口二次确认：配额存在同步延迟，此刻仍可能显示 claimable，
+    // 若据此误判「未生效」并重试，会撞上首次领取已作废的 session 而误报失败。
+    // 仅当响应不明确（success=true 但缺少 claimed 字段，即 pending_verification）时，
+    // 才继续用配额接口兜底确认。
+    if (claimResult.type !== 'pending_verification') {
       return claimResult;
     }
 
     const verifiedState = await waitForClaimActivation(page, dependencies);
     if (verifiedState?.type === 'already_claimed') {
-      return {
-        type: 'success',
-        message: claimResult.type === 'success' ? claimResult.message : '领取成功',
-      };
+      return { type: 'success', message: '领取成功' };
     }
     if (verifiedState?.type !== 'claimable') return verifiedState;
 
@@ -706,6 +728,12 @@ async function runClaim(config) {
         screenshotPath = await captureDebugScreenshot(page, 'general-timeout');
         const context = await capturePageContext(page);
         log(`通用超时上下文: ${JSON.stringify(context)}`);
+
+        // cookie 失效时页面会跳转到登录 SPA，goto/等待会一直卡到超时。
+        // 此处按最终落点区分：已在登录页 → auth_failed，而非笼统的网络超时。
+        if (/\/(login|register)(?:[/?#]|$)/i.test(page.url())) {
+          return { type: 'auth_failed', message: 'Cookie 已失效，页面已跳转到登录入口' };
+        }
       }
       return {
         type: 'network_error',
