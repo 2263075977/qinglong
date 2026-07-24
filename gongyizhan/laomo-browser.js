@@ -71,6 +71,46 @@ function parseCookiePairs(value) {
   return pairs;
 }
 
+// 从 session cookie 中尝试提取 userId
+// gorilla/sessions 的 session 格式: base64(timestamp|base64(gob_encoded_data)|signature)
+function extractUserIdFromSessionCookie(cookieHeader) {
+  try {
+    const pairs = parseCookiePairs(cookieHeader);
+    const sessionValue = pairs.get('session');
+    if (!sessionValue) return null;
+
+    // 第一层 base64 解码
+    const decoded1 = Buffer.from(sessionValue, 'base64').toString('utf8');
+
+    // 分割 session：timestamp|data|signature
+    const parts = decoded1.split('|');
+    if (parts.length < 2) return null;
+
+    // 第二层 base64 解码（gob 编码的数据）
+    const decoded2 = Buffer.from(parts[1], 'base64');
+    const text = decoded2.toString('binary');
+
+    // 在解码后的数据中搜索 "id" 字段
+    const idIndex = text.indexOf('id');
+    if (idIndex === -1) return null;
+
+    // gob 编码结构: "id" + 类型标记 + "int" + 字段类型 + 值
+    // 典型结构: id\x03int\x04\x04\x00\xfe\x1b\x8c
+    // 偏移 9 开始是值部分
+    const offset = idIndex + 9;  // 跳过 "id\x03int\x04\x04\x00"
+
+    if (offset + 3 > decoded2.length) return null;
+
+    // 尝试读取 3 字节作为完整的 userId（大端序）
+    // 0xfe1b8c = 16653196
+    const userId = (decoded2[offset] << 16) | (decoded2[offset + 1] << 8) | decoded2[offset + 2];
+
+    return userId && userId > 0 && userId < 2147483647 ? userId : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function toPlaywrightCookies(cookieHeader, siteUrl) {
   const cookies = [];
   let domain;
@@ -206,6 +246,28 @@ function isChallengeHtml(text) {
     || lower.includes('cf-browser-verification')
     || lower.includes('_cf_chl_opt')
     || lower.includes('bot detection');
+}
+
+// 从页面中提取 userId（优先从 localStorage 或全局变量）
+async function extractUserId(page) {
+  return page.evaluate(() => {
+    try {
+      // 尝试从 localStorage 获取用户信息
+      const userStr = localStorage.getItem('user');
+      if (userStr) {
+        const user = JSON.parse(userStr);
+        if (user?.id) return user.id;
+      }
+    } catch {}
+
+    try {
+      // 尝试从全局变量获取
+      if (window.user?.id) return window.user.id;
+      if (window.userInfo?.id) return window.userInfo.id;
+    } catch {}
+
+    return null;
+  });
 }
 
 // 会话预检：/api/user/self 与 /api/user/checkin 走同一套 session 认证，
@@ -359,17 +421,69 @@ async function runAccount(browser, account, config) {
     page.setDefaultTimeout(config.timeoutMs);
 
     // 导航到控制台页面，让 Cloudflare 完成指纹校验
-    await page.goto(`${config.siteUrl}/console/personal`, {
-      waitUntil: 'domcontentloaded',
-      timeout: config.timeoutMs,
-    });
+    console.log(`[老魔公益站] 正在加载页面: ${config.siteUrl}/console/personal`);
+    try {
+      await page.goto(`${config.siteUrl}/console/personal`, {
+        waitUntil: 'domcontentloaded',
+        timeout: config.timeoutMs,
+      });
+    } catch (error) {
+      // 如果页面加载超时，尝试等待 load 事件
+      if (error?.name === 'TimeoutError') {
+        console.log('[老魔公益站] domcontentloaded 超时，尝试继续执行...');
+        try {
+          await page.waitForLoadState('load', { timeout: 10000 });
+        } catch {
+          console.log('[老魔公益站] load 事件也超时，但继续执行...');
+        }
+      } else {
+        throw error;
+      }
+    }
 
     // 等待页面稳定，Cloudflare challenge 自动完成
-    await page.waitForTimeout(3000);
+    // 增加等待时间，确保 Cloudflare 验证完全完成
+    console.log('[老魔公益站] 等待 Cloudflare 验证完成...');
+    await page.waitForTimeout(8000);
+
+    // 检查当前 Cookie 状态
+    const cookies = await context.cookies();
+    console.log(`[老魔公益站] 当前 Cookie 数量: ${cookies.length}`);
+    const hasCfClearance = cookies.some(c => c.name === 'cf_clearance');
+    console.log(`[老魔公益站] cf_clearance 状态: ${hasCfClearance ? '已设置' : '未设置'}`);
+
+    // 首先尝试从 session cookie 中提取 userId
+    let userId = extractUserIdFromSessionCookie(account.cookie);
+    console.log(`[老魔公益站] 从 session cookie 提取的用户 ID: ${userId || '未找到'}`);
+
+    // 如果从 cookie 没有提取到，再尝试从页面中提取 userId
+    if (!userId) {
+      console.log('[老魔公益站] 正在从页面提取用户 ID...');
+      userId = await extractUserId(page);
+      console.log(`[老魔公益站] 从页面提取的用户 ID: ${userId || '未找到'}`);
+    }
 
     // 会话预检：确认登录态，并提前区分 Cookie 失效 / Cloudflare 挑战 / 网络异常
+    console.log('[老魔公益站] 开始验证会话状态...');
     const session = await verifySession(page);
-    if (!session.authenticated) {
+    console.log(`[老魔公益站] 会话验证结果: authenticated=${session.authenticated}, status=${session.status}`);
+
+    // 如果从页面没有提取到 userId，尝试从会话验证结果中获取
+    if (!userId && session.userId) {
+      userId = session.userId;
+      console.log(`[老魔公益站] 从会话验证获取的用户 ID: ${userId}`);
+    }
+
+    // 如果会话验证失败但不是因为 "未提供 New-Api-User"，才判定为真正的失败
+    // 某些站点的 /api/user/self 需要 New-API-User 头，但我们还没有 userId，所以允许这个错误
+    const isNewApiUserError = session.message && session.message.includes('New-Api-User');
+
+    if (!session.authenticated && !isNewApiUserError) {
+      console.log(`[老魔公益站] 会话验证失败: ${session.message}`);
+      if (session.rawText) {
+        console.log(`[老魔公益站] 响应内容片段: ${session.rawText.slice(0, 200)}`);
+      }
+
       if ([401, 403].includes(session.status) || isAuthMessage(session.message)) {
         return {
           type: 'auth_failed',
@@ -388,11 +502,21 @@ async function runAccount(browser, account, config) {
       };
     }
 
-    // 获取站点配置的积分单位
-    const quotaPerUnit = await fetchQuotaPerUnit(page);
+    if (session.authenticated) {
+      console.log(`[老魔公益站] 会话验证成功，用户 ID: ${session.userId}`);
+    } else {
+      console.log('[老魔公益站] 跳过会话预检（New-Api-User 问题），直接尝试签到...');
+    }
 
-    // 发起签到请求（附带预检拿到的 userId）
-    const checkinResult = await checkinWithBrowser(page, session.userId);
+    // 获取站点配置的积分单位
+    console.log('[老魔公益站] 正在获取站点配置...');
+    const quotaPerUnit = await fetchQuotaPerUnit(page);
+    console.log(`[老魔公益站] 积分单位: ${quotaPerUnit}`);
+
+    // 发起签到请求（附带提取到的 userId）
+    console.log(`[老魔公益站] 正在发起签到请求... (userId: ${userId || '无'})`);
+    const checkinResult = await checkinWithBrowser(page, userId);
+    console.log(`[老魔公益站] 签到结果: ok=${checkinResult.ok}, status=${checkinResult.status}, message=${checkinResult.message}`);
 
     if (checkinResult.ok) {
       return {
@@ -622,6 +746,8 @@ module.exports = {
   accountLabel,
   checkinWithBrowser,
   cleanString,
+  extractUserId,
+  extractUserIdFromSessionCookie,
   fetchQuotaPerUnit,
   formatAccountResult,
   formatQuotaReward,

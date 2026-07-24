@@ -54,6 +54,45 @@ function log(message) {
   console.log(`${LOG_PREFIX} ${message}`);
 }
 
+// 诊断辅助函数
+let sessionStartTime = null;
+
+function logWithTimestamp(message, startTime = null) {
+  if (!sessionStartTime) sessionStartTime = Date.now();
+  const elapsed = Date.now() - (startTime || sessionStartTime);
+  log(`[+${elapsed}ms] ${message}`);
+}
+
+async function captureDebugScreenshot(page, step) {
+  try {
+    const debugDir = './debug';
+    if (!fs.existsSync(debugDir)) {
+      fs.mkdirSync(debugDir, { recursive: true });
+    }
+    const timestamp = Date.now();
+    const filename = `${debugDir}/sharedchat-timeout-${timestamp}-${step}.png`;
+    await page.screenshot({ path: filename, fullPage: true });
+    log(`调试截图已保存: ${filename}`);
+    return filename;
+  } catch (error) {
+    log(`截图失败: ${error.message}`);
+    return null;
+  }
+}
+
+async function capturePageContext(page) {
+  try {
+    return await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      visibleText: document.body?.innerText?.slice(0, 500) || '',
+    }));
+  } catch {
+    return null;
+  }
+}
+
 function parsePositiveInteger(value, fallback) {
   const number = Number.parseInt(String(value || ''), 10);
   return Number.isInteger(number) && number > 0 ? number : fallback;
@@ -376,22 +415,30 @@ async function detectChallengeSignal(page) {
  */
 async function waitForDashboardReady(page, config) {
   const deadline = Date.now() + config.challengeWaitMs;
+  const startTime = Date.now();
   let lastSignal = null;
+  let attemptCount = 0;
 
   for (;;) {
+    attemptCount++;
     const currentUrl = page.url();
+    logWithTimestamp(`Dashboard 就绪检测 #${attemptCount}: ${currentUrl}`, startTime);
+
     if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
       throw new SharedChatClaimError('auth_failed', 'Cookie 已失效，页面已跳转到登录入口');
     }
 
     const probe = await fetchJsonInPage(page, QUOTA_PATH).catch(() => null);
     if (probe && probe.json && typeof probe.json === 'object') {
+      logWithTimestamp(`Dashboard 已就绪，配额接口返回有效 JSON`, startTime);
       return probe;
     }
 
     lastSignal = await detectChallengeSignal(page).catch(() => null);
 
     if (Date.now() >= deadline) {
+      const screenshot = await captureDebugScreenshot(page, 'dashboard-timeout');
+      log(`Dashboard 就绪超时，尝试次数: ${attemptCount}，截图: ${screenshot}`);
       if (lastSignal?.blocked) {
         log(`验证拦截诊断: kind=${lastSignal.kind} ${lastSignal.detail} url=${lastSignal.url}`);
         throw new SharedChatClaimError(
@@ -411,31 +458,84 @@ async function waitForDashboardReady(page, config) {
 }
 
 async function clickClaimThroughUi(page, reason, timeoutMs) {
+  const stepStartTime = Date.now();
+  logWithTimestamp('开始领取流程', stepStartTime);
+
+  logWithTimestamp('等待【领取 Codex 权益】按钮可见...', stepStartTime);
   const claimButton = page.getByRole('button', { name: '领取 Codex 权益', exact: true });
   try {
     await claimButton.waitFor({ state: 'visible', timeout: timeoutMs });
-  } catch {
-    throw new SharedChatClaimError('schema_changed', '未找到可见的“领取 Codex 权益”按钮');
+    logWithTimestamp('按钮已可见', stepStartTime);
+  } catch (error) {
+    const screenshot = await captureDebugScreenshot(page, 'wait-button');
+    const context = await capturePageContext(page);
+    log(`页面上下文: ${JSON.stringify(context)}`);
+    throw new SharedChatClaimError(
+      'schema_changed',
+      `等待【领取按钮】超时 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
+    );
   }
 
   if (await claimButton.count() !== 1) {
-    throw new SharedChatClaimError('schema_changed', '未找到唯一的“领取 Codex 权益”按钮');
+    throw new SharedChatClaimError('schema_changed', '未找到唯一的”领取 Codex 权益”按钮');
   }
 
-  await claimButton.click();
+  logWithTimestamp('点击领取按钮', stepStartTime);
+  try {
+    await claimButton.click();
+  } catch (clickError) {
+    // click 可能因为页面跳转而失败
+    const currentUrl = page.url();
+    if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
+      const screenshot = await captureDebugScreenshot(page, 'auth-redirect-on-click');
+      throw new SharedChatClaimError(
+        'auth_failed',
+        `Cookie 已失效，点击领取按钮时页面跳转到登录入口，截图: ${screenshot}`
+      );
+    }
+    // 不是登录跳转，重新抛出原错误
+    throw clickError;
+  }
 
+  logWithTimestamp('等待领取原因输入框...', stepStartTime);
   const reasonInput = page.locator('.el-message-box textarea');
-  await reasonInput.waitFor({ state: 'visible', timeout: timeoutMs });
+  try {
+    await reasonInput.waitFor({ state: 'visible', timeout: timeoutMs });
+    logWithTimestamp('输入框已可见', stepStartTime);
+  } catch (error) {
+    // 优先检测是否因登录失效而跳转
+    const currentUrl = page.url();
+    if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
+      const screenshot = await captureDebugScreenshot(page, 'auth-redirect');
+      throw new SharedChatClaimError(
+        'auth_failed',
+        `Cookie 已失效，点击领取按钮后页面跳转到登录入口 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
+      );
+    }
+    // 不是登录跳转，才按原有逻辑处理
+    const screenshot = await captureDebugScreenshot(page, 'wait-textarea');
+    const context = await capturePageContext(page);
+    log(`页面上下文: ${JSON.stringify(context)}`);
+    throw new SharedChatClaimError(
+      'schema_changed',
+      `等待【输入框】超时 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
+    );
+  }
+
   if (await reasonInput.count() !== 1) {
     throw new SharedChatClaimError('schema_changed', '领取原因输入框结构已变化');
   }
+
+  logWithTimestamp('填写领取原因', stepStartTime);
   await reasonInput.fill(reason);
 
+  logWithTimestamp('查找确认按钮', stepStartTime);
   const confirmButton = page.locator('.el-message-box__btns button').filter({ hasText: '领取' });
   if (await confirmButton.count() !== 1) {
     throw new SharedChatClaimError('schema_changed', '领取确认按钮结构已变化');
   }
 
+  logWithTimestamp('点击确认按钮并等待响应...', stepStartTime);
   const responsePromise = page.waitForResponse(
     response => response.url().includes(CLAIM_PATH) && response.request().method() === 'POST',
     { timeout: timeoutMs }
@@ -445,10 +545,14 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
   let response;
   try {
     response = await responsePromise;
-  } catch {
+    logWithTimestamp(`收到领取响应: HTTP ${response.status()}`, stepStartTime);
+  } catch (error) {
+    const screenshot = await captureDebugScreenshot(page, 'wait-response');
+    const context = await capturePageContext(page);
+    log(`页面上下文: ${JSON.stringify(context)}`);
     throw new SharedChatClaimError(
       'challenge_required',
-      '未捕获领取响应，浏览器指纹采集可能失败，请手动检查'
+      `等待【POST 响应】超时 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
     );
   }
 
@@ -502,6 +606,15 @@ async function claimWithVerification(page, config, dependencies = {}) {
 
     if (attempt < claimAttemptLimit) {
       logProgress('领取结果尚未生效，配额仍显示可领取，准备重试一次');
+
+      // 重试前检测登录状态，避免在失效的 session 上浪费时间
+      const currentUrl = page.url();
+      if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
+        return {
+          type: 'auth_failed',
+          message: 'Cookie 在领取后失效，页面已跳转到登录入口'
+        };
+      }
     }
   }
 
@@ -528,6 +641,9 @@ function formatResult(result) {
 }
 
 async function runClaim(config) {
+  sessionStartTime = Date.now();  // 重置诊断时间基准
+  logWithTimestamp('runClaim 开始');
+
   const launchOptions = {
     headless: true,
     args: [
@@ -583,8 +699,18 @@ async function runClaim(config) {
       return { type: error.type, message: error.message };
     }
 
+    // 通用超时错误处理
     if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
-      return { type: 'network_error', message: '页面或接口请求超时' };
+      let screenshotPath = null;
+      if (page) {
+        screenshotPath = await captureDebugScreenshot(page, 'general-timeout');
+        const context = await capturePageContext(page);
+        log(`通用超时上下文: ${JSON.stringify(context)}`);
+      }
+      return {
+        type: 'network_error',
+        message: `页面或接口请求超时，截图: ${screenshotPath}`
+      };
     }
 
     return { type: 'error', message: `执行失败: ${error?.message || String(error)}` };
