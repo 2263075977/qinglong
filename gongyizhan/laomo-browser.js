@@ -71,41 +71,64 @@ function parseCookiePairs(value) {
   return pairs;
 }
 
-// 从 session cookie 中尝试提取 userId
-// gorilla/sessions 的 session 格式: base64(timestamp|base64(gob_encoded_data)|signature)
+// gob 无符号变长整数解码：小于 0x80 直接是值，否则首字节为 (0x100 - 后续字节数)，
+// 后续字节按大端拼成无符号整数。返回 { value, next } 或 null。
+function readGobUint(buf, offset) {
+  const first = buf[offset];
+  if (first === undefined) return null;
+  if (first <= 0x7f) return { value: first, next: offset + 1 };
+  const byteCount = 0x100 - first;
+  if (byteCount > 8 || offset + 1 + byteCount > buf.length) return null;
+  let value = 0;
+  for (let i = 0; i < byteCount; i++) value = value * 256 + buf[offset + 1 + i];
+  return { value, next: offset + 1 + byteCount };
+}
+
+// 从 session cookie 中提取 userId。
+// gorilla/sessions 格式: base64(timestamp|base64(gob_encoded_map)|signature)。
+// gob 里 id 字段的编码结构（用已知 username=2263075977 字段反向标定得出）:
+//   \x02"id" \x03"int" <外层长度> <值区字节数> <分隔符 0x00> <zigzag 编码的有符号整数>
+// 关键：gob 有符号整数为 zigzag 编码，需 (u & 1) 判正负后再右移一位还原。
 function extractUserIdFromSessionCookie(cookieHeader) {
   try {
     const pairs = parseCookiePairs(cookieHeader);
     const sessionValue = pairs.get('session');
     if (!sessionValue) return null;
 
-    // 第一层 base64 解码
+    // 第一层 base64 解码后按 | 分割，取中间的 gob 数据段
     const decoded1 = Buffer.from(sessionValue, 'base64').toString('utf8');
-
-    // 分割 session：timestamp|data|signature
     const parts = decoded1.split('|');
     if (parts.length < 2) return null;
 
-    // 第二层 base64 解码（gob 编码的数据）
-    const decoded2 = Buffer.from(parts[1], 'base64');
-    const text = decoded2.toString('binary');
+    // 第二层 base64 解码得到 gob 字节
+    const gob = Buffer.from(parts[1], 'base64');
 
-    // 在解码后的数据中搜索 "id" 字段
-    const idIndex = text.indexOf('id');
-    if (idIndex === -1) return null;
+    // 精确定位 id 字段（\x02 是 "id" 的 gob 字符串长度前缀，避免误匹配其它 "id" 子串）
+    const marker = Buffer.from('\x02id\x03int', 'binary');
+    const markerIndex = gob.indexOf(marker);
+    if (markerIndex === -1) return null;
 
-    // gob 编码结构: "id" + 类型标记 + "int" + 字段类型 + 值
-    // 典型结构: id\x03int\x04\x04\x00\xfe\x1b\x8c
-    // 偏移 9 开始是值部分
-    const offset = idIndex + 9;  // 跳过 "id\x03int\x04\x04\x00"
+    let cursor = markerIndex + marker.length;
+    const outerLen = readGobUint(gob, cursor);   // 外层长度
+    if (!outerLen) return null;
+    cursor = outerLen.next;
+    const valueBytes = readGobUint(gob, cursor);  // 值区字节数
+    if (!valueBytes) return null;
+    cursor = valueBytes.next;
+    const separator = readGobUint(gob, cursor);   // 分隔符（应为 0）
+    if (!separator) return null;
+    cursor = separator.next;
+    const encoded = readGobUint(gob, cursor);     // zigzag 编码的有符号整数
+    if (!encoded) return null;
 
-    if (offset + 3 > decoded2.length) return null;
+    // zigzag 还原：偶数为正、奇数为负
+    const userId = (encoded.value & 1)
+      ? -((encoded.value + 1) / 2)
+      : (encoded.value / 2);
 
-    // 尝试读取 3 字节作为完整的 userId（大端序）
-    // 0xfe1b8c = 16653196
-    const userId = (decoded2[offset] << 16) | (decoded2[offset + 1] << 8) | decoded2[offset + 2];
-
-    return userId && userId > 0 && userId < 2147483647 ? userId : null;
+    return Number.isInteger(userId) && userId > 0 && userId < 2147483647
+      ? userId
+      : null;
   } catch (error) {
     return null;
   }
@@ -246,67 +269,6 @@ function isChallengeHtml(text) {
     || lower.includes('cf-browser-verification')
     || lower.includes('_cf_chl_opt')
     || lower.includes('bot detection');
-}
-
-// 从页面中提取 userId（优先从 localStorage 或全局变量）
-async function extractUserId(page) {
-  return page.evaluate(() => {
-    try {
-      // 尝试从 localStorage 获取用户信息
-      const userStr = localStorage.getItem('user');
-      if (userStr) {
-        const user = JSON.parse(userStr);
-        if (user?.id) return user.id;
-      }
-    } catch {}
-
-    try {
-      // 尝试从全局变量获取
-      if (window.user?.id) return window.user.id;
-      if (window.userInfo?.id) return window.userInfo.id;
-    } catch {}
-
-    return null;
-  });
-}
-
-// 会话预检：/api/user/self 与 /api/user/checkin 走同一套 session 认证，
-// 先探这里可提前区分 Cookie 失效、Cloudflare 挑战与网络异常，并拿到 userId
-async function verifySession(page) {
-  return page.evaluate(async () => {
-    try {
-      const response = await fetch('/api/user/self', {
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-      });
-      const text = await response.text();
-
-      let payload = null;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        payload = null;
-      }
-
-      return {
-        authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
-        status: response.status,
-        message: typeof payload?.message === 'string' ? payload.message : '',
-        userId: payload?.data?.id ?? null,
-        rawText: payload ? '' : text.slice(0, 2048),
-        isJson: payload != null,
-      };
-    } catch (error) {
-      return {
-        authenticated: false,
-        status: 0,
-        message: error?.message || '网络请求失败',
-        userId: null,
-        rawText: '',
-        isJson: false,
-      };
-    }
-  });
 }
 
 async function checkinWithBrowser(page, userId) {
@@ -452,60 +414,15 @@ async function runAccount(browser, account, config) {
     const hasCfClearance = cookies.some(c => c.name === 'cf_clearance');
     console.log(`[老魔公益站] cf_clearance 状态: ${hasCfClearance ? '已设置' : '未设置'}`);
 
-    // 首先尝试从 session cookie 中提取 userId
-    let userId = extractUserIdFromSessionCookie(account.cookie);
+    // 从 session cookie 中提取 userId（老魔站的 newapi 分支需要在签到请求头中提供）
+    const userId = extractUserIdFromSessionCookie(account.cookie);
     console.log(`[老魔公益站] 从 session cookie 提取的用户 ID: ${userId || '未找到'}`);
 
-    // 如果从 cookie 没有提取到，再尝试从页面中提取 userId
     if (!userId) {
-      console.log('[老魔公益站] 正在从页面提取用户 ID...');
-      userId = await extractUserId(page);
-      console.log(`[老魔公益站] 从页面提取的用户 ID: ${userId || '未找到'}`);
-    }
-
-    // 会话预检：确认登录态，并提前区分 Cookie 失效 / Cloudflare 挑战 / 网络异常
-    console.log('[老魔公益站] 开始验证会话状态...');
-    const session = await verifySession(page);
-    console.log(`[老魔公益站] 会话验证结果: authenticated=${session.authenticated}, status=${session.status}`);
-
-    // 如果从页面没有提取到 userId，尝试从会话验证结果中获取
-    if (!userId && session.userId) {
-      userId = session.userId;
-      console.log(`[老魔公益站] 从会话验证获取的用户 ID: ${userId}`);
-    }
-
-    // 如果会话验证失败但不是因为 "未提供 New-Api-User"，才判定为真正的失败
-    // 某些站点的 /api/user/self 需要 New-API-User 头，但我们还没有 userId，所以允许这个错误
-    const isNewApiUserError = session.message && session.message.includes('New-Api-User');
-
-    if (!session.authenticated && !isNewApiUserError) {
-      console.log(`[老魔公益站] 会话验证失败: ${session.message}`);
-      if (session.rawText) {
-        console.log(`[老魔公益站] 响应内容片段: ${session.rawText.slice(0, 200)}`);
-      }
-
-      if ([401, 403].includes(session.status) || isAuthMessage(session.message)) {
-        return {
-          type: 'auth_failed',
-          message: 'Cookie 已失效或无权限，请重新获取 Cookie',
-        };
-      }
-      if (!session.isJson && isChallengeHtml(session.rawText)) {
-        return {
-          type: 'challenge_required',
-          message: 'Cloudflare 挑战未在无头模式下自动完成，请改用有头模式或网页手动处理',
-        };
-      }
       return {
-        type: 'network_error',
-        message: session.message || `无法验证登录态，HTTP ${session.status || '未知'}`,
+        type: 'auth_failed',
+        message: 'Cookie 格式异常，无法提取用户 ID，请重新获取 Cookie',
       };
-    }
-
-    if (session.authenticated) {
-      console.log(`[老魔公益站] 会话验证成功，用户 ID: ${session.userId}`);
-    } else {
-      console.log('[老魔公益站] 跳过会话预检（New-Api-User 问题），直接尝试签到...');
     }
 
     // 获取站点配置的积分单位
@@ -746,7 +663,6 @@ module.exports = {
   accountLabel,
   checkinWithBrowser,
   cleanString,
-  extractUserId,
   extractUserIdFromSessionCookie,
   fetchQuotaPerUnit,
   formatAccountResult,
@@ -764,5 +680,4 @@ module.exports = {
   runBrowserCheckins,
   toPlaywrightCookies,
   validateDisplayAvailability,
-  verifySession,
 };
