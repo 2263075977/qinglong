@@ -24,10 +24,15 @@
  *     3. POST /api/user/checkin?pow_challenge=..&pow_nonce=..
  *     4. 若服务端仍要求 Turnstile，通过官方 widget 取得 token 后复用 PoW 重试
  *   全程在真实浏览器页面上下文内完成；无头模式无法自动完成 Turnstile 时，
- *   可切换有头模式人工验证。
+ *   可切换有头模式。有头模式通过本地调试端口连接独立临时 Chromium，
+ *   完成官方验证后自动删除临时浏览器配置。
  */
 
 const fs = require('node:fs');
+const net = require('node:net');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
 
 const TASK_TITLE = 'RunAnytime 浏览器签到';
 const SITE_URL = 'https://runanytime.hxi.me';
@@ -165,6 +170,118 @@ function resolveChromiumExecutable(explicitPath = process.env.PLAYWRIGHT_CHROMIU
   return CHROMIUM_CANDIDATES.find(candidate => fs.existsSync(candidate));
 }
 
+function getFreeLocalPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.close(error => {
+        if (error) reject(error);
+        else resolve(address.port);
+      });
+    });
+  });
+}
+
+async function waitForCdpEndpoint(port, chromeProcess, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (chromeProcess.spawnError) {
+      throw new RunAnytimeBrowserError(
+        'browser_error',
+        `启动本地 Chromium 失败: ${chromeProcess.spawnError.message}`
+      );
+    }
+    if (chromeProcess.exitCode !== null) {
+      throw new RunAnytimeBrowserError(
+        'browser_error',
+        `本地 Chromium 提前退出，状态码 ${chromeProcess.exitCode}`
+      );
+    }
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.timeout(1000),
+      });
+      if (response.ok) return;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  throw new RunAnytimeBrowserError('browser_error', '本地 Chromium 调试端口启动超时');
+}
+
+async function launchNativeChromium(chromium, executablePath, timeoutMs, userAgent = '') {
+  if (!executablePath) {
+    throw new RunAnytimeBrowserError(
+      'config_error',
+      '有头模式需要系统 Chromium，请设置 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'
+    );
+  }
+
+  const port = await getFreeLocalPort();
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runanytime-chromium-'));
+  const args = [
+    `--remote-debugging-port=${port}`,
+    '--remote-debugging-address=127.0.0.1',
+    `--user-data-dir=${profileDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-default-apps',
+    '--lang=zh-CN',
+    '--window-size=1365,900',
+    'about:blank',
+  ];
+  if (process.platform === 'linux') {
+    args.unshift('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
+  }
+  if (userAgent) args.unshift(`--user-agent=${userAgent}`);
+
+  const chromeProcess = spawn(executablePath, args, { stdio: 'ignore' });
+  chromeProcess.spawnError = null;
+  chromeProcess.once('error', error => {
+    chromeProcess.spawnError = error;
+  });
+
+  let browser;
+  const close = async () => {
+    await browser?.close().catch(() => {});
+    if (chromeProcess.exitCode === null) {
+      chromeProcess.kill('SIGTERM');
+      await Promise.race([
+        new Promise(resolve => chromeProcess.once('exit', resolve)),
+        new Promise(resolve => setTimeout(resolve, 1000)),
+      ]);
+    }
+    if (chromeProcess.exitCode === null) {
+      chromeProcess.kill('SIGKILL');
+      await Promise.race([
+        new Promise(resolve => chromeProcess.once('exit', resolve)),
+        new Promise(resolve => setTimeout(resolve, 1000)),
+      ]);
+    }
+    try {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch {
+      console.warn('[RunAnytime] 临时 Chromium 配置清理失败');
+    }
+  };
+
+  try {
+    await waitForCdpEndpoint(port, chromeProcess, timeoutMs);
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    const context = browser.contexts()[0];
+    if (!context) {
+      throw new RunAnytimeBrowserError('browser_error', '本地 Chromium 未创建默认上下文');
+    }
+    return { browser, close, context, profileDir };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
 function getNotify() {
   try {
     const mod = require('./sendNotify');
@@ -281,19 +398,39 @@ async function verifySession(page) {
       const message = typeof payload?.message === 'string' ? payload.message : '';
       return {
         authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
+        data: payload?.data || null,
         message,
         status: response.status,
       };
     } catch {
-      return { authenticated: false, message: '', status: 0 };
+      return { authenticated: false, data: null, message: '', status: 0 };
     }
   });
 
   return {
     authenticated: result.authenticated,
     authFailed: result.status === 401 || result.status === 403 || isAuthMessage(result.message),
+    data: result.authenticated ? result.data : null,
     status: result.status,
   };
+}
+
+async function prepareTurnstilePage(page, sessionData, statusData, timeoutMs) {
+  if (!sessionData || typeof sessionData !== 'object' || Array.isArray(sessionData)) {
+    throw new RunAnytimeBrowserError('schema_changed', '登录用户数据异常，无法加载 Turnstile');
+  }
+
+  await page.evaluate(({ user, status }) => {
+    localStorage.setItem('user', JSON.stringify(user));
+    if (status && typeof status === 'object' && !Array.isArray(status)) {
+      localStorage.setItem('status', JSON.stringify(status));
+    }
+  }, { user: sessionData, status: statusData });
+
+  await page.reload({
+    waitUntil: 'domcontentloaded',
+    timeout: Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS),
+  });
 }
 
 async function fetchStatus(page) {
@@ -475,6 +612,11 @@ async function requestTurnstileToken(page, siteKey, timeoutMs) {
     mountId: TURNSTILE_MOUNT_ID,
     turnstileSiteKey: siteKey,
     maxWaitMs: Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS),
+  }).catch(error => {
+    if (/execution context was destroyed|cannot find context|navigation/i.test(error?.message || '')) {
+      return { status: 'navigation' };
+    }
+    throw error;
   });
 }
 
@@ -483,6 +625,7 @@ function formatTurnstileFailure(verification, headless) {
     load_error: 'Turnstile 组件加载失败',
     error: 'Turnstile 验证失败',
     expired: 'Turnstile token 已过期',
+    navigation: 'Turnstile 验证页面发生跳转',
     unsupported: '当前浏览器不支持 Turnstile',
   }[verification?.status] || 'Turnstile 验证超时';
 
@@ -584,26 +727,37 @@ async function runBrowserCheckin(config) {
     };
   }
 
-  const launchOptions = {
-    headless: config.headless,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  };
-  if (config.executablePath) launchOptions.executablePath = config.executablePath;
-
   let browser;
   let context;
+  let nativeSession;
   let page;
 
   try {
-    browser = await chromium.launch(launchOptions);
-    const contextOptions = {
-      locale: 'zh-CN',
-      timezoneId: 'Asia/Shanghai',
-      viewport: { width: 1365, height: 900 },
-    };
-    if (config.userAgent) contextOptions.userAgent = config.userAgent;
+    if (!config.headless) {
+      nativeSession = await launchNativeChromium(
+        chromium,
+        config.executablePath,
+        config.timeoutMs,
+        config.userAgent
+      );
+      ({ browser, context } = nativeSession);
+    } else {
+      const launchOptions = {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      };
+      if (config.executablePath) launchOptions.executablePath = config.executablePath;
+      browser = await chromium.launch(launchOptions);
 
-    context = await browser.newContext(contextOptions);
+      const contextOptions = {
+        locale: 'zh-CN',
+        timezoneId: 'Asia/Shanghai',
+        viewport: { width: 1365, height: 900 },
+      };
+      if (config.userAgent) contextOptions.userAgent = config.userAgent;
+      context = await browser.newContext(contextOptions);
+    }
+
     await installApiUserHeader(context, config.userId);
     await context.addCookies(config.cookies);
 
@@ -700,6 +854,26 @@ async function runBrowserCheckin(config) {
       }
 
       console.log('[RunAnytime] 服务端要求 Turnstile，等待官方验证');
+      await prepareTurnstilePage(page, session.data, settings, config.timeoutMs);
+      const interactiveUrl = new URL(page.url());
+      if (interactiveUrl.origin !== SITE_URL || interactiveUrl.pathname.startsWith('/login')) {
+        return {
+          type: 'auth_failed',
+          message: 'Turnstile 页面未保持登录状态，请更新 Cookie 后重试',
+        };
+      }
+      if (await isChallengeVisible(page)) {
+        return {
+          type: 'challenge_required',
+          message: '加载 Turnstile 页面时触发 Cloudflare 人机验证，请在网页手动签到',
+        };
+      }
+
+      const interactiveSession = await verifySession(page);
+      if (interactiveSession.authFailed || !interactiveSession.authenticated) {
+        return { type: 'auth_failed', message: '加载 Turnstile 页面后登录状态失效' };
+      }
+
       const turnstileTimeoutMs = config.headless
         ? Math.min(config.timeoutMs, 30000)
         : config.timeoutMs;
@@ -756,8 +930,12 @@ async function runBrowserCheckin(config) {
     return { type: 'error', message: `浏览器执行失败: ${error?.message || String(error)}` };
   } finally {
     await page?.close().catch(() => {});
-    await context?.close().catch(() => {});
-    await browser?.close().catch(() => {});
+    if (nativeSession) {
+      await nativeSession.close();
+    } else {
+      await context?.close().catch(() => {});
+      await browser?.close().catch(() => {});
+    }
   }
 }
 
@@ -783,7 +961,8 @@ function printHelp() {
   站点采用 PoW 工作量证明作为签到主流程。
   脚本在浏览器页面内完成 challenge 获取、SHA-256 前导零求解与签到提交；
   若服务端仍要求 Turnstile，会通过官方 widget 验证后复用 PoW 重试。
-  验证 token 仅在内存中使用且不会记录；无头模式无法自动验证时请切换有头模式。`);
+  验证 token 仅在内存中使用且不会记录；有头模式使用独立临时 Chromium
+  配置完成官方验证，退出时自动清理。`);
 }
 
 async function main() {
@@ -842,12 +1021,14 @@ module.exports = {
   isAuthMessage,
   isChallengeVisible,
   isTurnstileMessage,
+  launchNativeChromium,
   normalizeCookie,
   normalizeUserId,
   parseBoolean,
   parseCookieHeader,
   parsePositiveInteger,
   performPowCheckin,
+  prepareTurnstilePage,
   requestTurnstileToken,
   resolveChromiumExecutable,
   runBrowserCheckin,
