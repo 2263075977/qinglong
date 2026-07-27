@@ -18,11 +18,13 @@
  *
  * 说明:
  *   RunAnytime(New API 分支)签到采用 PoW 工作量证明。站点当前配置
- *   pow_mode = "replace"，即 PoW 完全替代 Turnstile。脚本复刻前端流程：
+ *   pow_mode = "replace"，脚本复刻前端流程：
  *     1. GET  /api/user/pow/challenge?action=checkin  取 {challenge_id, prefix, difficulty}
  *     2. 本地计算 SHA-256(prefix + nonce) 满足 difficulty 个前导零 bit 的 nonce
  *     3. POST /api/user/checkin?pow_challenge=..&pow_nonce=..
- *   全程在真实浏览器页面上下文内用 fetch + crypto.subtle 完成，无需人工过验证。
+ *     4. 若服务端仍要求 Turnstile，通过官方 widget 取得 token 后复用 PoW 重试
+ *   全程在真实浏览器页面上下文内完成；无头模式无法自动完成 Turnstile 时，
+ *   可切换有头模式人工验证。
  */
 
 const fs = require('node:fs');
@@ -35,6 +37,8 @@ const COOKIE_ENV = 'RUNANYTIME_ACCOUNTS';
 const DEFAULT_USER_ID = '8514';
 const DEFAULT_TIMEOUT_MS = 90000;
 const DEFAULT_POW_TIMEOUT_MS = 60000;
+const TURNSTILE_SCRIPT_URL = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+const TURNSTILE_MOUNT_ID = 'runanytime-turnstile-mount';
 const CHROMIUM_CANDIDATES = [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
@@ -223,7 +227,7 @@ function sanitizeTraceUrl(value) {
   }
 
   if (url.hostname === 'challenges.cloudflare.com') {
-    return `${url.origin}${url.pathname}`;
+    return `${url.origin}/<redacted>`;
   }
 
   return null;
@@ -327,15 +331,176 @@ async function fetchCheckinStatus(page, month) {
   }, month);
 }
 
+function isTurnstileMessage(message) {
+  return /turnstile|人机验证/i.test(String(message || ''));
+}
+
+function buildCheckinPath(proof, turnstileToken = '') {
+  if (!proof || typeof proof.nonce !== 'string' || !proof.nonce) {
+    throw new RunAnytimeBrowserError('schema_changed', 'PoW proof 参数异常');
+  }
+
+  const params = new URLSearchParams();
+  if (turnstileToken) params.set('turnstile', turnstileToken);
+  if (proof.challengeId) params.set('pow_challenge', proof.challengeId);
+  params.set('pow_nonce', proof.nonce);
+  return `/api/user/checkin?${params.toString()}`;
+}
+
+async function submitPowProof(page, proof, turnstileToken = '') {
+  const path = buildCheckinPath(proof, turnstileToken);
+  return page.evaluate(async url => {
+    const response = await fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    });
+    const payload = await response.json().catch(() => null);
+    return {
+      stage: 'submit',
+      status: response.status,
+      success: payload?.success === true,
+      message: typeof payload?.message === 'string' ? payload.message : '',
+      data: payload?.data || null,
+    };
+  }, path);
+}
+
+async function requestTurnstileToken(page, siteKey, timeoutMs) {
+  return page.evaluate(async ({ scriptUrl, mountId, turnstileSiteKey, maxWaitMs }) => {
+    const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+    const deadline = Date.now() + maxWaitMs;
+
+    if (typeof window.turnstile?.render !== 'function') {
+      let script = document.querySelector('script[data-runanytime-turnstile]');
+      let scriptFailed = false;
+      if (!script) {
+        script = document.createElement('script');
+        script.src = scriptUrl;
+        script.async = true;
+        script.dataset.runanytimeTurnstile = 'true';
+        script.addEventListener('error', () => {
+          scriptFailed = true;
+        }, { once: true });
+        (document.head || document.documentElement).appendChild(script);
+      }
+
+      const loadDeadline = Math.min(deadline, Date.now() + 15000);
+      while (typeof window.turnstile?.render !== 'function'
+        && !scriptFailed
+        && Date.now() < loadDeadline) {
+        await wait(100);
+      }
+      if (typeof window.turnstile?.render !== 'function') {
+        return { status: 'load_error' };
+      }
+    }
+
+    let body = document.body;
+    if (!body) {
+      body = document.createElement('body');
+      document.documentElement.appendChild(body);
+    }
+
+    document.getElementById(mountId)?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = mountId;
+    overlay.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'z-index:2147483647',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'background:#ffffff',
+    ].join(';');
+    const widget = document.createElement('div');
+    overlay.appendChild(widget);
+    body.appendChild(overlay);
+
+    let widgetId = null;
+    let timer = null;
+    let lastFailure = 'timeout';
+    const remainingMs = Math.max(1, deadline - Date.now());
+    const result = await new Promise(resolve => {
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+
+      timer = setTimeout(() => finish({ status: lastFailure }), remainingMs);
+      try {
+        widgetId = window.turnstile.render(widget, {
+          sitekey: turnstileSiteKey,
+          appearance: 'always',
+          retry: 'auto',
+          'refresh-expired': 'auto',
+          callback: token => {
+            if (typeof token === 'string' && token) {
+              finish({ status: 'verified', token });
+            } else {
+              lastFailure = 'error';
+            }
+          },
+          'error-callback': () => {
+            lastFailure = 'error';
+          },
+          'expired-callback': () => {
+            lastFailure = 'expired';
+          },
+          'timeout-callback': () => {
+            lastFailure = 'timeout';
+          },
+          'unsupported-callback': () => {
+            lastFailure = 'unsupported';
+          },
+        });
+      } catch {
+        finish({ status: 'error' });
+      }
+    });
+
+    if (widgetId != null) {
+      try {
+        window.turnstile.remove(widgetId);
+      } catch {}
+    }
+    overlay.remove();
+    return result;
+  }, {
+    scriptUrl: TURNSTILE_SCRIPT_URL,
+    mountId: TURNSTILE_MOUNT_ID,
+    turnstileSiteKey: siteKey,
+    maxWaitMs: Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS),
+  });
+}
+
+function formatTurnstileFailure(verification, headless) {
+  const reason = {
+    load_error: 'Turnstile 组件加载失败',
+    error: 'Turnstile 验证失败',
+    expired: 'Turnstile token 已过期',
+    unsupported: '当前浏览器不支持 Turnstile',
+  }[verification?.status] || 'Turnstile 验证超时';
+
+  if (headless) {
+    return `${reason}，请设置 RUNANYTIME_BROWSER_HEADLESS=false 或前往网页手动签到`;
+  }
+  return `${reason}，请重新运行并在打开的浏览器窗口完成验证`;
+}
+
 /**
- * 在浏览器页面上下文内完成一次 PoW 签到：
+ * 在浏览器页面上下文内求解并提交一次 PoW 签到：
  *   1. 取 challenge
  *   2. 用 crypto.subtle 复刻站点 worker 的 SHA-256 前导零 bit 求解
  *   3. 携带 pow_challenge / pow_nonce POST 签到
- * 返回原始 HTTP 状态与 JSON，供 Node 侧统一判定。
+ * 返回原始 HTTP 状态、JSON 和一次回退可复用的 proof，供 Node 侧统一判定。
  */
 async function performPowCheckin(page, powTimeoutMs) {
-  return page.evaluate(async maxSolveMs => {
+  const solved = await page.evaluate(async maxSolveMs => {
     const getJson = async (url, init) => {
       const response = await fetch(url, {
         credentials: 'include',
@@ -396,21 +561,16 @@ async function performPowCheckin(page, powTimeoutMs) {
       }
     }
 
-    // 3. 携带 PoW 提交签到（replace 模式无需 turnstile 参数）
-    const params = new URLSearchParams();
-    if (challengeId) params.set('pow_challenge', challengeId);
-    params.set('pow_nonce', nonce);
-    const submitResult = await getJson(`/api/user/checkin?${params.toString()}`, { method: 'POST' });
-
     return {
-      stage: 'submit',
-      status: submitResult.status,
-      success: submitResult.payload?.success === true,
-      message: submitResult.payload?.message || '',
-      data: submitResult.payload?.data || null,
+      stage: 'solved',
       difficulty,
+      proof: { challengeId, nonce },
     };
   }, powTimeoutMs);
+
+  if (solved.stage !== 'solved') return solved;
+  const submitted = await submitPowProof(page, solved.proof);
+  return { ...submitted, difficulty: solved.difficulty, proof: solved.proof };
 }
 
 async function runBrowserCheckin(config) {
@@ -451,8 +611,9 @@ async function runBrowserCheckin(config) {
     attachRequestTrace(page, config.trace);
     page.setDefaultTimeout(config.timeoutMs);
 
-    // 加载页面主要用于建立真实浏览器上下文（TLS、Cookie、可能的 cf_clearance）
-    await page.goto(PERSONAL_URL, { waitUntil: 'domcontentloaded', timeout: config.timeoutMs });
+    // 只建立同源浏览器上下文，避免站点前端提前挂载的隐藏 Turnstile 阻塞无头模式。
+    await page.goto(PERSONAL_URL, { waitUntil: 'commit', timeout: config.timeoutMs });
+    await page.evaluate(() => window.stop());
 
     if (await isChallengeVisible(page)) {
       return {
@@ -513,7 +674,7 @@ async function runBrowserCheckin(config) {
     }
 
     // 执行 PoW 签到
-    const result = await performPowCheckin(page, config.powTimeoutMs);
+    let result = await performPowCheckin(page, config.powTimeoutMs);
     if (result.stage === 'challenge') {
       if ([401, 403].includes(result.status) || isAuthMessage(result.message)) {
         return { type: 'auth_failed', message: 'Cookie 已失效，PoW 接口要求重新登录' };
@@ -522,6 +683,36 @@ async function runBrowserCheckin(config) {
     }
     if (result.stage === 'solve') {
       return { type: 'error', message: result.message };
+    }
+
+    if (!result.success && isTurnstileMessage(result.message)) {
+      const siteKey = typeof settings.turnstile_site_key === 'string'
+        ? settings.turnstile_site_key.trim()
+        : '';
+      if (!siteKey) {
+        return {
+          type: 'challenge_required',
+          message: '站点要求 Turnstile，但公开配置未提供 site key',
+        };
+      }
+      if (!result.proof) {
+        return { type: 'schema_changed', message: 'Turnstile 回退缺少可复用的 PoW proof' };
+      }
+
+      console.log('[RunAnytime] 服务端要求 Turnstile，等待官方验证');
+      const turnstileTimeoutMs = config.headless
+        ? Math.min(config.timeoutMs, 30000)
+        : config.timeoutMs;
+      const verification = await requestTurnstileToken(page, siteKey, turnstileTimeoutMs);
+      if (verification.status !== 'verified') {
+        return {
+          type: 'challenge_required',
+          message: formatTurnstileFailure(verification, config.headless),
+        };
+      }
+
+      const retried = await submitPowProof(page, result.proof, verification.token);
+      result = { ...retried, difficulty: result.difficulty, proof: result.proof };
     }
 
     if (result.success) {
@@ -539,7 +730,7 @@ async function runBrowserCheckin(config) {
     if (/已签到|already/i.test(result.message)) {
       return { type: 'already_checked', message: '今日已签到' };
     }
-    if (/turnstile|人机|验证/i.test(result.message)) {
+    if (isTurnstileMessage(result.message)) {
       return {
         type: 'challenge_required',
         message: `站点要求 Turnstile：${result.message}`,
@@ -589,9 +780,10 @@ function printHelp() {
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
 
 说明:
-  站点采用 PoW 工作量证明签到，pow_mode = "replace" 时 PoW 完全替代 Turnstile。
-  脚本在浏览器页面内完成 challenge 获取、SHA-256 前导零求解与签到提交，
-  不读取或保存任何验证 token，正常情况下无需人工干预。`);
+  站点采用 PoW 工作量证明作为签到主流程。
+  脚本在浏览器页面内完成 challenge 获取、SHA-256 前导零求解与签到提交；
+  若服务端仍要求 Turnstile，会通过官方 widget 验证后复用 PoW 重试。
+  验证 token 仅在内存中使用且不会记录；无头模式无法自动验证时请切换有头模式。`);
 }
 
 async function main() {
@@ -641,21 +833,26 @@ if (require.main === module) {
 module.exports = {
   RunAnytimeBrowserError,
   attachRequestTrace,
+  buildCheckinPath,
+  formatTurnstileFailure,
   formatResult,
   formatReward,
   formatShanghaiMonth,
   installApiUserHeader,
   isAuthMessage,
   isChallengeVisible,
+  isTurnstileMessage,
   normalizeCookie,
   normalizeUserId,
   parseBoolean,
   parseCookieHeader,
   parsePositiveInteger,
   performPowCheckin,
+  requestTurnstileToken,
   resolveChromiumExecutable,
   runBrowserCheckin,
   sanitizeTraceUrl,
+  submitPowProof,
   validateDisplayAvailability,
   verifySession,
 };
