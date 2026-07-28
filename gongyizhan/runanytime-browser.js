@@ -9,7 +9,7 @@
  *
  * 可选环境变量:
  *   RUNANYTIME_USER_ID=8514
- *   RUNANYTIME_BROWSER_HEADLESS=true
+ *   RUNANYTIME_BROWSER_HEADLESS=false
  *   RUNANYTIME_BROWSER_TIMEOUT_MS=90000
  *   RUNANYTIME_POW_TIMEOUT_MS=60000
  *   RUNANYTIME_BROWSER_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
@@ -141,16 +141,25 @@ function isAuthMessage(message) {
     || text.includes('无权限');
 }
 
-function validateDisplayAvailability(
-  headless,
-  platform = process.platform,
-  env = process.env
-) {
-  if (!headless && platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
+function resolvePathExecutable(command, env = process.env) {
+  const searchPath = String(env.PATH || '');
+  for (const directory of searchPath.split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return '';
+}
+
+function validateDisplayAvailability(headless, platform = process.platform, env = process.env) {
+  const displayMissing = platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
+  if (!headless && displayMissing && !resolvePathExecutable('xvfb-run', env)) {
     throw new RunAnytimeBrowserError(
       'config_error',
-      '有头模式需要 X Server；请设置 RUNANYTIME_BROWSER_HEADLESS=true，'
-        + '或使用 xvfb-run -a node gongyizhan/runanytime-browser.js'
+      '有头模式需要虚拟显示，当前系统未找到 xvfb-run；请先安装 xvfb'
     );
   }
 }
@@ -212,7 +221,14 @@ async function waitForCdpEndpoint(port, chromeProcess, timeoutMs) {
   throw new RunAnytimeBrowserError('browser_error', '本地 Chromium 调试端口启动超时');
 }
 
-async function launchNativeChromium(chromium, executablePath, timeoutMs, userAgent = '') {
+async function launchNativeChromium(
+  chromium,
+  executablePath,
+  timeoutMs,
+  userAgent = '',
+  env = process.env,
+  platform = process.platform
+) {
   if (!executablePath) {
     throw new RunAnytimeBrowserError(
       'config_error',
@@ -233,12 +249,28 @@ async function launchNativeChromium(chromium, executablePath, timeoutMs, userAge
     '--window-size=1365,900',
     'about:blank',
   ];
-  if (process.platform === 'linux') {
+  if (platform === 'linux') {
     args.unshift('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
   }
   if (userAgent) args.unshift(`--user-agent=${userAgent}`);
 
-  const chromeProcess = spawn(executablePath, args, { stdio: 'ignore' });
+  const displayMissing = platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
+  const xvfbRunPath = displayMissing ? resolvePathExecutable('xvfb-run', env) : '';
+  if (displayMissing && !xvfbRunPath) {
+    try {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch {}
+    throw new RunAnytimeBrowserError(
+      'config_error',
+      '有头模式需要虚拟显示，当前系统未找到 xvfb-run；请先安装 xvfb'
+    );
+  }
+
+  const launchCommand = xvfbRunPath || executablePath;
+  const launchArgs = xvfbRunPath
+    ? ['-a', '-s', '-screen 0 1365x900x24 -nolisten tcp', executablePath, ...args]
+    : args;
+  const chromeProcess = spawn(launchCommand, launchArgs, { env, stdio: 'ignore' });
   chromeProcess.spawnError = null;
   chromeProcess.once('error', error => {
     chromeProcess.spawnError = error;
@@ -950,7 +982,7 @@ function printHelp() {
 
 可选环境变量:
   RUNANYTIME_USER_ID               New API 用户 ID，默认 ${DEFAULT_USER_ID}
-  RUNANYTIME_BROWSER_HEADLESS      true/false，默认 true
+  RUNANYTIME_BROWSER_HEADLESS      true/false，默认 false
   RUNANYTIME_BROWSER_TIMEOUT_MS    页面加载超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
   RUNANYTIME_POW_TIMEOUT_MS        PoW 求解超时毫秒数，默认 ${DEFAULT_POW_TIMEOUT_MS}
   RUNANYTIME_BROWSER_USER_AGENT    获取 Cookie 时浏览器的完整 User-Agent
@@ -962,7 +994,7 @@ function printHelp() {
   脚本在浏览器页面内完成 challenge 获取、SHA-256 前导零求解与签到提交；
   若服务端仍要求 Turnstile，会通过官方 widget 验证后复用 PoW 重试。
   验证 token 仅在内存中使用且不会记录；有头模式使用独立临时 Chromium
-  配置完成官方验证，退出时自动清理。`);
+  配置完成官方验证，退出时自动清理。Linux 无显示环境会自动调用 xvfb-run。`);
 }
 
 async function main() {
@@ -983,7 +1015,7 @@ async function main() {
     config = {
       cookies: parseCookieHeader(rawCookie),
       executablePath: resolveChromiumExecutable(),
-      headless: parseBoolean(process.env.RUNANYTIME_BROWSER_HEADLESS, true),
+      headless: parseBoolean(process.env.RUNANYTIME_BROWSER_HEADLESS, false),
       trace: parseBoolean(process.env.RUNANYTIME_BROWSER_TRACE, false),
       userAgent: process.env.RUNANYTIME_BROWSER_USER_AGENT?.trim() || '',
       userId: normalizeUserId(process.env.RUNANYTIME_USER_ID),
