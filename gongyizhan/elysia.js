@@ -14,7 +14,7 @@ const CONFIG = {
   ENV: 'ELYSIA_ACCOUNTS',
   USER_ID: '944',
   HEADLESS: true,
-  TIMEOUT: 20000,
+  TIMEOUT: 90000, // 增加到 90 秒，应对 Cloudflare 验证
 };
 
 // 工具函数
@@ -86,12 +86,37 @@ async function checkin(cookie) {
   let browser, context, page;
 
   try {
-    const execPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/chromium';
+    const chromiumCandidates = [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+    ];
+
+    const execPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+      || chromiumCandidates.find(path => {
+        try {
+          return require('fs').existsSync(path);
+        } catch {
+          return false;
+        }
+      });
+
+    if (!execPath) {
+      return { type: 'error', message: '未找到可用的 Chromium 浏览器' };
+    }
 
     browser = await chromium.launch({
       headless: CONFIG.HEADLESS,
       executablePath: execPath,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+      ],
     });
 
     context = await browser.newContext({
@@ -124,11 +149,13 @@ async function checkin(cookie) {
     });
 
     await page.goto(CONFIG.URL, { waitUntil: 'domcontentloaded', timeout: CONFIG.TIMEOUT });
-    await sleep(1500);
+    await sleep(3000); // 等待 Cloudflare 验证
 
     // 检查 Cloudflare
-    if ((await page.content()).includes('bot detection')) {
-      await sleep(5000);
+    const content = await page.content();
+    if (content.includes('bot detection') || content.includes('Checking your browser')) {
+      console.log('检测到 Cloudflare 验证，等待通过...');
+      await sleep(8000); // 额外等待 Cloudflare 完成
     }
 
     // 查找签到按钮
