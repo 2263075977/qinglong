@@ -557,20 +557,55 @@ async function run() {
     console.log(`[hybgzs] 本次预计消耗: ${quotaToCurrency(eligibility.cost)}`);
   }
 
+  // 查询与抽卡之间添加延迟，避免触发 Cloudflare 频率限制
+  console.log('[hybgzs] 等待 3 秒后开始抽卡...');
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+
   let drawResult;
-  try {
-    drawResult = await requestJson(config, '/api/cards/draw', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: DRAW_TYPE }),
-    });
-    assertSuccess(drawResult, '50连抽失败');
-  } catch (error) {
-    const errorMsg = error instanceof HybCardsError ? error.message : String(error);
-    console.error(`[hybgzs] 50连抽失败: ${errorMsg}`);
-    await sendQinglongNotification(TASK_NAME, `账号: ${accountLabel}\n❌ 发生异常：50连抽失败\n\n${errorMsg}`);
-    error.notificationSent = true;
-    throw error;
+  let lastError = null;
+  const maxRetries = 2;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 1) {
+        const waitSeconds = attempt * 5;
+        console.log(`[hybgzs] 第 ${attempt} 次尝试，等待 ${waitSeconds} 秒...`);
+        await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+      }
+
+      drawResult = await requestJson(config, '/api/cards/draw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: DRAW_TYPE }),
+      });
+      assertSuccess(drawResult, '50连抽失败');
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      const errorMsg = error instanceof HybCardsError ? error.message : String(error);
+      const is429 = error instanceof HybCardsError && error.details?.statusCode === 429;
+
+      if (is429 && attempt < maxRetries) {
+        console.log(`[hybgzs] 触发频率限制（429），准备重试 ${attempt}/${maxRetries - 1}...`);
+        continue;
+      }
+
+      console.error(`[hybgzs] 50连抽失败: ${errorMsg}`);
+
+      let notificationMsg = `账号: ${accountLabel}\n❌ 发生异常：50连抽失败\n\n${errorMsg}`;
+      if (is429) {
+        notificationMsg += '\n\n💡 建议：\n1. 等待 10-30 分钟后手动重试\n2. 或在浏览器访问 https://cdk.hybgzs.com/entertainment/cards/draw 完成验证后重新运行';
+      }
+
+      await sendQinglongNotification(TASK_NAME, notificationMsg);
+      error.notificationSent = true;
+      throw error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
   }
 
   const cardSummary = summarizeCards(drawResult.cards);
