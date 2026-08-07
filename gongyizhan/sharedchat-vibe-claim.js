@@ -355,17 +355,27 @@ async function fetchJsonInPage(page, path, options = {}) {
       });
       const text = await response.text();
       let json = null;
+      let parseError = null;
       try {
         json = text ? JSON.parse(text) : null;
-      } catch {}
-      return { ok: response.ok, status: response.status, json };
+      } catch (err) {
+        parseError = err.message;
+      }
+      return {
+        ok: response.ok,
+        status: response.status,
+        json,
+        rawTextPreview: text ? text.slice(0, 200) : '',
+        textLength: text ? text.length : 0,
+        parseError,
+      };
     } catch (error) {
       return { ok: false, status: 0, json: null, networkError: error.message || String(error) };
     }
   }, { requestPath: path, requestOptions: options });
 
   if (result.networkError) {
-    throw new SharedChatClaimError('network_error', '请求站点接口失败');
+    throw new SharedChatClaimError('network_error', `请求站点接口失败: ${result.networkError}`);
   }
 
   return result;
@@ -426,16 +436,18 @@ async function detectChallengeSignal(page) {
 
 /**
  * 等待 dashboard 就绪：
- *   - 以「配额接口能返回有效 JSON」为页面可用的 ground truth（挑战已过 / SPA 已就绪）；
+ *   - 优先通过 DOM 可见性判断页面就绪（领取按钮可见表示 SPA 已渲染完成）；
+ *   - 配额接口作为次要验证，若接口失败但页面内容已就绪，仍可继续；
  *   - 命中软挑战（Cloudflare 中间页）时轮询等待自愈，避免误杀可自动通过的验证；
  *   - 超时后仍存在真实可见的挑战 widget / 拦截页，才按 challenge_required 中止并打印诊断。
- * 返回首次拿到的配额探针结果，供上层复用，避免二次请求。
+ * 返回首次拿到的配额探针结果（可能为 null），供上层复用。
  */
 async function waitForDashboardReady(page, config) {
   const deadline = Date.now() + config.challengeWaitMs;
   const startTime = Date.now();
   let lastSignal = null;
   let attemptCount = 0;
+  let quotaProbe = null;
 
   for (;;) {
     attemptCount++;
@@ -446,10 +458,53 @@ async function waitForDashboardReady(page, config) {
       throw new SharedChatClaimError('auth_failed', 'Cookie 已失效，页面已跳转到登录入口');
     }
 
-    const probe = await fetchJsonInPage(page, QUOTA_PATH).catch(() => null);
-    if (probe && probe.json && typeof probe.json === 'object') {
-      logWithTimestamp(`Dashboard 已就绪，配额接口返回有效 JSON`, startTime);
-      return probe;
+    // 检测页面 DOM 是否已就绪（领取按钮可见 = SPA 已渲染）
+    const isDomReady = await page.evaluate(() => {
+      const button = document.querySelector('button');
+      if (!button) return false;
+      const buttonText = button.textContent || '';
+      return buttonText.includes('领取') && buttonText.includes('Codex');
+    }).catch(() => false);
+
+    logWithTimestamp(`DOM 就绪状态: ${isDomReady}`, startTime);
+
+    // 尝试调用配额接口
+    const probe = await fetchJsonInPage(page, QUOTA_PATH).catch(err => {
+      logWithTimestamp(`配额接口调用异常: ${err.message}`, startTime);
+      return null;
+    });
+
+    if (probe) {
+      logWithTimestamp(
+        `配额探测 #${attemptCount}: ok=${probe.ok} status=${probe.status} ` +
+        `hasJson=${!!probe.json} jsonType=${typeof probe.json} ` +
+        `textLen=${probe.textLength || 0} ` +
+        `parseError=${probe.parseError || 'none'} ` +
+        `preview="${probe.rawTextPreview || ''}"`,
+        startTime
+      );
+
+      if (probe.json && typeof probe.json === 'object') {
+        logWithTimestamp(`Dashboard 已就绪（配额接口验证通过）`, startTime);
+        return probe;
+      }
+
+      // 保存第一次成功的 HTTP 响应（即使 JSON 解析失败），供后续诊断
+      if (!quotaProbe && probe.status >= 200 && probe.status < 300) {
+        quotaProbe = probe;
+      }
+    }
+
+    // 如果 DOM 已就绪但配额接口失败，先尝试几次，若持续失败则认为页面可用
+    if (isDomReady) {
+      if (attemptCount >= 3) {
+        logWithTimestamp(
+          `Dashboard DOM 已就绪，配额接口响应异常但不阻断流程`,
+          startTime
+        );
+        return quotaProbe || { ok: false, status: 0, json: null };
+      }
+      logWithTimestamp(`DOM 已就绪，再验证配额接口 ${3 - attemptCount} 次`, startTime);
     }
 
     lastSignal = await detectChallengeSignal(page).catch(() => null);
@@ -709,10 +764,19 @@ async function runClaim(config) {
     });
 
     const quotaBefore = await waitForDashboardReady(page, config);
-    const quotaState = analyzeQuotaResponse(quotaBefore.status, quotaBefore.json);
-    if (quotaState.type !== 'claimable') return quotaState;
 
-    log('当前未检测到生效权益，准备通过页面领取');
+    // 如果配额接口返回了有效数据，检查是否已领取
+    if (quotaBefore && quotaBefore.json && typeof quotaBefore.json === 'object') {
+      const quotaState = analyzeQuotaResponse(quotaBefore.status, quotaBefore.json);
+      if (quotaState.type !== 'claimable') {
+        return quotaState;
+      }
+      log('配额接口确认：当前未检测到生效权益');
+    } else {
+      log('配额接口响应异常，但页面已就绪，将尝试通过 UI 领取');
+    }
+
+    log('准备通过页面领取');
     // 必须 await：否则 runClaim 会立即返回并触发 finally 关闭浏览器，
     // 令仍在进行的领取流程（waitFor 按钮/接口）被中断并伪装成「未找到按钮」
     return await claimWithVerification(page, config);
