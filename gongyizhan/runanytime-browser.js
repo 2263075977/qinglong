@@ -2,62 +2,41 @@
 'use strict';
 /**
  * cron: 25 8 * * *
- * new Env('RunAnytime 浏览器签到');
+ * new Env('RunAnytime 签到');
  *
  * 必填环境变量:
- *   RUNANYTIME_ACCOUNTS="完整 Cookie 字符串"
+ *   RUNANYTIME_ACCOUNTS="完整 Cookie 字符串（须包含 refresh 凭证 cookie，可含 cf_clearance）"
  *
  * 可选环境变量:
- *   RUNANYTIME_USER_ID=8514
- *   RUNANYTIME_BROWSER_HEADLESS=false
- *   RUNANYTIME_BROWSER_TIMEOUT_MS=90000
+ *   RUNANYTIME_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"（cf_clearance 与 UA 绑定，建议一并配置）
  *   RUNANYTIME_POW_TIMEOUT_MS=60000
- *   RUNANYTIME_BROWSER_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
- *   RUNANYTIME_BROWSER_TRACE=false
- *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+ *   RUNANYTIME_TRACE=false
  *
  * 说明:
- *   RunAnytime(New API 分支)签到采用 PoW 工作量证明。站点当前配置
- *   pow_mode = "replace"，脚本复刻前端流程：
- *     1. GET  /api/user/pow/challenge?action=checkin  取 {challenge_id, prefix, difficulty}
- *     2. 本地计算 SHA-256(prefix + nonce) 满足 difficulty 个前导零 bit 的 nonce
- *     3. POST /api/user/checkin?pow_challenge=..&pow_nonce=..
- *     4. 若服务端仍要求 Turnstile，通过官方 widget 取得 token 后复用 PoW 重试
- *   全程在真实浏览器页面上下文内完成；无头模式无法自动完成 Turnstile 时，
- *   可切换有头模式。有头模式通过本地调试端口连接独立临时 Chromium，
- *   完成官方验证后自动删除临时浏览器配置。
+ *   站点（New API 分支）已从 gorilla session 迁移到 JWT Bearer 认证：
+ *     1. POST /api/user/auth/refresh  凭 HttpOnly refresh cookie 换取 access token（15 分钟有效）
+ *     2. GET  /api/user/checkin?month=YYYY-MM  查询今日是否已签到
+ *     3. GET  /api/user/pow/challenge?action=checkin  取 {challenge_id, prefix, difficulty}
+ *     4. 本地计算 SHA-256(prefix + nonce) 满足 difficulty 个前导零 bit 的 nonce
+ *     5. POST /api/user/checkin?pow_challenge=..&pow_nonce=..  （Bearer 认证）
+ *   PoW 模式为 replace，纯 HTTP 即可完成，无需浏览器。
+ *   refresh cookie（new_api_refresh，HttpOnly）每次刷新都会轮换，脚本会自动
+ *   合并新值；青龙环境下通过 QLAPI 写回环境变量，本地运行则打印新值提醒。
  */
 
-const fs = require('node:fs');
-const net = require('node:net');
-const os = require('node:os');
-const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
 
-const TASK_TITLE = 'RunAnytime 浏览器签到';
+const TASK_TITLE = 'RunAnytime 签到';
 const SITE_URL = 'https://runanytime.hxi.me';
-const SITE_HOST = 'runanytime.hxi.me';
-const PERSONAL_URL = `${SITE_URL}/console/personal`;
 const COOKIE_ENV = 'RUNANYTIME_ACCOUNTS';
-const DEFAULT_USER_ID = '8514';
-const DEFAULT_TIMEOUT_MS = 90000;
 const DEFAULT_POW_TIMEOUT_MS = 60000;
-const TURNSTILE_SCRIPT_URL = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-const TURNSTILE_MOUNT_ID = 'runanytime-turnstile-mount';
-const CHROMIUM_CANDIDATES = [
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-  '/usr/bin/google-chrome',
-  '/usr/bin/google-chrome-stable',
-  '/opt/google/chrome/chrome',
-];
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36';
 
-class RunAnytimeBrowserError extends Error {
+class RunAnytimeError extends Error {
   constructor(type, message) {
     super(message);
-    this.name = 'RunAnytimeBrowserError';
+    this.name = 'RunAnytimeError';
     this.type = type;
   }
 }
@@ -70,43 +49,12 @@ function normalizeCookie(cookie) {
     .replace(/;\s*/g, '; ');
 }
 
-function parseCookieHeader(cookie) {
-  const cookies = [];
-
-  for (const pair of normalizeCookie(cookie).split(';')) {
-    const item = pair.trim();
-    if (!item) continue;
-
-    const separator = item.indexOf('=');
-    if (separator <= 0) continue;
-
-    const name = item.slice(0, separator).trim();
-    const value = item.slice(separator + 1).trim();
-    if (!name) continue;
-
-    cookies.push({
-      name,
-      value,
-      domain: SITE_HOST,
-      path: '/',
-      secure: true,
-      sameSite: 'Lax',
-    });
-  }
-
-  if (cookies.length === 0) {
-    throw new RunAnytimeBrowserError('config_error', `${COOKIE_ENV} 格式无效，未解析到 Cookie`);
-  }
-
-  return cookies;
-}
-
 function parseBoolean(value, fallback) {
   if (value == null || String(value).trim() === '') return fallback;
   const text = String(value).trim().toLowerCase();
   if (['1', 'true', 'yes', 'on'].includes(text)) return true;
   if (['0', 'false', 'no', 'off'].includes(text)) return false;
-  throw new RunAnytimeBrowserError('config_error', `无效布尔值: ${value}`);
+  throw new RunAnytimeError('config_error', `无效布尔值: ${value}`);
 }
 
 function parsePositiveInteger(value, fallback) {
@@ -114,204 +62,20 @@ function parsePositiveInteger(value, fallback) {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
-function normalizeUserId(value, fallback = DEFAULT_USER_ID) {
-  const userId = String(value || fallback).trim();
-  if (!/^\d+$/.test(userId) || userId === '0') {
-    throw new RunAnytimeBrowserError('config_error', `RUNANYTIME_USER_ID 无效: ${userId}`);
-  }
-  return userId;
+function formatShanghaiMonth(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.year}-${values.month}`;
 }
 
-function isAuthMessage(message) {
-  const text = String(message || '').toLowerCase();
-  return text.includes('unauthorized')
-    || text.includes('forbidden')
-    || text.includes('not login')
-    || text.includes('not logged')
-    || text.includes('please login')
-    || text.includes('expired')
-    || text.includes('invalid token')
-    || text.includes('未登录')
-    || text.includes('请先登录')
-    || text.includes('请登录')
-    || text.includes('登录失效')
-    || text.includes('登录已失效')
-    || text.includes('登录过期')
-    || text.includes('无权')
-    || text.includes('无权限');
-}
-
-function resolvePathExecutable(command, env = process.env) {
-  const searchPath = String(env.PATH || '');
-  for (const directory of searchPath.split(path.delimiter)) {
-    if (!directory) continue;
-    const candidate = path.join(directory, command);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {}
-  }
-  return '';
-}
-
-function validateDisplayAvailability(headless, platform = process.platform, env = process.env) {
-  const displayMissing = platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
-  if (!headless && displayMissing && !resolvePathExecutable('xvfb-run', env)) {
-    throw new RunAnytimeBrowserError(
-      'config_error',
-      '有头模式需要虚拟显示，当前系统未找到 xvfb-run；请先安装 xvfb'
-    );
-  }
-}
-
-function resolveChromiumExecutable(explicitPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
-  if (explicitPath?.trim()) {
-    const executablePath = explicitPath.trim();
-    if (!fs.existsSync(executablePath)) {
-      throw new RunAnytimeBrowserError(
-        'config_error',
-        `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH 不存在: ${executablePath}`
-      );
-    }
-    return executablePath;
-  }
-
-  return CHROMIUM_CANDIDATES.find(candidate => fs.existsSync(candidate));
-}
-
-function getFreeLocalPort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      server.close(error => {
-        if (error) reject(error);
-        else resolve(address.port);
-      });
-    });
-  });
-}
-
-async function waitForCdpEndpoint(port, chromeProcess, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (chromeProcess.spawnError) {
-      throw new RunAnytimeBrowserError(
-        'browser_error',
-        `启动本地 Chromium 失败: ${chromeProcess.spawnError.message}`
-      );
-    }
-    if (chromeProcess.exitCode !== null) {
-      throw new RunAnytimeBrowserError(
-        'browser_error',
-        `本地 Chromium 提前退出，状态码 ${chromeProcess.exitCode}`
-      );
-    }
-
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
-        signal: AbortSignal.timeout(1000),
-      });
-      if (response.ok) return;
-    } catch {}
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-
-  throw new RunAnytimeBrowserError('browser_error', '本地 Chromium 调试端口启动超时');
-}
-
-async function launchNativeChromium(
-  chromium,
-  executablePath,
-  timeoutMs,
-  userAgent = '',
-  env = process.env,
-  platform = process.platform
-) {
-  if (!executablePath) {
-    throw new RunAnytimeBrowserError(
-      'config_error',
-      '有头模式需要系统 Chromium，请设置 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'
-    );
-  }
-
-  const port = await getFreeLocalPort();
-  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runanytime-chromium-'));
-  const args = [
-    `--remote-debugging-port=${port}`,
-    '--remote-debugging-address=127.0.0.1',
-    `--user-data-dir=${profileDir}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-default-apps',
-    '--lang=zh-CN',
-    '--window-size=1365,900',
-    'about:blank',
-  ];
-  if (platform === 'linux') {
-    args.unshift('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
-  }
-  if (userAgent) args.unshift(`--user-agent=${userAgent}`);
-
-  const displayMissing = platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
-  const xvfbRunPath = displayMissing ? resolvePathExecutable('xvfb-run', env) : '';
-  if (displayMissing && !xvfbRunPath) {
-    try {
-      fs.rmSync(profileDir, { recursive: true, force: true });
-    } catch {}
-    throw new RunAnytimeBrowserError(
-      'config_error',
-      '有头模式需要虚拟显示，当前系统未找到 xvfb-run；请先安装 xvfb'
-    );
-  }
-
-  const launchCommand = xvfbRunPath || executablePath;
-  const launchArgs = xvfbRunPath
-    ? ['-a', '-s', '-screen 0 1365x900x24 -nolisten tcp', executablePath, ...args]
-    : args;
-  const chromeProcess = spawn(launchCommand, launchArgs, { env, stdio: 'ignore' });
-  chromeProcess.spawnError = null;
-  chromeProcess.once('error', error => {
-    chromeProcess.spawnError = error;
-  });
-
-  let browser;
-  const close = async () => {
-    await browser?.close().catch(() => {});
-    if (chromeProcess.exitCode === null) {
-      chromeProcess.kill('SIGTERM');
-      await Promise.race([
-        new Promise(resolve => chromeProcess.once('exit', resolve)),
-        new Promise(resolve => setTimeout(resolve, 1000)),
-      ]);
-    }
-    if (chromeProcess.exitCode === null) {
-      chromeProcess.kill('SIGKILL');
-      await Promise.race([
-        new Promise(resolve => chromeProcess.once('exit', resolve)),
-        new Promise(resolve => setTimeout(resolve, 1000)),
-      ]);
-    }
-    try {
-      fs.rmSync(profileDir, { recursive: true, force: true });
-    } catch {
-      console.warn('[RunAnytime] 临时 Chromium 配置清理失败');
-    }
-  };
-
-  try {
-    await waitForCdpEndpoint(port, chromeProcess, timeoutMs);
-    browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    const context = browser.contexts()[0];
-    if (!context) {
-      throw new RunAnytimeBrowserError('browser_error', '本地 Chromium 未创建默认上下文');
-    }
-    return { browser, close, context, profileDir };
-  } catch (error) {
-    await close();
-    throw error;
-  }
+function formatReward(rawQuota) {
+  const quota = Number(rawQuota);
+  if (!Number.isFinite(quota) || quota <= 0) return '';
+  return quota.toLocaleString('en-US');
 }
 
 function getNotify() {
@@ -335,639 +99,238 @@ async function sendResult(title, content) {
 }
 
 function formatResult(result) {
+  const lines = [];
   if (result.type === 'success') {
-    return result.reward ? `✅ 签到成功，获得 ${result.reward} 额度` : '✅ 签到成功';
+    lines.push(result.reward ? `✅ 签到成功，获得 ${result.reward} 额度` : '✅ 签到成功');
+  } else if (result.type === 'already_checked') {
+    lines.push('⏭️ 今日已签到');
+  } else {
+    lines.push(`❌ 发生异常：${result.message}`);
   }
-  if (result.type === 'already_checked') return '⏭️ 今日已签到';
-  if (result.type === 'challenge_required') return `❌ 发生异常：验证阻断：${result.message}`;
-  return `❌ 发生异常：${result.message}`;
-}
-
-function formatShanghaiMonth(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-  }).formatToParts(date);
-  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
-  return `${values.year}-${values.month}`;
-}
-
-function formatReward(rawQuota) {
-  const quota = Number(rawQuota);
-  if (!Number.isFinite(quota) || quota <= 0) return '';
-  return quota.toLocaleString('en-US');
-}
-
-function sanitizeTraceUrl(value) {
-  let url;
-  try {
-    url = new URL(value, SITE_URL);
-  } catch {
-    return null;
-  }
-
-  if (url.origin === SITE_URL && url.pathname.startsWith('/api/')) {
-    for (const key of ['turnstile', 'pow_challenge', 'pow_nonce', 'token']) {
-      if (url.searchParams.has(key)) url.searchParams.set(key, '<redacted>');
-    }
-    return `${url.origin}${url.pathname}${url.search}`
-      .replaceAll('%3Credacted%3E', '<redacted>');
-  }
-
-  if (url.hostname === 'challenges.cloudflare.com') {
-    return `${url.origin}/<redacted>`;
-  }
-
-  return null;
-}
-
-function attachRequestTrace(page, enabled) {
-  if (!enabled) return;
-
-  page.on('request', request => {
-    const url = sanitizeTraceUrl(request.url());
-    if (url) console.log(`[RunAnytime][请求] ${request.method()} ${url}`);
-  });
-  page.on('response', response => {
-    const url = sanitizeTraceUrl(response.url());
-    if (url) console.log(`[RunAnytime][响应] HTTP ${response.status()} ${url}`);
-  });
-}
-
-async function installApiUserHeader(context, userId) {
-  await context.route(`${SITE_URL}/api/**`, route => {
-    const headers = { ...route.request().headers() };
-    for (const key of Object.keys(headers)) {
-      if (key.toLowerCase() === 'new-api-user') delete headers[key];
-    }
-    headers['new-api-user'] = String(userId);
-    return route.continue({ headers });
-  });
-}
-
-async function isChallengeVisible(page) {
-  const dialog = page.getByText(/Security Check|安全验证|安全检查/i).first();
-  const widget = page.locator(
-    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile'
-  ).first();
-
-  const dialogVisible = (await dialog.count()) > 0
-    && await dialog.isVisible().catch(() => false);
-  const widgetVisible = (await widget.count()) > 0
-    && await widget.isVisible().catch(() => false);
-  return dialogVisible || widgetVisible;
-}
-
-async function verifySession(page) {
-  const result = await page.evaluate(async () => {
-    try {
-      const response = await fetch('/api/user/self', {
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-      });
-      const payload = await response.json().catch(() => null);
-      const message = typeof payload?.message === 'string' ? payload.message : '';
-      return {
-        authenticated: response.ok && payload?.success === true && Boolean(payload?.data),
-        data: payload?.data || null,
-        message,
-        status: response.status,
-      };
-    } catch {
-      return { authenticated: false, data: null, message: '', status: 0 };
-    }
-  });
-
-  return {
-    authenticated: result.authenticated,
-    authFailed: result.status === 401 || result.status === 403 || isAuthMessage(result.message),
-    data: result.authenticated ? result.data : null,
-    status: result.status,
-  };
-}
-
-async function prepareTurnstilePage(page, sessionData, statusData, timeoutMs) {
-  if (!sessionData || typeof sessionData !== 'object' || Array.isArray(sessionData)) {
-    throw new RunAnytimeBrowserError('schema_changed', '登录用户数据异常，无法加载 Turnstile');
-  }
-
-  await page.evaluate(({ user, status }) => {
-    localStorage.setItem('user', JSON.stringify(user));
-    if (status && typeof status === 'object' && !Array.isArray(status)) {
-      localStorage.setItem('status', JSON.stringify(status));
-    }
-  }, { user: sessionData, status: statusData });
-
-  await page.reload({
-    waitUntil: 'domcontentloaded',
-    timeout: Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS),
-  });
-}
-
-async function fetchStatus(page) {
-  return page.evaluate(async () => {
-    try {
-      const response = await fetch('/api/status', {
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-      });
-      const payload = await response.json().catch(() => null);
-      return { ok: response.ok, status: response.status, data: payload?.data || null };
-    } catch {
-      return { ok: false, status: 0, data: null };
-    }
-  });
-}
-
-async function fetchCheckinStatus(page, month) {
-  return page.evaluate(async currentMonth => {
-    try {
-      const response = await fetch(`/api/user/checkin?month=${encodeURIComponent(currentMonth)}`, {
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-      });
-      const payload = await response.json().catch(() => null);
-      return {
-        ok: response.ok && payload?.success === true && Boolean(payload?.data),
-        status: response.status,
-        message: typeof payload?.message === 'string' ? payload.message : '',
-        data: payload?.data || null,
-      };
-    } catch {
-      return { ok: false, status: 0, message: '', data: null };
-    }
-  }, month);
-}
-
-function isTurnstileMessage(message) {
-  return /turnstile|人机验证/i.test(String(message || ''));
-}
-
-function buildCheckinPath(proof, turnstileToken = '') {
-  if (!proof || typeof proof.nonce !== 'string' || !proof.nonce) {
-    throw new RunAnytimeBrowserError('schema_changed', 'PoW proof 参数异常');
-  }
-
-  const params = new URLSearchParams();
-  if (turnstileToken) params.set('turnstile', turnstileToken);
-  if (proof.challengeId) params.set('pow_challenge', proof.challengeId);
-  params.set('pow_nonce', proof.nonce);
-  return `/api/user/checkin?${params.toString()}`;
-}
-
-async function submitPowProof(page, proof, turnstileToken = '') {
-  const path = buildCheckinPath(proof, turnstileToken);
-  return page.evaluate(async url => {
-    const response = await fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { Accept: 'application/json' },
-    });
-    const payload = await response.json().catch(() => null);
-    return {
-      stage: 'submit',
-      status: response.status,
-      success: payload?.success === true,
-      message: typeof payload?.message === 'string' ? payload.message : '',
-      data: payload?.data || null,
-    };
-  }, path);
-}
-
-async function requestTurnstileToken(page, siteKey, timeoutMs) {
-  return page.evaluate(async ({ scriptUrl, mountId, turnstileSiteKey, maxWaitMs }) => {
-    const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-    const deadline = Date.now() + maxWaitMs;
-
-    if (typeof window.turnstile?.render !== 'function') {
-      let script = document.querySelector('script[data-runanytime-turnstile]');
-      let scriptFailed = false;
-      if (!script) {
-        script = document.createElement('script');
-        script.src = scriptUrl;
-        script.async = true;
-        script.dataset.runanytimeTurnstile = 'true';
-        script.addEventListener('error', () => {
-          scriptFailed = true;
-        }, { once: true });
-        (document.head || document.documentElement).appendChild(script);
-      }
-
-      const loadDeadline = Math.min(deadline, Date.now() + 15000);
-      while (typeof window.turnstile?.render !== 'function'
-        && !scriptFailed
-        && Date.now() < loadDeadline) {
-        await wait(100);
-      }
-      if (typeof window.turnstile?.render !== 'function') {
-        return { status: 'load_error' };
-      }
-    }
-
-    let body = document.body;
-    if (!body) {
-      body = document.createElement('body');
-      document.documentElement.appendChild(body);
-    }
-
-    document.getElementById(mountId)?.remove();
-    const overlay = document.createElement('div');
-    overlay.id = mountId;
-    overlay.style.cssText = [
-      'position:fixed',
-      'inset:0',
-      'z-index:2147483647',
-      'display:flex',
-      'align-items:center',
-      'justify-content:center',
-      'background:#ffffff',
-    ].join(';');
-    const widget = document.createElement('div');
-    overlay.appendChild(widget);
-    body.appendChild(overlay);
-
-    let widgetId = null;
-    let timer = null;
-    let lastFailure = 'timeout';
-    const remainingMs = Math.max(1, deadline - Date.now());
-    const result = await new Promise(resolve => {
-      let settled = false;
-      const finish = value => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        resolve(value);
-      };
-
-      timer = setTimeout(() => finish({ status: lastFailure }), remainingMs);
-      try {
-        widgetId = window.turnstile.render(widget, {
-          sitekey: turnstileSiteKey,
-          appearance: 'always',
-          retry: 'auto',
-          'refresh-expired': 'auto',
-          callback: token => {
-            if (typeof token === 'string' && token) {
-              finish({ status: 'verified', token });
-            } else {
-              lastFailure = 'error';
-            }
-          },
-          'error-callback': () => {
-            lastFailure = 'error';
-          },
-          'expired-callback': () => {
-            lastFailure = 'expired';
-          },
-          'timeout-callback': () => {
-            lastFailure = 'timeout';
-          },
-          'unsupported-callback': () => {
-            lastFailure = 'unsupported';
-          },
-        });
-      } catch {
-        finish({ status: 'error' });
-      }
-    });
-
-    if (widgetId != null) {
-      try {
-        window.turnstile.remove(widgetId);
-      } catch {}
-    }
-    overlay.remove();
-    return result;
-  }, {
-    scriptUrl: TURNSTILE_SCRIPT_URL,
-    mountId: TURNSTILE_MOUNT_ID,
-    turnstileSiteKey: siteKey,
-    maxWaitMs: Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS),
-  }).catch(error => {
-    if (/execution context was destroyed|cannot find context|navigation/i.test(error?.message || '')) {
-      return { status: 'navigation' };
-    }
-    throw error;
-  });
-}
-
-function formatTurnstileFailure(verification, headless) {
-  const reason = {
-    load_error: 'Turnstile 组件加载失败',
-    error: 'Turnstile 验证失败',
-    expired: 'Turnstile token 已过期',
-    navigation: 'Turnstile 验证页面发生跳转',
-    unsupported: '当前浏览器不支持 Turnstile',
-  }[verification?.status] || 'Turnstile 验证超时';
-
-  if (headless) {
-    return `${reason}，请设置 RUNANYTIME_BROWSER_HEADLESS=false 或前往网页手动签到`;
-  }
-  return `${reason}，请重新运行并在打开的浏览器窗口完成验证`;
-}
-
-/**
- * 在浏览器页面上下文内求解并提交一次 PoW 签到：
- *   1. 取 challenge
- *   2. 用 crypto.subtle 复刻站点 worker 的 SHA-256 前导零 bit 求解
- *   3. 携带 pow_challenge / pow_nonce POST 签到
- * 返回原始 HTTP 状态、JSON 和一次回退可复用的 proof，供 Node 侧统一判定。
- */
-async function performPowCheckin(page, powTimeoutMs) {
-  const solved = await page.evaluate(async maxSolveMs => {
-    const getJson = async (url, init) => {
-      const response = await fetch(url, {
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-        ...init,
-      });
-      const payload = await response.json().catch(() => null);
-      return { status: response.status, payload };
-    };
-
-    // 1. 获取 PoW challenge
-    const challengeResult = await getJson('/api/user/pow/challenge?action=checkin');
-    if (!challengeResult.payload?.success || !challengeResult.payload?.data) {
-      return {
-        stage: 'challenge',
-        status: challengeResult.status,
-        message: challengeResult.payload?.message || '获取 PoW challenge 失败',
-      };
-    }
-
-    const { challenge_id: challengeId, prefix, difficulty } = challengeResult.payload.data;
-    if (!prefix || typeof difficulty !== 'number') {
-      return { stage: 'challenge', status: challengeResult.status, message: 'PoW challenge 参数异常' };
-    }
-
-    // 2. 求解 nonce —— 与站点 worker (static/js/async/4736) 逐字节一致
-    const hasLeadingZeroBits = (bytes, bits) => {
-      if (bits <= 0) return true;
-      const fullBytes = Math.floor(bits / 8);
-      const remainder = bits % 8;
-      for (let i = 0; i < fullBytes && i < bytes.length; i++) {
-        if (bytes[i] !== 0) return false;
-      }
-      if (remainder > 0 && fullBytes < bytes.length) {
-        if ((bytes[fullBytes] & (255 << (8 - remainder))) !== 0) return false;
-      }
-      return true;
-    };
-
-    const encoder = new TextEncoder();
-    const solveDeadline = Date.now() + maxSolveMs;
-    let counter = 0;
-    let nonce = null;
-
-    for (;;) {
-      const candidate = counter.toString(16).padStart(8, '0');
-      const digest = await crypto.subtle.digest('SHA-256', encoder.encode(prefix + candidate));
-      if (hasLeadingZeroBits(new Uint8Array(digest), difficulty)) {
-        nonce = candidate;
-        break;
-      }
-      counter += 1;
-      if (counter > 0xffffffff) {
-        return { stage: 'solve', status: 0, message: 'PoW 求解耗尽计数仍无解' };
-      }
-      if ((counter & 0x3fff) === 0 && Date.now() > solveDeadline) {
-        return { stage: 'solve', status: 0, message: `PoW 求解超时（difficulty=${difficulty}）` };
-      }
-    }
-
-    return {
-      stage: 'solved',
-      difficulty,
-      proof: { challengeId, nonce },
-    };
-  }, powTimeoutMs);
-
-  if (solved.stage !== 'solved') return solved;
-  const submitted = await submitPowProof(page, solved.proof);
-  return { ...submitted, difficulty: solved.difficulty, proof: solved.proof };
-}
-
-async function runBrowserCheckin(config) {
-  let chromium;
-  try {
-    ({ chromium } = require('playwright'));
-  } catch {
-    return {
-      type: 'browser_error',
-      message: '未安装 Playwright，请在青龙环境安装 playwright 并准备 Chromium',
-    };
-  }
-
-  let browser;
-  let context;
-  let nativeSession;
-  let page;
-
-  try {
-    if (!config.headless) {
-      nativeSession = await launchNativeChromium(
-        chromium,
-        config.executablePath,
-        config.timeoutMs,
-        config.userAgent
-      );
-      ({ browser, context } = nativeSession);
+  if (result.cookieRotated) {
+    if (result.cookiePersisted) {
+      lines.push('🔄 登录凭证已轮换，已自动写回环境变量');
     } else {
-      const launchOptions = {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-      };
-      if (config.executablePath) launchOptions.executablePath = config.executablePath;
-      browser = await chromium.launch(launchOptions);
-
-      const contextOptions = {
-        locale: 'zh-CN',
-        timezoneId: 'Asia/Shanghai',
-        viewport: { width: 1365, height: 900 },
-      };
-      if (config.userAgent) contextOptions.userAgent = config.userAgent;
-      context = await browser.newContext(contextOptions);
+      lines.push(`⚠️ 登录凭证已轮换但未能自动保存，请用日志中的新 Cookie 更新 ${COOKIE_ENV}，否则下次运行将掉登录`);
     }
+  }
+  return lines.join('\n');
+}
 
-    await installApiUserHeader(context, config.userId);
-    await context.addCookies(config.cookies);
+/** 替换或追加 Cookie 串中的某一项 */
+function mergeCookie(cookie, name, value) {
+  const items = cookie.split(';').map(item => item.trim()).filter(Boolean);
+  const index = items.findIndex(item => item.slice(0, item.indexOf('=')).trim() === name);
+  if (index >= 0) items[index] = `${name}=${value}`;
+  else items.push(`${name}=${value}`);
+  return items.join('; ');
+}
 
-    page = await context.newPage();
-    attachRequestTrace(page, config.trace);
-    page.setDefaultTimeout(config.timeoutMs);
-
-    // 只建立同源浏览器上下文，避免站点前端提前挂载的隐藏 Turnstile 阻塞无头模式。
-    await page.goto(PERSONAL_URL, { waitUntil: 'commit', timeout: config.timeoutMs });
-    await page.evaluate(() => window.stop());
-
-    if (await isChallengeVisible(page)) {
-      return {
-        type: 'challenge_required',
-        message: '页面加载即触发 Cloudflare 人机验证，请改用有头模式或网页手动签到',
-      };
-    }
-
-    const session = await verifySession(page);
-    if (session.authFailed) {
-      return { type: 'auth_failed', message: `Cookie 已失效，请更新 ${COOKIE_ENV}` };
-    }
-    if (!session.authenticated) {
-      return {
-        type: 'network_error',
-        message: `无法确认登录状态，用户信息接口 HTTP ${session.status || '未知'}`,
-      };
-    }
-
-    // 读取站点签到/PoW 配置，确认走 PoW 而非 Turnstile
-    const status = await fetchStatus(page);
-    const settings = status.data || {};
-    if (settings.checkin_enabled === false) {
-      return { type: 'error', message: '站点已关闭签到功能' };
-    }
-    const powEnabled = settings.pow_enabled === true;
-    const powMode = settings.pow_mode || '';
-    const turnstileRequired = settings.turnstile_check === true;
-
-    // 仅当 PoW 可独立完成签到时才自动处理；否则需要人工过 Turnstile
-    const powReplacesTurnstile = powEnabled && (powMode === 'replace' || !turnstileRequired);
-    if (turnstileRequired && !powReplacesTurnstile) {
-      return {
-        type: 'challenge_required',
-        message: `站点 PoW 模式为 "${powMode || '未知'}"，签到仍需 Turnstile，无头模式无法自动完成`,
-      };
-    }
-    if (!powEnabled) {
-      return {
-        type: 'schema_changed',
-        message: '站点未启用 PoW，签到机制已变更，请人工确认',
-      };
-    }
-
-    const month = formatShanghaiMonth();
-    const initialStatus = await fetchCheckinStatus(page, month);
-    if (!initialStatus.ok) {
-      if ([401, 403].includes(initialStatus.status) || isAuthMessage(initialStatus.message)) {
-        return { type: 'auth_failed', message: 'Cookie 已失效，签到状态接口要求重新登录' };
-      }
-      return {
-        type: 'network_error',
-        message: `无法获取签到状态，HTTP ${initialStatus.status || '未知'}`,
-      };
-    }
-    if (initialStatus.data?.stats?.checked_in_today === true) {
-      return { type: 'already_checked', message: '今日已签到' };
-    }
-
-    // 执行 PoW 签到
-    let result = await performPowCheckin(page, config.powTimeoutMs);
-    if (result.stage === 'challenge') {
-      if ([401, 403].includes(result.status) || isAuthMessage(result.message)) {
-        return { type: 'auth_failed', message: 'Cookie 已失效，PoW 接口要求重新登录' };
-      }
-      return { type: 'network_error', message: `获取 PoW challenge 失败：${result.message}` };
-    }
-    if (result.stage === 'solve') {
-      return { type: 'error', message: result.message };
-    }
-
-    if (!result.success && isTurnstileMessage(result.message)) {
-      const siteKey = typeof settings.turnstile_site_key === 'string'
-        ? settings.turnstile_site_key.trim()
-        : '';
-      if (!siteKey) {
-        return {
-          type: 'challenge_required',
-          message: '站点要求 Turnstile，但公开配置未提供 site key',
-        };
-      }
-      if (!result.proof) {
-        return { type: 'schema_changed', message: 'Turnstile 回退缺少可复用的 PoW proof' };
-      }
-
-      console.log('[RunAnytime] 服务端要求 Turnstile，等待官方验证');
-      await prepareTurnstilePage(page, session.data, settings, config.timeoutMs);
-      const interactiveUrl = new URL(page.url());
-      if (interactiveUrl.origin !== SITE_URL || interactiveUrl.pathname.startsWith('/login')) {
-        return {
-          type: 'auth_failed',
-          message: 'Turnstile 页面未保持登录状态，请更新 Cookie 后重试',
-        };
-      }
-      if (await isChallengeVisible(page)) {
-        return {
-          type: 'challenge_required',
-          message: '加载 Turnstile 页面时触发 Cloudflare 人机验证，请在网页手动签到',
-        };
-      }
-
-      const interactiveSession = await verifySession(page);
-      if (interactiveSession.authFailed || !interactiveSession.authenticated) {
-        return { type: 'auth_failed', message: '加载 Turnstile 页面后登录状态失效' };
-      }
-
-      const turnstileTimeoutMs = config.headless
-        ? Math.min(config.timeoutMs, 30000)
-        : config.timeoutMs;
-      const verification = await requestTurnstileToken(page, siteKey, turnstileTimeoutMs);
-      if (verification.status !== 'verified') {
-        return {
-          type: 'challenge_required',
-          message: formatTurnstileFailure(verification, config.headless),
-        };
-      }
-
-      const retried = await submitPowProof(page, result.proof, verification.token);
-      result = { ...retried, difficulty: result.difficulty, proof: result.proof };
-    }
-
-    if (result.success) {
-      return {
-        type: 'success',
-        message: '浏览器签到成功',
-        reward: formatReward(result.data?.quota_awarded),
-      };
-    }
-
-    // 提交失败的分类判定
-    if ([401, 403].includes(result.status) || isAuthMessage(result.message)) {
-      return { type: 'auth_failed', message: '签到过程中登录状态失效' };
-    }
-    if (/已签到|already/i.test(result.message)) {
-      return { type: 'already_checked', message: '今日已签到' };
-    }
-    if (isTurnstileMessage(result.message)) {
-      return {
-        type: 'challenge_required',
-        message: `站点要求 Turnstile：${result.message}`,
-      };
-    }
-    if (/pow|challenge|nonce|工作量/i.test(result.message)) {
-      return { type: 'error', message: `PoW 校验未通过：${result.message}（difficulty=${result.difficulty}）` };
-    }
-    return { type: 'error', message: `签到失败：${result.message || `HTTP ${result.status}`}` };
+/** 青龙环境下通过 QLAPI 将轮换后的 Cookie 写回环境变量 */
+async function persistCookie(newCookie) {
+  if (typeof QLAPI === 'undefined' || typeof QLAPI.getEnvs !== 'function') return false;
+  try {
+    const envs = await QLAPI.getEnvs({ searchValue: COOKIE_ENV });
+    const item = (envs?.data || []).find(env => env.name === COOKIE_ENV);
+    if (!item) return false;
+    await QLAPI.updateEnv({ env: { ...item, value: newCookie } });
+    return true;
   } catch (error) {
-    if (error instanceof RunAnytimeBrowserError) {
-      return { type: error.type, message: error.message };
+    console.warn(`[RunAnytime] 写回环境变量失败: ${error?.message || error}`);
+    return false;
+  }
+}
+
+function hasLeadingZeroBits(bytes, bits) {
+  if (bits <= 0) return true;
+  const fullBytes = Math.floor(bits / 8);
+  const remainder = bits % 8;
+  for (let i = 0; i < fullBytes; i++) {
+    if (bytes[i] !== 0) return false;
+  }
+  return remainder === 0 || (bytes[fullBytes] & (255 << (8 - remainder))) === 0;
+}
+
+/** 复刻站点 worker：求满足 difficulty 个前导零 bit 的 8 位十六进制 nonce */
+function solvePow(prefix, difficulty, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (let counter = 0; counter <= 0xffffffff; counter++) {
+    const nonce = counter.toString(16).padStart(8, '0');
+    const digest = createHash('sha256').update(prefix + nonce).digest();
+    if (hasLeadingZeroBits(digest, difficulty)) return nonce;
+    if ((counter & 0x3fff) === 0 && Date.now() > deadline) {
+      throw new RunAnytimeError('error', `PoW 求解超时（difficulty=${difficulty}）`);
     }
-    if (page && await isChallengeVisible(page).catch(() => false)) {
-      return {
+  }
+  throw new RunAnytimeError('error', 'PoW 求解耗尽计数仍无解');
+}
+
+class RunAnytimeClient {
+  constructor(config) {
+    this.cookie = config.cookie;
+    this.userAgent = config.userAgent;
+    this.trace = config.trace;
+    this.accessToken = '';
+    this.sessionId = '';
+    this.cookieRotated = false;
+  }
+
+  async request(method, apiPath, { auth = true } = {}) {
+    const headers = {
+      Accept: 'application/json',
+      Cookie: this.cookie,
+      Referer: `${SITE_URL}/console/personal`,
+      'User-Agent': this.userAgent,
+    };
+    if (auth && this.accessToken) headers.Authorization = `Bearer ${this.accessToken}`;
+    if (!auth && this.sessionId) headers['X-Auth-Session'] = this.sessionId;
+
+    let response;
+    try {
+      response = await fetch(`${SITE_URL}${apiPath}`, { method, headers });
+    } catch (error) {
+      throw new RunAnytimeError('network_error', `请求 ${apiPath} 失败: ${error?.message || error}`);
+    }
+    const payload = await response.json().catch(() => null);
+    if (this.trace) {
+      console.log(`[RunAnytime] ${method} ${apiPath.replace(/\?.*$/, '')} -> HTTP ${response.status}`);
+    }
+    if (payload == null) {
+      const hint = response.status === 403 ? '（疑似 Cloudflare 拦截，请更新 cf_clearance）' : '';
+      throw new RunAnytimeError('network_error', `${apiPath} 返回非 JSON，HTTP ${response.status}${hint}`);
+    }
+    return { status: response.status, payload, headers: response.headers };
+  }
+
+  /** 凭 refresh cookie 换取短期 access token；429 限流退避重试，凭证轮换时记录提醒 */
+  async refresh(maxAttempts = 4) {
+    let status;
+    let payload;
+    let headers;
+    for (let attempt = 1; ; attempt++) {
+      let limited = false;
+      try {
+        ({ status, payload, headers } = await this.request('POST', '/api/user/auth/refresh', { auth: false }));
+        if (status !== 429) break;
+        limited = true;
+      } catch (error) {
+        if (!(error instanceof RunAnytimeError) || !/HTTP 429/.test(error.message)) throw error;
+        limited = true;
+      }
+      if (limited) {
+        if (attempt >= maxAttempts) {
+          throw new RunAnytimeError('network_error', '刷新 access token 持续被限流（HTTP 429），请稍后重试');
+        }
+        const waitMs = 15000 * attempt;
+        console.log(`[RunAnytime] 刷新接口限流，${waitMs / 1000}s 后重试（${attempt}/${maxAttempts - 1}）`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+    }
+    if (!payload.success || !payload.data) {
+      if ([401, 403, 409].includes(status)) {
+        throw new RunAnytimeError(
+          'auth_failed',
+          `登录凭证已失效（HTTP ${status} ${payload.message || payload.code || ''}），请重新登录并更新 ${COOKIE_ENV}`
+        );
+      }
+      throw new RunAnytimeError('network_error', `刷新 access token 失败：HTTP ${status} ${payload.message || ''}`);
+    }
+
+    const data = payload.data;
+    this.accessToken = data.access_token || data.accessToken || data.token || '';
+    this.sessionId = data.session?.sid || data.sid || '';
+    if (!this.accessToken) {
+      throw new RunAnytimeError('schema_changed', '刷新接口未返回 access token，站点接口可能已变更');
+    }
+
+    const setCookie = typeof headers.getSetCookie === 'function'
+      ? headers.getSetCookie()
+      : [headers.get('set-cookie')].filter(Boolean);
+    for (const item of setCookie) {
+      const [pair] = item.split(';');
+      const separator = pair.indexOf('=');
+      if (separator <= 0) continue;
+      const name = pair.slice(0, separator).trim();
+      if (/^cf_/i.test(name)) continue;
+      this.cookieRotated = true;
+      this.cookie = mergeCookie(this.cookie, name, pair.slice(separator + 1).trim());
+      console.log(`[RunAnytime] 🔄 站点轮换了凭证 Cookie: ${name}`);
+    }
+  }
+}
+
+async function runCheckin(config) {
+  const client = new RunAnytimeClient(config);
+  const withRotation = result => ({
+    ...result,
+    cookieRotated: client.cookieRotated,
+    updatedCookie: client.cookieRotated ? client.cookie : '',
+  });
+
+  try {
+    await client.refresh();
+
+    // 确认今日签到状态
+    const month = formatShanghaiMonth();
+    const status = await client.request('GET', `/api/user/checkin?month=${encodeURIComponent(month)}`);
+    if (!status.payload.success) {
+      if ([401, 403].includes(status.status)) {
+        throw new RunAnytimeError('auth_failed', 'access token 未被接受，请更新 Cookie 后重试');
+      }
+      throw new RunAnytimeError('network_error', `查询签到状态失败：HTTP ${status.status} ${status.payload.message || ''}`);
+    }
+    if (status.payload.data?.enabled === false) {
+      return withRotation({ type: 'error', message: '站点已关闭签到功能' });
+    }
+    if (status.payload.data?.stats?.checked_in_today === true) {
+      return withRotation({ type: 'already_checked', message: '今日已签到' });
+    }
+
+    // 获取并求解 PoW challenge
+    const challenge = await client.request('GET', '/api/user/pow/challenge?action=checkin');
+    if (!challenge.payload.success || !challenge.payload.data) {
+      throw new RunAnytimeError(
+        'network_error',
+        `获取 PoW challenge 失败：HTTP ${challenge.status} ${challenge.payload.message || ''}`
+      );
+    }
+    const { challenge_id: challengeId, prefix, difficulty } = challenge.payload.data;
+    if (!challengeId || !prefix || typeof difficulty !== 'number') {
+      throw new RunAnytimeError('schema_changed', 'PoW challenge 参数异常，站点接口可能已变更');
+    }
+    const nonce = solvePow(prefix, difficulty, config.powTimeoutMs);
+    if (config.trace) console.log(`[RunAnytime] PoW 求解完成 difficulty=${difficulty}`);
+
+    // 提交签到
+    const params = new URLSearchParams({ pow_challenge: challengeId, pow_nonce: nonce });
+    const submit = await client.request('POST', `/api/user/checkin?${params.toString()}`);
+    if (submit.payload.success) {
+      return withRotation({
+        type: 'success',
+        message: '签到成功',
+        reward: formatReward(submit.payload.data?.quota_awarded),
+      });
+    }
+
+    const message = submit.payload.message || `HTTP ${submit.status}`;
+    if ([401, 403].includes(submit.status)) {
+      return withRotation({ type: 'auth_failed', message: `签到提交被拒：${message}` });
+    }
+    if (/已签到|already/i.test(message)) {
+      return withRotation({ type: 'already_checked', message: '今日已签到' });
+    }
+    if (/turnstile|人机验证/i.test(message)) {
+      return withRotation({
         type: 'challenge_required',
-        message: 'Cloudflare/Turnstile 人机验证未能自动完成',
-      };
+        message: `站点要求 Turnstile：${message}，签到机制已变更，请人工确认`,
+      });
     }
-    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
-      return { type: 'network_error', message: '页面加载或签到等待超时' };
+    return withRotation({ type: 'error', message: `签到失败：${message}` });
+  } catch (error) {
+    if (error instanceof RunAnytimeError) {
+      return withRotation({ type: error.type, message: error.message });
     }
-    return { type: 'error', message: `浏览器执行失败: ${error?.message || String(error)}` };
-  } finally {
-    await page?.close().catch(() => {});
-    if (nativeSession) {
-      await nativeSession.close();
-    } else {
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
-    }
+    return withRotation({ type: 'error', message: `执行失败: ${error?.message || String(error)}` });
   }
 }
 
@@ -978,23 +341,18 @@ function printHelp() {
   node gongyizhan/runanytime-browser.js
 
 必填环境变量:
-  ${COOKIE_ENV}                    RunAnytime 完整登录 Cookie
+  ${COOKIE_ENV}              完整 Cookie 字符串（须包含 refresh 凭证 cookie）
 
 可选环境变量:
-  RUNANYTIME_USER_ID               New API 用户 ID，默认 ${DEFAULT_USER_ID}
-  RUNANYTIME_BROWSER_HEADLESS      true/false，默认 false
-  RUNANYTIME_BROWSER_TIMEOUT_MS    页面加载超时毫秒数，默认 ${DEFAULT_TIMEOUT_MS}
-  RUNANYTIME_POW_TIMEOUT_MS        PoW 求解超时毫秒数，默认 ${DEFAULT_POW_TIMEOUT_MS}
-  RUNANYTIME_BROWSER_USER_AGENT    获取 Cookie 时浏览器的完整 User-Agent
-  RUNANYTIME_BROWSER_TRACE         true/false，输出脱敏请求路径与响应状态，默认 false
-  PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
+  RUNANYTIME_USER_AGENT      获取 Cookie 时浏览器的完整 User-Agent
+  RUNANYTIME_POW_TIMEOUT_MS  PoW 求解超时毫秒数，默认 ${DEFAULT_POW_TIMEOUT_MS}
+  RUNANYTIME_TRACE           true/false，输出请求路径与响应状态，默认 false
 
 说明:
-  站点采用 PoW 工作量证明作为签到主流程。
-  脚本在浏览器页面内完成 challenge 获取、SHA-256 前导零求解与签到提交；
-  若服务端仍要求 Turnstile，会通过官方 widget 验证后复用 PoW 重试。
-  验证 token 仅在内存中使用且不会记录；有头模式使用独立临时 Chromium
-  配置完成官方验证，退出时自动清理。Linux 无显示环境会自动调用 xvfb-run。`);
+  站点已迁移到 JWT Bearer 认证：脚本先用 refresh cookie 换取 15 分钟有效的
+  access token，再完成 PoW 求解与签到提交，纯 HTTP 无需浏览器。
+  refresh cookie 为 HttpOnly，需从浏览器 DevTools -> Application -> Cookies
+  复制站点全部 Cookie 填入 ${COOKIE_ENV}。`);
 }
 
 async function main() {
@@ -1013,23 +371,24 @@ async function main() {
   let config;
   try {
     config = {
-      cookies: parseCookieHeader(rawCookie),
-      executablePath: resolveChromiumExecutable(),
-      headless: parseBoolean(process.env.RUNANYTIME_BROWSER_HEADLESS, false),
-      trace: parseBoolean(process.env.RUNANYTIME_BROWSER_TRACE, false),
-      userAgent: process.env.RUNANYTIME_BROWSER_USER_AGENT?.trim() || '',
-      userId: normalizeUserId(process.env.RUNANYTIME_USER_ID),
-      timeoutMs: parsePositiveInteger(process.env.RUNANYTIME_BROWSER_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+      cookie: normalizeCookie(rawCookie),
+      userAgent: process.env.RUNANYTIME_USER_AGENT?.trim() || DEFAULT_USER_AGENT,
+      trace: parseBoolean(process.env.RUNANYTIME_TRACE, false),
       powTimeoutMs: parsePositiveInteger(process.env.RUNANYTIME_POW_TIMEOUT_MS, DEFAULT_POW_TIMEOUT_MS),
     };
-    validateDisplayAvailability(config.headless);
   } catch (error) {
     await sendResult(TASK_TITLE, `❌ 发生异常：${error.message}`);
     process.exitCode = 1;
     return;
   }
 
-  const result = await runBrowserCheckin(config);
+  const result = await runCheckin(config);
+  if (result.cookieRotated && result.updatedCookie) {
+    result.cookiePersisted = await persistCookie(result.updatedCookie);
+    if (!result.cookiePersisted) {
+      console.log(`[RunAnytime] 请手动更新 ${COOKIE_ENV} 为：\n${result.updatedCookie}`);
+    }
+  }
   await sendResult(TASK_TITLE, formatResult(result));
   if (!['success', 'already_checked'].includes(result.type)) process.exitCode = 1;
 }
@@ -1042,30 +401,16 @@ if (require.main === module) {
 }
 
 module.exports = {
-  RunAnytimeBrowserError,
-  attachRequestTrace,
-  buildCheckinPath,
-  formatTurnstileFailure,
+  RunAnytimeClient,
+  RunAnytimeError,
   formatResult,
   formatReward,
   formatShanghaiMonth,
-  installApiUserHeader,
-  isAuthMessage,
-  isChallengeVisible,
-  isTurnstileMessage,
-  launchNativeChromium,
+  hasLeadingZeroBits,
+  mergeCookie,
   normalizeCookie,
-  normalizeUserId,
   parseBoolean,
-  parseCookieHeader,
   parsePositiveInteger,
-  performPowCheckin,
-  prepareTurnstilePage,
-  requestTurnstileToken,
-  resolveChromiumExecutable,
-  runBrowserCheckin,
-  sanitizeTraceUrl,
-  submitPowProof,
-  validateDisplayAvailability,
-  verifySession,
+  runCheckin,
+  solvePow,
 };
