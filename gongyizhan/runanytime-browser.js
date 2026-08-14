@@ -173,6 +173,7 @@ class RunAnytimeClient {
     this.accessToken = '';
     this.sessionId = '';
     this.cookieRotated = false;
+    this.cookiePersisted = false;
   }
 
   async request(method, apiPath, { auth = true } = {}) {
@@ -228,9 +229,18 @@ class RunAnytimeClient {
     }
     if (!payload.success || !payload.data) {
       if ([401, 403, 409].includes(status)) {
+        const code = payload.code || '';
+        if (code === 'AUTH_SESSION_REVOKED') {
+          throw new RunAnytimeError(
+            'auth_failed',
+            '会话已被服务端吊销（旧 refresh token 被重放触发盗用检测）。'
+              + '请用无痕窗口重新登录获取专用 Cookie，复制后直接关闭无痕窗口，'
+              + `不要在浏览器里继续使用该会话，再更新 ${COOKIE_ENV}`
+          );
+        }
         throw new RunAnytimeError(
           'auth_failed',
-          `登录凭证已失效（HTTP ${status} ${payload.message || payload.code || ''}），请重新登录并更新 ${COOKIE_ENV}`
+          `登录凭证已失效（HTTP ${status} ${code || payload.message || ''}），请重新登录并更新 ${COOKIE_ENV}`
         );
       }
       throw new RunAnytimeError('network_error', `刷新 access token 失败：HTTP ${status} ${payload.message || ''}`);
@@ -256,6 +266,15 @@ class RunAnytimeClient {
       this.cookie = mergeCookie(this.cookie, name, pair.slice(separator + 1).trim());
       console.log(`[RunAnytime] 🔄 站点轮换了凭证 Cookie: ${name}`);
     }
+
+    // 轮换后立即持久化：旧 secret 的宽限窗口很短，若等流程结束才保存，
+    // 中途一旦崩溃，下次运行重放旧值会触发盗用检测、吊销整个会话
+    if (this.cookieRotated) {
+      this.cookiePersisted = await persistCookie(this.cookie);
+      if (!this.cookiePersisted) {
+        console.log(`[RunAnytime] 请立即更新 ${COOKIE_ENV} 为：\n${this.cookie}`);
+      }
+    }
   }
 }
 
@@ -264,6 +283,7 @@ async function runCheckin(config) {
   const withRotation = result => ({
     ...result,
     cookieRotated: client.cookieRotated,
+    cookiePersisted: client.cookiePersisted,
     updatedCookie: client.cookieRotated ? client.cookie : '',
   });
 
@@ -383,11 +403,9 @@ async function main() {
   }
 
   const result = await runCheckin(config);
-  if (result.cookieRotated && result.updatedCookie) {
+  if (result.cookieRotated && !result.cookiePersisted && result.updatedCookie) {
+    // 轮换时刻的写回失败后在此重试一次
     result.cookiePersisted = await persistCookie(result.updatedCookie);
-    if (!result.cookiePersisted) {
-      console.log(`[RunAnytime] 请手动更新 ${COOKIE_ENV} 为：\n${result.updatedCookie}`);
-    }
   }
   await sendResult(TASK_TITLE, formatResult(result));
   if (!['success', 'already_checked'].includes(result.type)) process.exitCode = 1;
