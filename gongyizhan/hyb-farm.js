@@ -880,13 +880,19 @@ function isMaturePlot(plot, nowMs = Date.now()) {
 }
 
 // 返回所有未成熟地块中最近的成熟时刻（毫秒），没有则 null。
+// 实测（2026-08-24）接口同时给出 maturesAt(ISO) 与 remainingTime(剩余秒数)。
+// 优先用 remainingTime：它是服务端权威的相对时间，容器时钟漂移时仍然准确；
+// 缺失时回退 maturesAt 绝对时刻。
 function getNextMatureAt(state, nowMs = Date.now()) {
   if (!state || typeof state !== 'object') return null;
   const cropItems = getExplicitArray(state.crops, ['crops', 'plots', 'plantedCrops'], isPlotLike);
   let next = null;
   for (const plot of cropItems) {
     if (isEmptyPlot(plot) || isMaturePlot(plot, nowMs)) continue;
-    const timestamp = parseMatureTimestamp(plot);
+    const remainingSeconds = Number(plot.remainingTime);
+    const timestamp = Number.isFinite(remainingSeconds) && remainingSeconds > 0
+      ? nowMs + remainingSeconds * 1000
+      : parseMatureTimestamp(plot);
     if (timestamp === null || timestamp <= nowMs) continue;
     if (next === null || timestamp < next) next = timestamp;
   }
