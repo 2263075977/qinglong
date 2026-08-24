@@ -4,13 +4,14 @@
  * new Env('SharedChat Vibe Code 权益领取');
  *
  * 必填环境变量:
- *   SHAREDCHAT_COOKIE="完整 Cookie 字符串"
+ *   SHAREDCHAT_USERNAME="用户名或邮箱"
+ *   SHAREDCHAT_PASSWORD="登录密码"
  *
  * 可选环境变量:
  *   SHAREDCHAT_CLAIM_REASON_PREFIX="用于学习 Codex 编程并完成个人项目"
  *   SHAREDCHAT_TIMEOUT_MS=60000
  *   SHAREDCHAT_CHALLENGE_WAIT_MS=15000
- *   SHAREDCHAT_USER_AGENT="获取 Cookie 时浏览器的 User-Agent"
+ *   SHAREDCHAT_USER_AGENT="浏览器 User-Agent"
  *   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
  */
 
@@ -20,7 +21,12 @@ const fs = require('node:fs');
 const { chromium } = require('playwright');
 
 const SITE_URL = 'https://new.sharedchat.cc';
+const SITE_ORIGIN = new URL(SITE_URL).origin;
+const LOGIN_URL = `${SITE_URL}/list/#/login`;
 const DASHBOARD_URL = `${SITE_URL}/list/#/vibe-code/dashboard`;
+const LOGIN_CONFIG_PATH = '/frontend-api/getLoginConfig';
+const LOGIN_PATH = '/frontend-api/login';
+const LOGIN_STORAGE_KEY = '__user_token__';
 const QUOTA_PATH = '/frontend-api/vibe-code/quota';
 const CLAIM_PATH = '/frontend-api/vibe-code/codex/claim';
 const TASK_TITLE = 'SharedChat Vibe Code 权益领取';
@@ -83,10 +89,9 @@ async function captureDebugScreenshot(page, step) {
 async function capturePageContext(page) {
   try {
     return await page.evaluate(() => ({
-      url: location.href,
+      url: `${location.origin}${location.pathname}`,
       title: document.title,
       readyState: document.readyState,
-      visibleText: document.body?.innerText?.slice(0, 500) || '',
     }));
   } catch {
     return null;
@@ -98,44 +103,38 @@ function parsePositiveInteger(value, fallback) {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
-function normalizeCookie(cookie) {
-  return String(cookie || '')
-    .trim()
-    .replace(/^cookie\s*:\s*/i, '')
-    .replace(/[\r\n]+/g, '')
-    .replace(/;\s*/g, '; ');
+function safePageUrl(value) {
+  try {
+    const parsed = new URL(String(value));
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return '';
+  }
 }
 
-function parseCookieHeader(cookie) {
-  const normalized = normalizeCookie(cookie);
-  const cookies = [];
-
-  for (const pair of normalized.split(';')) {
-    const item = pair.trim();
-    if (!item) continue;
-
-    const separator = item.indexOf('=');
-    if (separator <= 0) continue;
-
-    const name = item.slice(0, separator).trim();
-    const value = item.slice(separator + 1).trim();
-    if (!name) continue;
-
-    cookies.push({
-      name,
-      value,
-      domain: 'new.sharedchat.cc',
-      path: '/',
-      secure: true,
-      sameSite: 'Lax',
-    });
+function getConfig(env = process.env) {
+  const username = String(env?.SHAREDCHAT_USERNAME || '').trim();
+  if (!username) {
+    throw new SharedChatClaimError('config_error', '未配置环境变量 SHAREDCHAT_USERNAME');
   }
 
-  if (cookies.length === 0) {
-    throw new SharedChatClaimError('config_error', 'SHAREDCHAT_COOKIE 格式无效，未解析到 Cookie');
+  const password = String(env?.SHAREDCHAT_PASSWORD || '');
+  if (!password.trim()) {
+    throw new SharedChatClaimError('config_error', '未配置环境变量 SHAREDCHAT_PASSWORD');
   }
 
-  return cookies;
+  return {
+    username,
+    password,
+    executablePath: resolveChromiumExecutable(env?.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH),
+    timeoutMs: parsePositiveInteger(env?.SHAREDCHAT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+    challengeWaitMs: parsePositiveInteger(
+      env?.SHAREDCHAT_CHALLENGE_WAIT_MS,
+      DEFAULT_CHALLENGE_WAIT_MS
+    ),
+    userAgent: String(env?.SHAREDCHAT_USER_AGENT || '').trim() || DEFAULT_USER_AGENT,
+    reason: buildClaimReason(env?.SHAREDCHAT_CLAIM_REASON_PREFIX),
+  };
 }
 
 function shanghaiDateStamp(date = new Date()) {
@@ -187,15 +186,321 @@ function isAuthMessage(message) {
   const text = String(message || '').toLowerCase();
   return text.includes('unauthorized')
     || text.includes('forbidden')
+    || text.includes('invalid credential')
+    || text.includes('invalid token')
+    || text.includes('token invalid')
+    || text.includes('user not found')
+    || text.includes('wrong password')
+    || text.includes('login failed')
+    || text.includes('invalid username')
+    || text.includes('invalid password')
     || text.includes('not login')
     || text.includes('not logged')
     || text.includes('expired')
     || text.includes('未登录')
     || text.includes('登录失效')
     || text.includes('登录状态过期')
+    || text.includes('账号或密码')
+    || text.includes('用户名或密码')
+    || text.includes('密码错误')
+    || text.includes('账号不存在')
+    || text.includes('用户不存在')
+    || text.includes('登录失败')
     || text.includes('重新登录')
     || text.includes('请登录')
     || text.includes('无权限');
+}
+
+function isChallengeMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('turnstile')
+    || text.includes('cloudflare')
+    || text.includes('captcha')
+    || text.includes('人机验证')
+    || text.includes('安全验证')
+    || text.includes('安全检查')
+    || text.includes('验证码')
+    || text.includes('challenge required')
+    || text.includes('human verification');
+}
+
+function isLoginPageUrl(url) {
+  return /\/(login|register)(?:[/?#]|$)/i.test(String(url || ''));
+}
+
+function isSiteApiResponse(response, path, method = 'POST') {
+  try {
+    const parsed = new URL(response.url());
+    return parsed.origin === SITE_ORIGIN
+      && parsed.pathname === path
+      && response.request().method() === method;
+  } catch {
+    return false;
+  }
+}
+
+function analyzeLoginResponse(status, payload) {
+  const message = extractMessage(payload);
+
+  if (status === 0 || status === 408 || status === 429 || status >= 500) {
+    return { type: 'network_error', message: '登录请求失败或服务暂时不可用' };
+  }
+
+  if (isChallengeMessage(message)
+    || payload?.challenge_required === true
+    || payload?.data?.challenge_required === true
+    || payload?.data?.requiresChallenge === true) {
+    return {
+      type: 'challenge_required',
+      message: '登录需要人工完成 Turnstile/Cloudflare 验证',
+    };
+  }
+
+  if (status === 401 || status === 403 || isAuthMessage(message)) {
+    return {
+      type: 'auth_failed',
+      message: '账号或密码错误或登录状态无效',
+    };
+  }
+
+  if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'code')) {
+    return { type: 'schema_changed', message: '登录接口响应结构已变化' };
+  }
+
+  if (status >= 200 && status < 300 && payload.code === 1) {
+    return { type: 'success', message: '登录成功' };
+  }
+
+  return { type: 'schema_changed', message: '登录接口响应结构已变化' };
+}
+
+function getLoginConfig(payload) {
+  if (!payload || typeof payload !== 'object' || payload.code !== 1
+    || !payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
+    return null;
+  }
+
+  const enabled = payload.data.isEnableLoginTurnstile;
+  if (typeof enabled !== 'boolean') return null;
+
+  return {
+    turnstileEnabled: enabled,
+    turnstileSiteKey: typeof payload.data.turnstileSiteKey === 'string'
+      ? payload.data.turnstileSiteKey.trim()
+      : '',
+  };
+}
+
+async function loginWithCredentials(page, config, dependencies = {}) {
+  const fetchPageJson = dependencies.fetchJson || fetchJsonInPage;
+  const detectChallenge = dependencies.detectChallenge || detectChallengeSignal;
+  const startTime = Date.now();
+
+  try {
+    await page.goto(LOGIN_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.timeoutMs,
+    });
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+      throw new SharedChatClaimError('network_error', '登录页面加载超时，请检查网络连接');
+    }
+    throw new SharedChatClaimError('network_error', '登录页面加载失败，请检查网络连接');
+  }
+
+  const initialChallenge = await detectChallenge(page).catch(() => null);
+  if (initialChallenge?.blocked) {
+    throw new SharedChatClaimError(
+      'challenge_required',
+      '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+    );
+  }
+
+  const loginConfigProbe = await fetchPageJson(page, LOGIN_CONFIG_PATH);
+  if (loginConfigProbe.status === 0) {
+    throw new SharedChatClaimError('network_error', '登录配置接口请求失败，请检查网络连接');
+  }
+  if (loginConfigProbe.status === 401 || loginConfigProbe.status === 403) {
+    const challenge = await detectChallenge(page).catch(() => null);
+    if (challenge?.blocked) {
+      throw new SharedChatClaimError(
+        'challenge_required',
+        '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+      );
+    }
+    throw new SharedChatClaimError('auth_failed', '登录配置接口拒绝访问');
+  }
+  if (loginConfigProbe.status < 200 || loginConfigProbe.status >= 300) {
+    throw new SharedChatClaimError('network_error', '登录配置接口暂时不可用');
+  }
+  const loginConfig = getLoginConfig(loginConfigProbe?.json);
+  if (!loginConfig) {
+    const challenge = await detectChallenge(page).catch(() => null);
+    if (challenge?.blocked) {
+      throw new SharedChatClaimError(
+        'challenge_required',
+        '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+      );
+    }
+    throw new SharedChatClaimError('schema_changed', '登录配置接口响应结构已变化');
+  }
+  if (loginConfig.turnstileEnabled) {
+    throw new SharedChatClaimError(
+      'challenge_required',
+      '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+    );
+  }
+
+  const usernameInputs = page.locator(
+    'input:not([type]), input[type="text"], input[type="email"]'
+  );
+  const passwordInputs = page.locator('input[type="password"]');
+  try {
+    await usernameInputs.nth(0).waitFor({ state: 'visible', timeout: config.timeoutMs });
+    await passwordInputs.nth(0).waitFor({ state: 'visible', timeout: config.timeoutMs });
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+      throw new SharedChatClaimError('schema_changed', '登录表单结构已变化');
+    }
+    throw new SharedChatClaimError('schema_changed', '登录表单不可用');
+  }
+
+  const usernameCount = await usernameInputs.count();
+  const passwordCount = await passwordInputs.count();
+  if (usernameCount !== 1 || passwordCount !== 1) {
+    throw new SharedChatClaimError('schema_changed', '登录表单字段结构已变化');
+  }
+
+  const usernameInput = usernameInputs.nth(0);
+  const passwordInput = passwordInputs.nth(0);
+
+  try {
+    await usernameInput.fill(config.username);
+    await passwordInput.fill(config.password);
+  } catch {
+    throw new SharedChatClaimError('schema_changed', '登录表单字段不可填写');
+  }
+
+  const formChallenge = await detectChallenge(page).catch(() => null);
+  if (formChallenge?.blocked) {
+    throw new SharedChatClaimError(
+      'challenge_required',
+      '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+    );
+  }
+
+  const submitButtons = page.getByRole('button', { name: /登录|login/i });
+  try {
+    await submitButtons.nth(0).waitFor({ state: 'visible', timeout: config.timeoutMs });
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+      throw new SharedChatClaimError('schema_changed', '登录按钮结构已变化');
+    }
+    throw new SharedChatClaimError('schema_changed', '登录按钮不可用');
+  }
+
+  const submitCount = await submitButtons.count();
+  if (submitCount !== 1) {
+    throw new SharedChatClaimError('schema_changed', '未找到唯一的登录按钮');
+  }
+  const submitButton = submitButtons.nth(0);
+
+  let response;
+  try {
+    [response] = await Promise.all([
+      page.waitForResponse(
+        loginResponse => isSiteApiResponse(loginResponse, LOGIN_PATH),
+        { timeout: config.timeoutMs }
+      ),
+      submitButton.click(),
+    ]);
+  } catch (error) {
+    const challenge = await detectChallenge(page).catch(() => null);
+    if (challenge?.blocked) {
+      throw new SharedChatClaimError(
+        'challenge_required',
+        '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+      );
+    }
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+      throw new SharedChatClaimError('network_error', '登录请求超时，请检查网络连接');
+    }
+    throw new SharedChatClaimError('network_error', '登录请求失败，请检查网络连接');
+  }
+
+  const responseStatus = response.status();
+  if (responseStatus === 0 || responseStatus === 408 || responseStatus === 429
+    || responseStatus >= 500) {
+    throw new SharedChatClaimError('network_error', '登录请求失败或服务暂时不可用');
+  }
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    const challenge = await detectChallenge(page).catch(() => null);
+    if (challenge?.blocked) {
+      throw new SharedChatClaimError(
+        'challenge_required',
+        '登录需要人工完成 Turnstile/Cloudflare 验证，请在网页中手动处理'
+      );
+    }
+    if (responseStatus === 401 || responseStatus === 403) {
+      throw new SharedChatClaimError('auth_failed', '账号或密码错误或登录状态无效');
+    }
+    throw new SharedChatClaimError('schema_changed', '登录接口未返回有效 JSON');
+  }
+
+  if (responseStatus === 401 || responseStatus === 403) {
+    const result = analyzeLoginResponse(responseStatus, payload);
+    if (result.type === 'challenge_required') {
+      throw new SharedChatClaimError(result.type, result.message);
+    }
+    throw new SharedChatClaimError('auth_failed', '账号或密码错误或登录状态无效');
+  }
+
+  const result = analyzeLoginResponse(responseStatus, payload);
+  if (result.type !== 'success') {
+    throw new SharedChatClaimError(result.type, result.message);
+  }
+
+  // 站点登录页在成功回调中写入这个会话标记；这里显式补齐，避免
+  // 在响应事件与前端 Promise 回调之间直接导航导致 SPA 误判为未登录。
+  try {
+    await page.evaluate((storageKey) => {
+      window.localStorage.setItem(storageKey, 'token');
+    }, LOGIN_STORAGE_KEY);
+  } catch {
+    throw new SharedChatClaimError('browser_error', '登录成功后无法建立页面会话');
+  }
+
+  try {
+    await page.goto(DASHBOARD_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: config.timeoutMs,
+    });
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) {
+      throw new SharedChatClaimError('network_error', '登录成功后打开权益页面超时');
+    }
+    throw new SharedChatClaimError('network_error', '登录成功后打开权益页面失败');
+  }
+
+  const finalUrl = page.url();
+  if (isLoginPageUrl(finalUrl)) {
+    throw new SharedChatClaimError('auth_failed', '账号或密码错误或登录状态无效');
+  }
+
+  const finalChallenge = await detectChallenge(page).catch(() => null);
+  if (finalChallenge?.blocked) {
+    throw new SharedChatClaimError(
+      'challenge_required',
+      '登录后页面需要人工完成 Turnstile/Cloudflare 验证'
+    );
+  }
+
+  logWithTimestamp(`登录完成（HTTP ${responseStatus}，页面已进入权益入口）`, startTime);
+  return { type: 'success', message: '登录成功' };
 }
 
 function isAlreadyClaimedMessage(message) {
@@ -231,7 +536,7 @@ function analyzeQuotaResponse(status, payload) {
   const message = extractMessage(payload);
 
   if (status === 401 || status === 403 || isAuthMessage(message)) {
-    return { type: 'auth_failed', message: 'Cookie 已失效或登录状态无效' };
+    return { type: 'auth_failed', message: '登录状态无效，请重新登录' };
   }
 
   const codex = getCodexQuota(payload);
@@ -260,7 +565,7 @@ function analyzeClaimResponse(status, payload) {
   const message = extractMessage(payload);
 
   if (status === 401 || status === 403 || isAuthMessage(message)) {
-    return { type: 'auth_failed', message: 'Cookie 已失效或登录状态无效' };
+    return { type: 'auth_failed', message: '登录状态无效，请重新登录' };
   }
 
   if (!payload || typeof payload !== 'object') {
@@ -289,7 +594,7 @@ function analyzeClaimResponse(status, payload) {
     const dataMessage = typeof data.message === 'string' ? data.message.trim() : '';
     if (dataMessage) {
       if (isAuthMessage(dataMessage)) {
-        return { type: 'auth_failed', message: dataMessage };
+        return { type: 'auth_failed', message: '登录状态无效，请重新登录' };
       }
       if (isAlreadyClaimedMessage(dataMessage)) {
         return { type: 'already_claimed', message: dataMessage };
@@ -365,7 +670,6 @@ async function fetchJsonInPage(page, path, options = {}) {
         ok: response.ok,
         status: response.status,
         json,
-        rawTextPreview: text ? text.slice(0, 200) : '',
         textLength: text ? text.length : 0,
         parseError,
       };
@@ -393,7 +697,7 @@ async function detectChallengeSignal(page) {
       kind: '',
       detail: '',
       title: document.title || '',
-      url: location.href,
+      url: `${location.origin}${location.pathname}`,
     };
 
     // 1. 真实可见的挑战 widget（对齐同仓库 runanytime-browser 的 isChallengeVisible 思路）
@@ -412,8 +716,9 @@ async function detectChallengeSignal(page) {
       if (visible) {
         signal.blocked = true;
         signal.kind = 'turnstile-widget';
+        // 不记录 iframe src：Cloudflare/Turnstile 的 URL 可能携带动态挑战参数。
         signal.detail = `visible <${el.tagName.toLowerCase()}> `
-          + `${el.getAttribute('src') || el.className || el.id || ''}`.trim();
+          + `${el.className || el.id || 'challenge-widget'}`.trim();
         return signal;
       }
     }
@@ -452,10 +757,13 @@ async function waitForDashboardReady(page, config) {
   for (;;) {
     attemptCount++;
     const currentUrl = page.url();
-    logWithTimestamp(`Dashboard 就绪检测 #${attemptCount}: ${currentUrl}`, startTime);
+    logWithTimestamp(
+      `Dashboard 就绪检测 #${attemptCount}: ${safePageUrl(currentUrl)}`,
+      startTime
+    );
 
     if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
-      throw new SharedChatClaimError('auth_failed', 'Cookie 已失效，页面已跳转到登录入口');
+      throw new SharedChatClaimError('auth_failed', '登录状态无效，页面已跳转到登录入口');
     }
 
     // 检测页面 DOM 是否已就绪（领取按钮可见 = SPA 已渲染）
@@ -479,10 +787,20 @@ async function waitForDashboardReady(page, config) {
         `配额探测 #${attemptCount}: ok=${probe.ok} status=${probe.status} ` +
         `hasJson=${!!probe.json} jsonType=${typeof probe.json} ` +
         `textLen=${probe.textLength || 0} ` +
-        `parseError=${probe.parseError || 'none'} ` +
-        `preview="${probe.rawTextPreview || ''}"`,
+        `parseError=${probe.parseError ? 'yes' : 'none'}`,
         startTime
       );
+
+      if (probe.status === 401 || probe.status === 403) {
+        const signal = await detectChallengeSignal(page).catch(() => null);
+        if (signal?.blocked) {
+          throw new SharedChatClaimError(
+            'challenge_required',
+            `页面要求人工完成浏览器验证（${signal.kind}）`
+          );
+        }
+        throw new SharedChatClaimError('auth_failed', '登录状态无效，请重新登录');
+      }
 
       if (probe.json && typeof probe.json === 'object') {
         logWithTimestamp(`Dashboard 已就绪（配额接口验证通过）`, startTime);
@@ -513,13 +831,13 @@ async function waitForDashboardReady(page, config) {
       const screenshot = await captureDebugScreenshot(page, 'dashboard-timeout');
       log(`Dashboard 就绪超时，尝试次数: ${attemptCount}，截图: ${screenshot}`);
       if (lastSignal?.blocked) {
-        log(`验证拦截诊断: kind=${lastSignal.kind} ${lastSignal.detail} url=${lastSignal.url}`);
+        log(`验证拦截诊断: kind=${lastSignal.kind} ${lastSignal.detail}`);
         throw new SharedChatClaimError(
           'challenge_required',
           `页面要求人工完成浏览器验证（${lastSignal.kind}）`
         );
       }
-      log(`页面未就绪诊断: url=${currentUrl} title=${lastSignal?.title || ''}`);
+      log(`页面未就绪诊断: url=${safePageUrl(currentUrl)} title=${lastSignal?.title || ''}`);
       throw new SharedChatClaimError(
         'network_error',
         '页面加载后配额接口无有效响应，可能被前置验证或网络拦截'
@@ -563,7 +881,7 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
       const screenshot = await captureDebugScreenshot(page, 'auth-redirect-on-click');
       throw new SharedChatClaimError(
         'auth_failed',
-        `Cookie 已失效，点击领取按钮时页面跳转到登录入口，截图: ${screenshot}`
+        `登录状态无效，点击领取按钮时页面跳转到登录入口，截图: ${screenshot}`
       );
     }
     // 不是登录跳转，重新抛出原错误
@@ -582,7 +900,7 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
       const screenshot = await captureDebugScreenshot(page, 'auth-redirect');
       throw new SharedChatClaimError(
         'auth_failed',
-        `Cookie 已失效，点击领取按钮后页面跳转到登录入口 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
+        `登录状态无效，点击领取按钮后页面跳转到登录入口 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
       );
     }
     // 不是登录跳转，才按原有逻辑处理
@@ -610,7 +928,7 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
 
   logWithTimestamp('点击确认按钮并等待响应...', stepStartTime);
   const responsePromise = page.waitForResponse(
-    response => response.url().includes(CLAIM_PATH) && response.request().method() === 'POST',
+    response => isSiteApiResponse(response, CLAIM_PATH),
     { timeout: timeoutMs }
   );
   await confirmButton.click();
@@ -620,11 +938,24 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
     response = await responsePromise;
     logWithTimestamp(`收到领取响应: HTTP ${response.status()}`, stepStartTime);
   } catch (error) {
+    if (isLoginPageUrl(page.url())) {
+      throw new SharedChatClaimError(
+        'auth_failed',
+        '登录状态无效，领取请求后页面跳转到登录入口'
+      );
+    }
+    const challenge = await detectChallengeSignal(page).catch(() => null);
+    if (challenge?.blocked) {
+      throw new SharedChatClaimError(
+        'challenge_required',
+        `页面要求人工完成浏览器验证（${challenge.kind}）`
+      );
+    }
     const screenshot = await captureDebugScreenshot(page, 'wait-response');
     const context = await capturePageContext(page);
     log(`页面上下文: ${JSON.stringify(context)}`);
     throw new SharedChatClaimError(
-      'challenge_required',
+      'network_error',
       `等待【POST 响应】超时 (${Date.now() - stepStartTime}ms)，截图: ${screenshot}`
     );
   }
@@ -632,7 +963,6 @@ async function clickClaimThroughUi(page, reason, timeoutMs) {
   let payload = null;
   try {
     payload = await response.json();
-    log(`领取响应 body: ${JSON.stringify(payload)}`);
   } catch {}
 
   return analyzeClaimResponse(response.status(), payload);
@@ -689,7 +1019,7 @@ async function claimWithVerification(page, config, dependencies = {}) {
       if (/\/(login|register)(?:[/?#]|$)/i.test(currentUrl)) {
         return {
           type: 'auth_failed',
-          message: 'Cookie 在领取后失效，页面已跳转到登录入口'
+          message: '登录状态在领取后失效，页面已跳转到登录入口',
         };
       }
     }
@@ -754,14 +1084,10 @@ async function runClaim(config) {
       Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
     });
 
-    await context.addCookies(config.cookies);
-
     page = await context.newPage();
     page.setDefaultTimeout(config.timeoutMs);
-    await page.goto(DASHBOARD_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: config.timeoutMs,
-    });
+    log('正在使用账号密码登录');
+    await loginWithCredentials(page, config);
 
     const quotaBefore = await waitForDashboardReady(page, config);
 
@@ -793,10 +1119,9 @@ async function runClaim(config) {
         const context = await capturePageContext(page);
         log(`通用超时上下文: ${JSON.stringify(context)}`);
 
-        // cookie 失效时页面会跳转到登录 SPA，goto/等待会一直卡到超时。
-        // 此处按最终落点区分：已在登录页 → auth_failed，而非笼统的网络超时。
+        // 登录态失效时页面会跳转到登录 SPA；按最终落点保留 auth_failed 分类。
         if (/\/(login|register)(?:[/?#]|$)/i.test(page.url())) {
-          return { type: 'auth_failed', message: 'Cookie 已失效，页面已跳转到登录入口' };
+          return { type: 'auth_failed', message: '登录状态无效，页面已跳转到登录入口' };
         }
       }
       return {
@@ -820,20 +1145,22 @@ function printHelp() {
   node sharedchat-vibe-claim.js
 
 必填环境变量:
-  SHAREDCHAT_COOKIE                  new.sharedchat.cc 的完整登录 Cookie
+  SHAREDCHAT_USERNAME                SharedChat 用户名或邮箱
+  SHAREDCHAT_PASSWORD                SharedChat 登录密码
 
 可选环境变量:
   SHAREDCHAT_CLAIM_REASON_PREFIX     领取原因前缀，脚本会追加北京时间日期
   SHAREDCHAT_TIMEOUT_MS              页面和接口超时毫秒数，默认 60000
   SHAREDCHAT_CHALLENGE_WAIT_MS       软验证自愈等待毫秒数，默认 15000
-  SHAREDCHAT_USER_AGENT             浏览器 User-Agent，建议与获取 Cookie 时一致
+  SHAREDCHAT_USER_AGENT             浏览器 User-Agent
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH  Chromium 可执行文件路径
 
 青龙定时任务:
   5 0 * * * node /ql/data/scripts/sharedchat-vibe-claim.js
 
 说明:
-  脚本仅支持单账号。已内置基础反自动化检测（抹除 webdriver 特征等），
+  脚本仅支持单账号，每次运行在临时浏览器上下文中登录，不持久化会话。
+  已内置基础反自动化检测（抹除 webdriver 特征等），
   并对可自动通过的软验证做自愈等待；若最终仍出现需人工点击的 Turnstile/
   Cloudflare 拦截，会停止并通知，不尝试破解验证码。`);
 }
@@ -844,26 +1171,9 @@ async function main() {
     return;
   }
 
-  const rawCookie = process.env.SHAREDCHAT_COOKIE;
-  if (!rawCookie?.trim()) {
-    await notify(TASK_TITLE, '❌ 发生异常：未配置环境变量 SHAREDCHAT_COOKIE');
-    process.exitCode = 1;
-    return;
-  }
-
   let config;
   try {
-    config = {
-      cookies: parseCookieHeader(rawCookie),
-      executablePath: resolveChromiumExecutable(),
-      timeoutMs: parsePositiveInteger(process.env.SHAREDCHAT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-      challengeWaitMs: parsePositiveInteger(
-        process.env.SHAREDCHAT_CHALLENGE_WAIT_MS,
-        DEFAULT_CHALLENGE_WAIT_MS
-      ),
-      userAgent: process.env.SHAREDCHAT_USER_AGENT?.trim() || DEFAULT_USER_AGENT,
-      reason: buildClaimReason(process.env.SHAREDCHAT_CLAIM_REASON_PREFIX),
-    };
+    config = getConfig(process.env);
   } catch (error) {
     await notify(TASK_TITLE, `❌ 发生异常：${error.message}`);
     process.exitCode = 1;
@@ -889,16 +1199,17 @@ if (require.main === module) {
 module.exports = {
   SharedChatClaimError,
   analyzeClaimResponse,
+  analyzeLoginResponse,
   analyzeQuotaResponse,
   buildClaimReason,
   claimWithVerification,
   detectChallengeSignal,
   formatResult,
+  getConfig,
   getCodexQuota,
   isAlreadyClaimedMessage,
   isSuccessMessage,
-  normalizeCookie,
-  parseCookieHeader,
+  loginWithCredentials,
   parsePositiveInteger,
   resolveChromiumExecutable,
   runClaim,
