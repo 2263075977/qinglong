@@ -14,7 +14,7 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const TASK_NAME = '黑与白福利站 轻松农场';
 const LOG_PREFIX = '[hybgzs-farm]';
 const FARM_REFERER_PATH = '/entertainment/farm';
-const DEFAULT_ACTION = 'status';
+const DEFAULT_ACTION = 'auto';
 const NOTIFICATION_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const NOTIFICATION_STATE_FILENAME = 'hyb-farm-notification-state.json';
 const FARM_ACTIONS = new Set(['status', 'harvest-all', 'care-all', 'plant-batch', 'auto']);
@@ -60,6 +60,11 @@ const DEFAULT_FORCE_SELL_USAGE = 0.85; // 仓库使用率 ≥ 该值时无视价
 // 此后库存中出现的 starfruit 均为收获的果实（种子/果实同池），故 0 保留不会误卖种子。
 // 若日后会“买种子囤着分批种”，需调高此值兜底，否则未种的种子会被当盈余卖出。
 const DEFAULT_SEED_RESERVE = 0;
+// 近成熟守候：地块等级不同导致成熟周期参差（6h / 10h…），cron */30 可能刚跑完就有作物成熟。
+// 跑完 auto 后若最近成熟时刻落在该窗口内，进程内 sleep 到点补跑一轮，避免白等半小时。
+const DEFAULT_WAIT_WINDOW_MIN = 8; // 0 表示关闭守候
+const DEFAULT_WAIT_ROUNDS = 1; // 每次运行最多补跑的轮数
+const WAIT_BUFFER_MS = 20 * 1000; // 服务端时钟略慢时的缓冲
 
 class HybFarmError extends Error {
   constructor(message, details = {}) {
@@ -207,7 +212,7 @@ function getConfig() {
     maxPlant: parsePositiveInteger(process.env.HYB_FARM_MAX_PLANT, null),
     plantBodyRaw: (process.env.HYB_FARM_PLANT_BODY || '').trim(),
     timeoutMs: parsePositiveInteger(process.env.HYB_FARM_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-    autoExecute: parseBoolean(process.env.HYB_FARM_AUTO_EXECUTE, false),
+    autoExecute: parseBoolean(process.env.HYB_FARM_AUTO_EXECUTE, true),
     // 主种：默认锁定杨桃 starfruit，HYB_FARM_SEED_ID 可覆盖
     mainSeedId: (process.env.HYB_FARM_SEED_ID || MAIN_SEED_ID).trim(),
     minEnergy: parseNonNegativeInteger(process.env.HYB_FARM_MIN_ENERGY, DEFAULT_MIN_ENERGY),
@@ -216,6 +221,9 @@ function getConfig() {
     sellRatio: parseFloatOrDefault(process.env.HYB_FARM_SELL_RATIO, DEFAULT_SELL_RATIO),
     forceSellUsage: parseFloatOrDefault(process.env.HYB_FARM_FORCE_SELL_USAGE, DEFAULT_FORCE_SELL_USAGE),
     seedReserve: parseNonNegativeInteger(process.env.HYB_FARM_SEED_RESERVE, DEFAULT_SEED_RESERVE),
+    // 近成熟守候
+    waitWindowMs: parseNonNegativeInteger(process.env.HYB_FARM_WAIT_WINDOW_MIN, DEFAULT_WAIT_WINDOW_MIN) * 60 * 1000,
+    maxWaitRounds: parseNonNegativeInteger(process.env.HYB_FARM_WAIT_ROUNDS, DEFAULT_WAIT_ROUNDS),
   };
 }
 
@@ -415,8 +423,10 @@ function printUsage() {
   HYB_FARM_QUANTITY      可选，默认种植数量；未设置时按空地最大
   HYB_FARM_MAX_PLANT     可选，auto 最大补种数量
   HYB_FARM_PLANT_BODY    可选，覆盖 plant-batch JSON 请求体
-  HYB_FARM_DEFAULT_ACTION 可选，无参数运行时的动作，默认 status
-  HYB_FARM_AUTO_EXECUTE  可选，设为 1/true 时允许 auto 默认执行
+  HYB_FARM_DEFAULT_ACTION 可选，无参数运行时的动作，默认 ${DEFAULT_ACTION}
+  HYB_FARM_AUTO_EXECUTE  可选，auto 真实执行，默认开启，设 0 回到 dry-run
+  HYB_FARM_WAIT_WINDOW_MIN 可选，近成熟守候窗口（分钟），默认 ${DEFAULT_WAIT_WINDOW_MIN}，设 0 关闭
+  HYB_FARM_WAIT_ROUNDS   可选，每次运行最多守候补跑轮数，默认 ${DEFAULT_WAIT_ROUNDS}
   HYB_FARM_MIN_ENERGY    可选，护理前保留的体力阈值，默认 ${DEFAULT_MIN_ENERGY}
   HYB_FARM_AUTO_SELL     可选，auto 自动卖出盈余果实，默认开启，设 0 关闭
   HYB_FARM_SELL_RATIO    可选，当前价 ≥ 7日均价×该值才卖，默认 ${DEFAULT_SELL_RATIO}
@@ -432,12 +442,14 @@ function printUsage() {
   node hyb-farm.js auto --execute
 
 青龙环境变量自动化（任务命令无需追加参数）:
-  HYB_FARM_DEFAULT_ACTION=auto    无参数运行时进入自动流程
-  HYB_FARM_AUTO_EXECUTE=1        允许真实收获、护理、种植与卖出；不设置时为 dry-run
-  （主种默认锁定杨桃 starfruit，如需改种用 HYB_FARM_SEED_ID 覆盖）
+  脚本默认即为 auto + 真实执行 + 主种杨桃 starfruit，无需配置任何变量
+  HYB_FARM_AUTO_EXECUTE=0        临时回到 dry-run，只输出计划不实际操作
+  HYB_FARM_DEFAULT_ACTION=status 无参数运行时只查询状态
+  （如需改种用 HYB_FARM_SEED_ID 覆盖）
 
 青龙定时任务:
-  */30 * * * * task 仓库目录/gongyizhan/hyb-farm.js`);
+  */30 * * * * task 仓库目录/gongyizhan/hyb-farm.js
+  （作物在 ${DEFAULT_WAIT_WINDOW_MIN} 分钟内成熟时脚本会原地守候补跑，无需缩短 cron）`);
 }
 
 function isQinglongEnvironment() {
@@ -841,6 +853,18 @@ function isEmptyPlot(plot) {
   return 'plotId' in plot || 'plot_id' in plot || 'plotIndex' in plot;
 }
 
+// 解析地块的成熟时刻，返回毫秒时间戳；无法解析时返回 null。
+// 服务端可能返回秒级时间戳或 ISO 字符串，统一归一到毫秒。
+function parseMatureTimestamp(plot) {
+  if (!plot || typeof plot !== 'object') return null;
+  const maturesAt = plot.maturesAt ?? plot.matureAt ?? plot.harvestAt;
+  if (maturesAt === undefined || maturesAt === null || maturesAt === '') return null;
+  let timestamp = typeof maturesAt === 'number' ? maturesAt : Date.parse(String(maturesAt));
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+  if (timestamp < 1e12) timestamp *= 1000;
+  return timestamp;
+}
+
 function isMaturePlot(plot, nowMs = Date.now()) {
   if (!plot || typeof plot !== 'object') return false;
   const status = String(plot.status || plot.state || '').toLowerCase();
@@ -851,11 +875,33 @@ function isMaturePlot(plot, nowMs = Date.now()) {
     return true;
   }
 
-  const maturesAt = plot.maturesAt ?? plot.matureAt ?? plot.harvestAt;
-  if (maturesAt === undefined || maturesAt === null || maturesAt === '') return false;
-  let timestamp = typeof maturesAt === 'number' ? maturesAt : Date.parse(String(maturesAt));
-  if (Number.isFinite(timestamp) && timestamp > 0 && timestamp < 1e12) timestamp *= 1000;
-  return Number.isFinite(timestamp) && timestamp <= nowMs;
+  const timestamp = parseMatureTimestamp(plot);
+  return timestamp !== null && timestamp <= nowMs;
+}
+
+// 返回所有未成熟地块中最近的成熟时刻（毫秒），没有则 null。
+function getNextMatureAt(state, nowMs = Date.now()) {
+  if (!state || typeof state !== 'object') return null;
+  const cropItems = getExplicitArray(state.crops, ['crops', 'plots', 'plantedCrops'], isPlotLike);
+  let next = null;
+  for (const plot of cropItems) {
+    if (isEmptyPlot(plot) || isMaturePlot(plot, nowMs)) continue;
+    const timestamp = parseMatureTimestamp(plot);
+    if (timestamp === null || timestamp <= nowMs) continue;
+    if (next === null || timestamp < next) next = timestamp;
+  }
+  return next;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes > 0 ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`;
 }
 
 // 实测（2026-07-14 抓包）debuff 以成对时间戳表示：
@@ -1748,7 +1794,7 @@ async function run() {
     return;
   }
 
-  const autoResult = await runAuto(config, args);
+  let autoResult = await runAuto(config, args);
   if (autoResult.dryRun) {
     console.log(`${LOG_PREFIX} auto 当前为 dry-run；需要真实执行请加 --execute 或设置 HYB_FARM_AUTO_EXECUTE=1`);
   }
@@ -1756,8 +1802,32 @@ async function run() {
     console.log(`${LOG_PREFIX} ${formatResult(result)}`);
   }
 
-  await sendRoundNotification(config, { state: autoResult.state, results: autoResult.results });
-  if (autoResult.results.some(isFailureResult)) process.exitCode = 1;
+  // 近成熟守候：作物在短窗口内成熟时，原地等到点补跑一轮，避免白等到下个 cron 周期
+  const allResults = [...autoResult.results];
+  for (let round = 1; !autoResult.dryRun && config.waitWindowMs > 0 && round <= config.maxWaitRounds; round++) {
+    const nextMatureAt = getNextMatureAt(autoResult.state);
+    if (nextMatureAt === null) break;
+    const delay = nextMatureAt - Date.now() + WAIT_BUFFER_MS;
+    if (delay <= 0 || delay > config.waitWindowMs) {
+      console.log(`${LOG_PREFIX} 最近成熟时间超出守候窗口（${formatDuration(config.waitWindowMs)}），本轮结束`);
+      break;
+    }
+
+    const label = `守候补跑 #${round}`;
+    const waitMessage = `等待 ${formatDuration(delay)} 至 ${new Date(nextMatureAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} 成熟`;
+    console.log(`${LOG_PREFIX} ${label}：${waitMessage}`);
+    await sleep(delay);
+
+    autoResult = await runAuto(config, args);
+    allResults.push(makeResult(label, 'success', waitMessage));
+    for (const result of autoResult.results) {
+      console.log(`${LOG_PREFIX} ${formatResult(result)}`);
+    }
+    allResults.push(...autoResult.results);
+  }
+
+  await sendRoundNotification(config, { state: autoResult.state, results: allResults });
+  if (allResults.some(isFailureResult)) process.exitCode = 1;
 }
 
 if (require.main === module) {
@@ -1798,6 +1868,7 @@ module.exports = {
   formatSummary,
   getAccountIdentity,
   getConfig,
+  getNextMatureAt,
   getNotificationStateFile,
   isIssueCooling,
   normalizeBaseUrl,
@@ -1805,6 +1876,7 @@ module.exports = {
   normalizeDefaultAction,
   normalizeNotificationState,
   parseArgs,
+  parseMatureTimestamp,
   parseWarehouse,
   parseFreeSlots,
   parseRecyclePrices,
