@@ -65,6 +65,7 @@ const DEFAULT_SEED_RESERVE = 0;
 const DEFAULT_WAIT_WINDOW_MIN = 8; // 0 表示关闭守候
 const DEFAULT_WAIT_ROUNDS = 1; // 每次运行最多补跑的轮数
 const WAIT_BUFFER_MS = 20 * 1000; // 服务端时钟略慢时的缓冲
+const HARVEST_CHALLENGE_RETRY_DELAYS_MS = [5 * 1000, 10 * 1000];
 
 class HybFarmError extends Error {
   constructor(message, details = {}) {
@@ -1273,31 +1274,57 @@ async function postAction(config, action, apiPath, body = {}) {
   }
 }
 
-async function performHarvestAll(config, dryRun = false) {
+async function performHarvestAll(config, dryRun = false, dependencies = {}) {
   const action = '一键收获';
+  const request = dependencies.request || requestJson;
+  const wait = dependencies.wait || sleep;
+  const log = dependencies.log || console.log;
+  const retryDelaysMs = dependencies.retryDelaysMs ?? HARVEST_CHALLENGE_RETRY_DELAYS_MS;
   // destroyIfFull=false：仓满时不销毁多余作物，宁可停下也不丢东西，改由通知提醒去卖
   if (dryRun) return makeResult(action, 'dry_run', 'dry-run，未执行 POST /api/farm/harvest-all');
-  try {
-    const result = await requestJson(config, '/api/farm/harvest-all', {
-      method: 'POST',
-      body: { destroyIfFull: false },
-    });
-    // 仓满可能以 success:false 形式返回，先判仓满再断言
-    if (isWarehouseFull(result)) {
-      return makeResult(action, 'warehouse_full', '仓库已满，部分作物未能收获，请尽快去卖出腾空间');
+  for (let attempt = 1; attempt <= retryDelaysMs.length + 1; attempt += 1) {
+    try {
+      const result = await request(config, '/api/farm/harvest-all', {
+        method: 'POST',
+        body: { destroyIfFull: false },
+      });
+      // 仓满可能以 success:false 形式返回，先判仓满再断言
+      if (isWarehouseFull(result)) {
+        return makeResult(action, 'warehouse_full', '仓库已满，部分作物未能收获，请尽快去卖出腾空间');
+      }
+      assertSuccess(result, `${action}失败`);
+      const data = getData(result);
+      const destroyed = getNumber(data?.destroyedCount, 0);
+      const base = makeResult(action, 'success', summarizeActionData(data), { data });
+      if (destroyed > 0) base.message += `（销毁 ${destroyed}）`;
+      return base;
+    } catch (error) {
+      // 仓满也可能以 HTTP 错误 / 抛异常形式出现
+      if (error instanceof HybFarmError && isWarehouseFull(error.details?.response || error.details)) {
+        return makeResult(action, 'warehouse_full', '仓库已满，部分作物未能收获，请尽快去卖出腾空间');
+      }
+
+      const shouldRetryChallenge = error instanceof HybFarmError &&
+        error.type === 'challenge_required' &&
+        attempt <= retryDelaysMs.length;
+      if (!shouldRetryChallenge) {
+        if (error instanceof HybFarmError && error.type === 'challenge_required' && retryDelaysMs.length > 0) {
+          return makeResult(
+            action,
+            'challenge_required',
+            `已重试 ${retryDelaysMs.length} 次，仍需要 CAP/Cloudflare 验证，脚本已跳过`
+          );
+        }
+        return resultFromError(action, error);
+      }
+
+      const delayMs = retryDelaysMs[attempt - 1];
+      log(
+        `${LOG_PREFIX} 一键收获触发 CAP/Cloudflare 验证，` +
+        `${formatDuration(delayMs)}后重试（${attempt}/${retryDelaysMs.length}）`
+      );
+      await wait(delayMs);
     }
-    assertSuccess(result, `${action}失败`);
-    const data = getData(result);
-    const destroyed = getNumber(data?.destroyedCount, 0);
-    const base = makeResult(action, 'success', summarizeActionData(data), { data });
-    if (destroyed > 0) base.message += `（销毁 ${destroyed}）`;
-    return base;
-  } catch (error) {
-    // 仓满也可能以 HTTP 错误 / 抛异常形式出现
-    if (error instanceof HybFarmError && isWarehouseFull(error.details?.response || error.details)) {
-      return makeResult(action, 'warehouse_full', '仓库已满，部分作物未能收获，请尽快去卖出腾空间');
-    }
-    return resultFromError(action, error);
   }
 }
 
