@@ -271,15 +271,19 @@ function isChallengeHtml(text) {
     || lower.includes('bot detection');
 }
 
-async function checkinWithBrowser(page, userId) {
+async function checkinWithBrowser(page, userId, turnstileToken) {
   // 在页面上下文内发起签到请求，自动携带所有 Cookie（含 Cloudflare 种的 cf_clearance）
-  return page.evaluate(async apiUserId => {
+  return page.evaluate(async ({ apiUserId, token }) => {
     try {
       const headers = { 'Content-Type': 'application/json' };
       // 与站点前端一致：附带 New-API-User 头，兼容部分 newapi 分支
       if (apiUserId != null) headers['New-API-User'] = String(apiUserId);
 
-      const response = await fetch('/api/user/checkin', {
+      // newapi TurnstileCheck 中间件从 query 参数读取 token
+      const url = token
+        ? `/api/user/checkin?turnstile=${encodeURIComponent(token)}`
+        : '/api/user/checkin';
+      const response = await fetch(url, {
         method: 'POST',
         headers,
         body: '{}',
@@ -320,11 +324,100 @@ async function checkinWithBrowser(page, userId) {
         isJson: false,
       };
     }
-  }, userId);
+  }, { apiUserId: userId, token: turnstileToken || null });
 }
 
-async function fetchQuotaPerUnit(page) {
-  return page.evaluate(async fallback => {
+// 在页面里渲染 Turnstile 组件获取 token；站点未开启或获取失败时返回 { token: null, reason }
+// 渲染为非阻塞（结果挂在 window.__laomoTurnstile），Node 侧轮询；
+// 交互式挑战（复选框）无法在页面 JS 内触发，需用 Playwright 真实鼠标点击。
+async function getTurnstileToken(page, siteKey, timeoutMs) {
+  if (!siteKey) return { token: null, reason: 'no_site_key' };
+
+  try {
+    const setupError = await page.evaluate(async key => {
+      if (!window.turnstile) {
+        try {
+          await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+            script.onload = resolve;
+            script.onerror = () => reject(new Error('script_load_failed'));
+            document.head.appendChild(script);
+          });
+        } catch (error) {
+          return error.message;
+        }
+        if (!window.turnstile) return 'turnstile_object_missing';
+      }
+
+      const container = document.createElement('div');
+      container.id = 'laomo-turnstile-container';
+      // 放在视口中央，交互式挑战需要组件可见且可点击
+      container.style.cssText = 'position:fixed;top:40%;left:50%;transform:translateX(-50%);z-index:2147483647;background:#fff;padding:8px;';
+      document.body.appendChild(container);
+
+      window.__laomoTurnstile = { status: 'pending' };
+      try {
+        window.turnstile.render(container, {
+          sitekey: key,
+          appearance: 'always',
+          callback: token => { window.__laomoTurnstile = { status: 'ok', token }; },
+          'error-callback': code => { window.__laomoTurnstile = { status: 'error', code: String(code || 'unknown') }; },
+        });
+      } catch (error) {
+        return `render_throw_${error?.message || 'unknown'}`;
+      }
+      return null;
+    }, siteKey);
+    if (setupError) return { token: null, reason: setupError };
+
+    const startedAt = Date.now();
+    let clickCount = 0;
+    while (Date.now() - startedAt < timeoutMs) {
+      const state = await page.evaluate(() => window.__laomoTurnstile).catch(() => null);
+      if (state?.status === 'ok') return { token: state.token, reason: 'ok' };
+      if (state?.status === 'error') return { token: null, reason: `error_${state.code}` };
+
+      // 5 秒后仍 pending，视为交互式挑战，每 5 秒点击一次复选框区域（组件左侧约 30px 处）。
+      // 注意：Turnstile 的 iframe 在 closed shadow DOM 内不可查询，用容器 rect 定位。
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > 5000 && clickCount < Math.floor(elapsed / 5000)) {
+        clickCount = Math.floor(elapsed / 5000);
+        const box = await page.evaluate(() => {
+          const rect = document
+            .getElementById('laomo-turnstile-container')
+            ?.getBoundingClientRect();
+          return rect && rect.width > 0
+            ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+            : null;
+        }).catch(() => null);
+        if (box) {
+          console.log(`[老魔公益站] Turnstile 疑似交互式挑战，尝试点击复选框 (第 ${clickCount} 次, 组件 ${Math.round(box.width)}x${Math.round(box.height)})...`);
+          await page.mouse.click(box.x + 30, box.y + box.height / 2).catch(() => {});
+        } else {
+          console.log('[老魔公益站] Turnstile 容器不可见，无法点击');
+        }
+      }
+
+      await page.waitForTimeout(500);
+    }
+
+    await page.screenshot({ path: '/tmp/laomo-turnstile-timeout.png', fullPage: false })
+      .then(() => console.log('[老魔公益站] 已保存超时截图: /tmp/laomo-turnstile-timeout.png'))
+      .catch(() => {});
+    return { token: null, reason: 'timeout' };
+  } catch (error) {
+    return { token: null, reason: `evaluate_failed_${error?.message || 'unknown'}` };
+  }
+}
+
+async function fetchSiteStatus(page) {
+  return page.evaluate(async fallbackQuota => {
+    const fallback = {
+      quotaPerUnit: fallbackQuota,
+      turnstileEnabled: false,
+      turnstileSiteKey: '',
+    };
     try {
       const response = await fetch('/api/status', {
         credentials: 'include',
@@ -332,9 +425,15 @@ async function fetchQuotaPerUnit(page) {
       });
       const payload = await response.json().catch(() => null);
       const quotaPerUnit = Number(payload?.data?.quota_per_unit);
-      return Number.isFinite(quotaPerUnit) && quotaPerUnit > 0
-        ? quotaPerUnit
-        : fallback;
+      return {
+        quotaPerUnit: Number.isFinite(quotaPerUnit) && quotaPerUnit > 0
+          ? quotaPerUnit
+          : fallbackQuota,
+        turnstileEnabled: payload?.data?.turnstile_check === true,
+        turnstileSiteKey: typeof payload?.data?.turnstile_site_key === 'string'
+          ? payload.data.turnstile_site_key
+          : '',
+      };
     } catch {
       return fallback;
     }
@@ -425,14 +524,23 @@ async function runAccount(browser, account, config) {
       };
     }
 
-    // 获取站点配置的积分单位
+    // 获取站点配置（积分单位 + Turnstile 开关）
     console.log('[老魔公益站] 正在获取站点配置...');
-    const quotaPerUnit = await fetchQuotaPerUnit(page);
-    console.log(`[老魔公益站] 积分单位: ${quotaPerUnit}`);
+    const siteStatus = await fetchSiteStatus(page);
+    console.log(`[老魔公益站] 积分单位: ${siteStatus.quotaPerUnit}`);
 
-    // 发起签到请求（附带提取到的 userId）
+    // 站点开启 Turnstile 时，先在页面里渲染组件拿 token
+    let turnstileToken = null;
+    if (siteStatus.turnstileEnabled && siteStatus.turnstileSiteKey) {
+      console.log(`[老魔公益站] 站点开启 Turnstile 验证，正在获取 token... (siteKey: ${siteStatus.turnstileSiteKey})`);
+      const turnstileResult = await getTurnstileToken(page, siteStatus.turnstileSiteKey, 30000);
+      turnstileToken = turnstileResult.token;
+      console.log(`[老魔公益站] Turnstile token: ${turnstileToken ? '获取成功' : `获取失败(${turnstileResult.reason})，仍尝试签到`}`);
+    }
+
+    // 发起签到请求（附带提取到的 userId 和 Turnstile token）
     console.log(`[老魔公益站] 正在发起签到请求... (userId: ${userId || '无'})`);
-    const checkinResult = await checkinWithBrowser(page, userId);
+    const checkinResult = await checkinWithBrowser(page, userId, turnstileToken);
     console.log(`[老魔公益站] 签到结果: ok=${checkinResult.ok}, status=${checkinResult.status}, message=${checkinResult.message}`);
 
     if (checkinResult.ok) {
@@ -441,7 +549,7 @@ async function runAccount(browser, account, config) {
         message: checkinResult.message || '签到成功',
         reward: formatQuotaReward(
           checkinResult.data?.reward ?? checkinResult.data?.quota_awarded,
-          quotaPerUnit
+          siteStatus.quotaPerUnit
         ),
       };
     }
@@ -461,10 +569,10 @@ async function runAccount(browser, account, config) {
       };
     }
 
-    if (checkinResult.challenge) {
+    if (checkinResult.challenge || /turnstile/i.test(checkinResult.message)) {
       return {
         type: 'challenge_required',
-        message: 'Cloudflare 挑战未在无头模式下自动完成，请改用有头模式或网页手动处理',
+        message: 'Turnstile 验证未通过（token 获取失败或被拒），请改用有头模式或网页手动签到',
       };
     }
 
@@ -479,15 +587,23 @@ async function runAccount(browser, account, config) {
 }
 
 async function runBrowserCheckins(accounts, config) {
+  // 优先使用 rebrowser-playwright（修补 CDP Runtime.enable 泄漏，Turnstile 检测不到自动化），
+  // 未安装时回退原版 playwright
   let chromium;
   try {
-    ({ chromium } = require('playwright'));
+    ({ chromium } = require('rebrowser-playwright'));
+    console.log('[老魔公益站] 使用 rebrowser-playwright（反检测补丁版）');
   } catch {
-    return accounts.map(account => ({
-      accountLabel: accountLabel(account),
-      type: 'browser_error',
-      message: '未安装 Playwright，请在青龙环境安装 playwright 并准备 Chromium',
-    }));
+    try {
+      ({ chromium } = require('playwright'));
+      console.log('[老魔公益站] 使用原版 playwright（建议安装 rebrowser-playwright 提高 Turnstile 通过率）');
+    } catch {
+      return accounts.map(account => ({
+        accountLabel: accountLabel(account),
+        type: 'browser_error',
+        message: '未安装 Playwright，请在青龙环境安装 playwright 并准备 Chromium',
+      }));
+    }
   }
 
   const launchOptions = {
@@ -664,10 +780,11 @@ module.exports = {
   checkinWithBrowser,
   cleanString,
   extractUserIdFromSessionCookie,
-  fetchQuotaPerUnit,
+  fetchSiteStatus,
   formatAccountResult,
   formatQuotaReward,
   formatResults,
+  getTurnstileToken,
   isAlreadyCheckedMessage,
   isAuthMessage,
   isChallengeHtml,
