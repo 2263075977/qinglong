@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // cron: */30 * * * *
 // new Env('黑与白福利站 轻松农场');
-// description: 黑与白福利站轻松农场自动收获、护理、补种杨桃与变现
+// description: 黑与白福利站轻松农场自动收获、护理、补种赤阳莲与变现
 
 const fs = require('fs');
 const crypto = require('crypto');
@@ -48,19 +48,21 @@ const COOKIE_ENV_NAMES = [
   'HYB_CARDS_COOKIE',
 ];
 
-// 主种锁定杨桃 starfruit（VIP 最优，10h 周期契合 30min cron）。
-// 名字/ID 双匹配，回退到 HYB_FARM_SEED_ID，再回退到内置常量。
-const MAIN_SEED_ID = 'starfruit';
-const MAIN_SEED_ALIASES = ['starfruit', '杨桃'];
+// 主种锁定赤阳莲 sunfire_lotus（VIP 作物，基础成熟时间 108h）。
+// 作物资料：https://hyb.gudong226.com/；实际成熟时刻以接口返回为准。
+// cron 每 30min 巡检收获、护理与空地补种；108h 是基础生长周期，不是脚本运行间隔。
+// HYB_FARM_SEED_ID 可填写中文名或 ID；中文名通过种子目录解析，未找到时报配置错误。
+const MAIN_SEED_ID = 'sunfire_lotus';
+const MAIN_SEED_ALIASES = [MAIN_SEED_ID, '赤阳莲'];
 const MAX_SLIPPAGE_BPS = 300; // 回收滑点保护：超过 3% 自动拒绝
 const DEFAULT_MIN_ENERGY = 10; // 护理前保留的体力阈值
 const DEFAULT_SELL_RATIO = 0.95; // 当前回收价 ≥ 7 日均价 × 该比例才卖（躲低谷）
 const DEFAULT_FORCE_SELL_USAGE = 0.85; // 仓库使用率 ≥ 该值时无视价格强制卖（防满仓卡死）
-// 卖出前保留的种子数，默认 0。安全前提：用户更新脚本前会手动一次性把 starfruit 种子全部种下（库存清零），
-// 此后库存中出现的 starfruit 均为收获的果实（种子/果实同池），故 0 保留不会误卖种子。
+// 卖出前保留的种子数，默认 0。安全前提：开始自动卖出前已把主种种子全部种下（库存清零），
+// 此后库存中出现的主种均为收获的果实（种子/果实同池），故 0 保留不会误卖种子。
 // 若日后会“买种子囤着分批种”，需调高此值兜底，否则未种的种子会被当盈余卖出。
 const DEFAULT_SEED_RESERVE = 0;
-// 近成熟守候：地块等级不同导致成熟周期参差（6h / 10h…），cron */30 可能刚跑完就有作物成熟。
+// 近成熟守候：地块等级和种植时刻不同导致成熟时间参差，cron */30 可能刚跑完就有作物成熟。
 // 跑完 auto 后若最近成熟时刻落在该窗口内，进程内 sleep 到点补跑一轮，避免白等半小时。
 const DEFAULT_WAIT_WINDOW_MIN = 8; // 0 表示关闭守候
 const DEFAULT_WAIT_ROUNDS = 1; // 每次运行最多补跑的轮数
@@ -214,7 +216,7 @@ function getConfig() {
     plantBodyRaw: (process.env.HYB_FARM_PLANT_BODY || '').trim(),
     timeoutMs: parsePositiveInteger(process.env.HYB_FARM_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     autoExecute: parseBoolean(process.env.HYB_FARM_AUTO_EXECUTE, true),
-    // 主种：默认锁定杨桃 starfruit，HYB_FARM_SEED_ID 可覆盖
+    // 主种：默认赤阳莲，HYB_FARM_SEED_ID 可用中文名或 ID 覆盖
     mainSeedId: (process.env.HYB_FARM_SEED_ID || MAIN_SEED_ID).trim(),
     minEnergy: parseNonNegativeInteger(process.env.HYB_FARM_MIN_ENERGY, DEFAULT_MIN_ENERGY),
     // 卖出开关与保护参数
@@ -400,18 +402,18 @@ function printUsage() {
   console.log(`使用方法: node hyb-farm.js [动作] [选项]
 
 动作:
-  status        查询农场、种子、仓库、体力状态，默认动作，只读
+  status        查询农场、种子、仓库、体力状态，只读
   harvest-all   一键收获成熟作物
   care-all      一键务农，处理浇水/除草/杀虫等护理
   plant-batch   批量种植，数量默认取空闲地块最大值
-  auto          自动流程：收获 -> 护理 -> 补种杨桃 -> 卖出盈余
+  auto          默认动作，自动流程：收获 -> 护理 -> 补种赤阳莲 -> 卖出盈余
 
 选项:
-  --seed-id <id>      种子 ID，例如 golden_apple
+  --seed-id <名称或ID> 作物中文名或种子 ID，例如 赤阳莲 或 ${MAIN_SEED_ID}
   --quantity <n>      种植数量；未设置时使用空地数量，不按库存截断
   --max-plant <n>     auto 最大补种数量
   --dry-run           只展示计划，不执行 POST 动作
-  --execute           允许 auto 执行 POST；auto 默认 dry-run
+  --execute           允许 auto 执行 POST；auto 默认真实执行
   -h, --help          显示此帮助信息
 
 环境变量:
@@ -420,7 +422,7 @@ function printUsage() {
   HYBGZS_COOKIE          兼容，完整浏览器 Cookie 字符串
   HYB_COOKIE             兼容，完整浏览器 Cookie 字符串
   HYB_CARDS_COOKIE       兼容，可复用 50 连抽脚本 Cookie
-  HYB_FARM_SEED_ID       可选，主种 ID，覆盖默认杨桃 ${MAIN_SEED_ID}
+  HYB_FARM_SEED_ID       可选，作物中文名或 ID，例如 赤阳莲；默认赤阳莲
   HYB_FARM_QUANTITY      可选，默认种植数量；未设置时按空地最大
   HYB_FARM_MAX_PLANT     可选，auto 最大补种数量
   HYB_FARM_PLANT_BODY    可选，覆盖 plant-batch JSON 请求体
@@ -439,17 +441,18 @@ function printUsage() {
 
 示例:
   node hyb-farm.js status
-  node hyb-farm.js plant-batch --seed-id starfruit --quantity 16
+  node hyb-farm.js plant-batch --seed-id 赤阳莲 --quantity 16
   node hyb-farm.js auto --execute
 
 青龙环境变量自动化（任务命令无需追加参数）:
-  脚本默认即为 auto + 真实执行 + 主种杨桃 starfruit，无需配置任何变量
+  脚本默认即为 auto + 真实执行 + 主种赤阳莲 ${MAIN_SEED_ID}，无需额外配置作物变量
   HYB_FARM_AUTO_EXECUTE=0        临时回到 dry-run，只输出计划不实际操作
   HYB_FARM_DEFAULT_ACTION=status 无参数运行时只查询状态
-  （如需改种用 HYB_FARM_SEED_ID 覆盖）
+  HYB_FARM_SEED_ID=赤阳莲       直接填写作物中文名，也兼容英文 ID
 
 青龙定时任务:
   */30 * * * * task 仓库目录/gongyizhan/hyb-farm.js
+  （每 30 分钟巡检一次；赤阳莲基础生长周期 108 小时，实际成熟以接口为准）
   （作物在 ${DEFAULT_WAIT_WINDOW_MIN} 分钟内成熟时脚本会原地守候补跑，无需缩短 cron）`);
 }
 
@@ -1187,7 +1190,7 @@ function buildPlantBody(config, args, summary = null) {
 
   const seedId = (args.seedId || config.defaultSeedId || '').trim();
   if (!seedId) {
-    throw new HybFarmError('缺少种子 ID，请设置 --seed-id 或 HYB_FARM_SEED_ID', { type: 'config_error' });
+    throw new HybFarmError('缺少作物名称或种子 ID，请设置 --seed-id 或 HYB_FARM_SEED_ID', { type: 'config_error' });
   }
 
   let quantity = args.quantity ?? config.defaultQuantity ?? null;
@@ -1367,7 +1370,10 @@ async function plantEmptySlots(config, args, state, summary, seedId, dryRun = fa
   let targetBody;
 
   try {
-    targetBody = buildPlantBody(config, { ...args, seedId }, currentSummary);
+    // 自定义请求体保持原样；普通种植先将中文名转换为接口 ID。
+    const resolvedSeedId = config.plantBodyRaw ? seedId
+      : resolveSeedId(seedId || args.seedId || config.defaultSeedId, currentState);
+    targetBody = buildPlantBody(config, { ...args, seedId: resolvedSeedId }, currentSummary);
   } catch (error) {
     results.push(resultFromError('批量种植', error));
     return { results, state: currentState, summary: currentSummary };
@@ -1420,23 +1426,37 @@ async function plantEmptySlots(config, args, state, summary, seedId, dryRun = fa
   return { results, state: currentState, summary: currentSummary };
 }
 
-// 从 seeds 目录用 名字/ID 双匹配定位主种（杨桃 starfruit）。返回 { seedId, seed } 或 null。
+// 从 seeds 目录用 名字/ID 双匹配定位主种（赤阳莲 sunfire_lotus）。返回 { seedId, seed } 或 null。
 function resolveMainSeed(config, state) {
   const seeds = getExplicitArray(state.seeds, ['seeds'], isSeedLike);
   const wanted = String(config.mainSeedId || '').trim().toLowerCase();
-  // 别名（starfruit/杨桃）只在目标确为默认主种时启用；用户覆盖 HYB_FARM_SEED_ID 后只按其精确匹配
-  const useAliases = wanted === MAIN_SEED_ID.toLowerCase();
+  // 默认主种的中文名和 ID 共用别名；其他作物按目录中的名称或 ID 精确匹配。
+  const useAliases = MAIN_SEED_ALIASES.some((alias) => alias.toLowerCase() === wanted);
   const aliases = useAliases ? MAIN_SEED_ALIASES.map((a) => a.toLowerCase()) : [];
   const matches = (v) => {
     const s = String(v || '').trim().toLowerCase();
     return s !== '' && (s === wanted || aliases.includes(s));
   };
   for (const seed of seeds) {
-    if (matches(seed?.id) || matches(seed?.seedId) || matches(seed?.name)) {
+    if (matches(seed?.id) || matches(seed?.seedId) || matches(getItemName(seed))) {
       return { seedId: String(seed.id || seed.seedId).trim(), seed };
     }
   }
   return null;
+}
+
+function resolveSeedId(value, state) {
+  const wanted = String(value || '').trim();
+  const resolved = resolveMainSeed({ mainSeedId: wanted }, state);
+  if (resolved) return resolved.seedId;
+  if (/\p{Script=Han}/u.test(wanted)) {
+    throw new HybFarmError(
+      `种子目录中未找到作物“${wanted}”，请检查 HYB_FARM_SEED_ID 或 --seed-id 中的中文名`,
+      { type: 'config_error' }
+    );
+  }
+  // 保留原有 ID 直传能力，兼容目录尚未收录的作物。
+  return wanted;
 }
 
 // VIP 专属作物在 VIP 失效时种植会失败，识别这类消息以便单独发通知提醒续费。
@@ -1520,6 +1540,8 @@ async function runAuto(config, args) {
   const dryRun = args.dryRun || !shouldExecute;
   const initialState = await fetchState(config);
   const initialSummary = summarizeState(initialState);
+  // 在收获等写操作前校验名称，补种和卖出均使用同一个接口 ID。
+  const seedId = resolveSeedId(config.mainSeedId, initialState);
   const results = [];
   let harvestResult = null;
 
@@ -1556,11 +1578,7 @@ async function runAuto(config, args) {
   }
   let workSummary = summarizeState(workState);
 
-  // 3. 定位主种（杨桃）。定位不到就回退到 config.mainSeedId 原样使用
-  const resolved = resolveMainSeed(config, workState);
-  const seedId = resolved ? resolved.seedId : config.mainSeedId;
-
-  // 4. 补种主种到空地。每次成功后按权威状态核验，接口部分完成时继续补齐本轮安全目标。
+  // 3. 补种主种到空地。每次成功后按权威状态核验，接口部分完成时继续补齐本轮安全目标。
   if (workSummary.plotSummary.empty > 0) {
     const plantRun = await plantEmptySlots(config, args, workState, workSummary, seedId, dryRun);
     results.push(...plantRun.results);
@@ -1570,7 +1588,7 @@ async function runAuto(config, args) {
     results.push(makeResult('批量种植', 'skipped', '没有空闲地块'));
   }
 
-  // 5. 卖出盈余：仅在本轮真收获了果实时才卖。
+  // 4. 卖出盈余：仅在本轮真收获了果实时才卖。
   //    关键安全前提——种子与果实同池，库存无法区分二者。只有本轮收获成功，
   //    才能确定库存里新增的是果实；否则（没成熟/没收获）库存里全是种子，绝不能卖。
   //    补种在收获后进行，会先消耗掉种子，故收获后刷新的库存即纯果实盈余。
@@ -1919,6 +1937,7 @@ module.exports = {
   performPlantBatch,
   requestJson,
   resolveMainSeed,
+  resolveSeedId,
   readNotificationState,
   recordIssueCooldowns,
   run,
