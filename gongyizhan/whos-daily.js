@@ -38,6 +38,7 @@ const DEFAULT_RATE_SCORE = 5;
 const DEFAULT_FRAME_ID_MAX = 106896533;
 const DEFAULT_FRAME_ID_SPAN = 3000000;
 const MAX_CANDIDATE_ATTEMPTS = 120;
+const MAX_CONSECUTIVE_ERRORS = 3;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const LOG_PREFIX = '[whos-daily]';
 const TASK_TITLE = 'whos.tv 每日任务';
@@ -808,8 +809,28 @@ function isFatalType(type) {
   return type === 'auth_failed' || type === 'challenge_required';
 }
 
+// 任务循环内的单次写请求：超时/socket 错误不再抛出，而是归为 'network_error' 交给调用方按"本次尝试失败"处理，
+// 避免一次瞬时超时中断整个循环；其他错误（含致命类型）照常抛出
+async function requestMutation(ctx, apiPath, options = {}) {
+  const { config, state, request, log } = ctx;
+  try {
+    const result = await request(config, state, apiPath, options);
+    return { result, analysis: analyzeMutationResponse(result) };
+  } catch (error) {
+    if (error.type !== 'network_error') throw error;
+    log(`${LOG_PREFIX} ${options.method || 'GET'} ${apiPath} 网络错误: ${scrubText(error.message)}`);
+    return { result: null, analysis: 'network_error' };
+  }
+}
+
+function consecutiveErrorMessage(type) {
+  return type === 'network_error'
+    ? `连续 ${MAX_CONSECUTIVE_ERRORS} 次网络错误（超时/连接失败），请检查网络后重跑`
+    : `连续 ${MAX_CONSECUTIVE_ERRORS} 次 ${type}`;
+}
+
 async function doRateAndFavorite(ctx) {
-  const { config, state, request, tasks, summary, log, mode, sleep, random } = ctx;
+  const { config, tasks, summary, log, mode, sleep, random } = ctx;
 
   let ratingNeeded = 5;
   let favoriteNeeded = 5;
@@ -839,6 +860,8 @@ async function doRateAndFavorite(ctx) {
 
   const sampler = createFrameIdSampler(config, random);
   const favorited = [];
+  // 提前挂到 ctx：即使循环中途抛出，取消收藏步骤也能拿到已收藏列表
+  ctx.favorited = favorited;
   let ratingCount = 0;
   let favoriteCount = 0;
   let attempts = 0;
@@ -859,8 +882,7 @@ async function doRateAndFavorite(ctx) {
     // Try favorite first if needed
     if (favoriteCount < favoriteNeeded) {
       await pause(PAUSE_MIN_MS, PAUSE_MAX_MS, sleep);
-      const favResult = await request(config, state, `/api/frames/${frameId}/favorite`, { method: 'POST' });
-      const favAnalysis = analyzeMutationResponse(favResult);
+      const { result: favResult, analysis: favAnalysis } = await requestMutation(ctx, `/api/frames/${frameId}/favorite`, { method: 'POST' });
 
       if (favAnalysis === 'ok') {
         favoriteCount++;
@@ -880,8 +902,7 @@ async function doRateAndFavorite(ctx) {
         const retryMs = getRetryAfterMs(favResult);
         log(`${LOG_PREFIX} 收藏遇 429，休眠 ${retryMs / 1000}s 后重试`);
         await sleep(retryMs);
-        const retryResult = await request(config, state, `/api/frames/${frameId}/favorite`, { method: 'POST' });
-        const retryAnalysis = analyzeMutationResponse(retryResult);
+        const { analysis: retryAnalysis } = await requestMutation(ctx, `/api/frames/${frameId}/favorite`, { method: 'POST' });
         if (retryAnalysis === 'ok') {
           favoriteCount++;
           favorited.push(frameId);
@@ -897,12 +918,12 @@ async function doRateAndFavorite(ctx) {
         }
       } else if (['auth_failed', 'challenge_required'].includes(favAnalysis)) {
         throw new WhosDailyError(`收藏遇 ${favAnalysis}，终止`, { type: favAnalysis });
-      } else if (favAnalysis === 'api_error') {
+      } else if (favAnalysis === 'api_error' || favAnalysis === 'network_error') {
         consecutiveErrors++;
-        log(`${LOG_PREFIX} 收藏 frame ${frameId} api_error (连续 ${consecutiveErrors})`);
-        if (consecutiveErrors >= 3) {
-          log(`${LOG_PREFIX} 连续 3 次 api_error，收藏任务中断`);
-          summary.favorite = { type: 'failed', error: 'api_error', current: favoriteCount, max: favoriteNeeded, message: '连续 API 错误' };
+        log(`${LOG_PREFIX} 收藏 frame ${frameId} ${favAnalysis} (连续 ${consecutiveErrors})`);
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          log(`${LOG_PREFIX} 连续 ${MAX_CONSECUTIVE_ERRORS} 次错误，收藏任务中断`);
+          summary.favorite = { type: 'failed', error: favAnalysis, current: favoriteCount, max: favoriteNeeded, message: consecutiveErrorMessage(favAnalysis) };
           favoriteNeeded = favoriteCount;
         }
       }
@@ -911,8 +932,7 @@ async function doRateAndFavorite(ctx) {
     // Try rating if needed
     if (ratingCount < ratingNeeded) {
       await pause(PAUSE_MIN_MS, PAUSE_MAX_MS, sleep);
-      const rateResult = await request(config, state, `/api/frames/${frameId}/rate`, { method: 'POST', body: { score: config.rateScore } });
-      const rateAnalysis = analyzeMutationResponse(rateResult);
+      const { result: rateResult, analysis: rateAnalysis } = await requestMutation(ctx, `/api/frames/${frameId}/rate`, { method: 'POST', body: { score: config.rateScore } });
 
       if (rateAnalysis === 'ok') {
         ratingCount++;
@@ -930,8 +950,7 @@ async function doRateAndFavorite(ctx) {
         const retryMs = getRetryAfterMs(rateResult);
         log(`${LOG_PREFIX} 评分遇 429，休眠 ${retryMs / 1000}s 后重试`);
         await sleep(retryMs);
-        const retryResult = await request(config, state, `/api/frames/${frameId}/rate`, { method: 'POST', body: { score: config.rateScore } });
-        const retryAnalysis = analyzeMutationResponse(retryResult);
+        const { analysis: retryAnalysis } = await requestMutation(ctx, `/api/frames/${frameId}/rate`, { method: 'POST', body: { score: config.rateScore } });
         if (retryAnalysis === 'ok') {
           ratingCount++;
           log(`${LOG_PREFIX} 评分 frame ${frameId} 重试成功 (${ratingCount}/${ratingNeeded})`);
@@ -946,12 +965,12 @@ async function doRateAndFavorite(ctx) {
         }
       } else if (['auth_failed', 'challenge_required'].includes(rateAnalysis)) {
         throw new WhosDailyError(`评分遇 ${rateAnalysis}，终止`, { type: rateAnalysis });
-      } else if (rateAnalysis === 'api_error') {
+      } else if (rateAnalysis === 'api_error' || rateAnalysis === 'network_error') {
         consecutiveErrors++;
-        log(`${LOG_PREFIX} 评分 frame ${frameId} api_error (连续 ${consecutiveErrors})`);
-        if (consecutiveErrors >= 3) {
-          log(`${LOG_PREFIX} 连续 3 次 api_error，评分任务中断`);
-          summary.rating = { type: 'failed', error: 'api_error', current: ratingCount, max: ratingNeeded, message: '连续 API 错误' };
+        log(`${LOG_PREFIX} 评分 frame ${frameId} ${rateAnalysis} (连续 ${consecutiveErrors})`);
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          log(`${LOG_PREFIX} 连续 ${MAX_CONSECUTIVE_ERRORS} 次错误，评分任务中断`);
+          summary.rating = { type: 'failed', error: rateAnalysis, current: ratingCount, max: ratingNeeded, message: consecutiveErrorMessage(rateAnalysis) };
           ratingNeeded = ratingCount;
         }
       }
@@ -974,9 +993,6 @@ async function doRateAndFavorite(ctx) {
       summary.favorite = { type: 'partial', current: favoriteCount, max: favoriteNeeded, attempts, kept: false, message: `候选 ID 已用尽（${attempts} 次尝试，命中 ${favoriteCount} 个）` };
     }
   }
-
-  // Store favorited list for unfavorite step
-  ctx.favorited = favorited;
 }
 
 async function doUnfavorite(ctx) {
@@ -1074,7 +1090,7 @@ async function doUnfavorite(ctx) {
 }
 
 async function doShare(ctx) {
-  const { config, state, request, tasks, summary, log, mode, sleep } = ctx;
+  const { tasks, summary, log, mode, sleep } = ctx;
 
   let shareNeeded = 5;
   if (mode === 'progress' && tasks.task_share) {
@@ -1089,14 +1105,16 @@ async function doShare(ctx) {
 
   log(`${LOG_PREFIX} 执行分享任务（需 ${shareNeeded} 次）`);
   let shareCount = 0;
+  let consecutiveErrors = 0;
 
-  for (let i = 0; i < shareNeeded; i++) {
+  // 网络错误不计入分享次数，只累计连续错误；其他分支要么计数、要么 break，循环有界
+  while (shareCount < shareNeeded) {
     await pause(PAUSE_MIN_MS, PAUSE_MAX_MS, sleep);
-    const result = await request(config, state, '/api/user/tasks/task_share/complete', { method: 'POST' });
-    const analysis = analyzeMutationResponse(result);
+    const { result, analysis } = await requestMutation(ctx, '/api/user/tasks/task_share/complete', { method: 'POST' });
 
     if (analysis === 'ok') {
       shareCount++;
+      consecutiveErrors = 0;
       log(`${LOG_PREFIX} 分享 (${shareCount}/${shareNeeded}) 成功`);
     } else if (analysis === 'limit') {
       log(`${LOG_PREFIX} 分享已达上限`);
@@ -1105,10 +1123,10 @@ async function doShare(ctx) {
       const retryMs = getRetryAfterMs(result);
       log(`${LOG_PREFIX} 分享遇 429，休眠 ${retryMs / 1000}s 后重试`);
       await sleep(retryMs);
-      const retryResult = await request(config, state, '/api/user/tasks/task_share/complete', { method: 'POST' });
-      const retryAnalysis = analyzeMutationResponse(retryResult);
+      const { analysis: retryAnalysis } = await requestMutation(ctx, '/api/user/tasks/task_share/complete', { method: 'POST' });
       if (retryAnalysis === 'ok') {
         shareCount++;
+        consecutiveErrors = 0;
         log(`${LOG_PREFIX} 分享 (${shareCount}/${shareNeeded}) 重试成功`);
       } else if (retryAnalysis === 'rate_limited') {
         log(`${LOG_PREFIX} 分享第二次 429，任务失败`);
@@ -1122,6 +1140,15 @@ async function doShare(ctx) {
     } else if (isFatalType(analysis)) {
       summary.share = { type: 'failed', error: analysis, current: shareCount, max: shareNeeded };
       throw new WhosDailyError(`分享遇 ${analysis}，终止后续写操作`, { type: analysis });
+    } else if (analysis === 'network_error') {
+      consecutiveErrors++;
+      if (consecutiveErrors < MAX_CONSECUTIVE_ERRORS) {
+        log(`${LOG_PREFIX} 分享 network_error (连续 ${consecutiveErrors})，重试`);
+        continue;
+      }
+      log(`${LOG_PREFIX} 连续 ${MAX_CONSECUTIVE_ERRORS} 次网络错误，分享任务中断`);
+      summary.share = { type: 'failed', error: analysis, current: shareCount, max: shareNeeded, message: consecutiveErrorMessage(analysis) };
+      break;
     } else {
       log(`${LOG_PREFIX} 分享失败: ${analysis}`);
       summary.share = { type: 'failed', error: analysis, current: shareCount, max: shareNeeded };
@@ -1210,6 +1237,11 @@ async function run(config, args, deps = {}) {
       await step();
     } catch (error) {
       recordError(stage, error);
+      // 取消收藏中途异常：账号里仍留有本轮收藏，通知里如实标记为"已保留"
+      if (stage === 'unfavorite' && summary.favorite) {
+        summary.favorite.kept = true;
+        summary.favorite.keptReason = `取消收藏中断（${error.type || 'runtime_error'}）`;
+      }
       if (isFatalType(error.type)) {
         fatal = error.type;
         log(`${LOG_PREFIX} ❌ ${stage} 阶段遇 ${fatal}，停止后续写操作`);
