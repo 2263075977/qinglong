@@ -22,6 +22,7 @@ const IMPORTANT_SUCCESS_ACTIONS = new Set(['一键收获', '交易所卖出']);
 const ISSUE_DEFINITIONS = [
   ['auth_failed', 'Cookie 失效', '🍪'],
   ['challenge_required', 'Cloudflare 验证', '🧩'],
+  ['rate_limited', '访问限流', '⏳'],
   ['warehouse_full', '仓库已满', '📦'],
   ['vip_required', 'VIP 失效', '👑'],
   ['schema_changed', '响应结构异常', '🧱'],
@@ -68,6 +69,12 @@ const DEFAULT_WAIT_WINDOW_MIN = 8; // 0 表示关闭守候
 const DEFAULT_WAIT_ROUNDS = 1; // 每次运行最多补跑的轮数
 const WAIT_BUFFER_MS = 20 * 1000; // 服务端时钟略慢时的缓冲
 const HARVEST_CHALLENGE_RETRY_DELAYS_MS = [5 * 1000, 10 * 1000];
+// 站点前置 Cloudflare 等候室（/__vwr/）：同一出口 IP 并发访问过多时返回 HTTP 429 + Retry-After。
+// 请求未到达源站，重试安全；按 Retry-After 与指数退避取较大值等待，整轮运行共享等待预算。
+const DEFAULT_RATE_LIMIT_WAIT_SEC = 120; // 每次运行累计最多等待秒数，0 表示不重试
+const RATE_LIMIT_BASE_DELAY_MS = 5 * 1000;
+const RATE_LIMIT_MAX_DELAY_MS = 30 * 1000;
+const STATE_REQUEST_GAP_MS = 1000; // 状态查询的连续 GET 之间留间隔，避免突发并发
 
 class HybFarmError extends Error {
   constructor(message, details = {}) {
@@ -227,6 +234,10 @@ function getConfig() {
     // 近成熟守候
     waitWindowMs: parseNonNegativeInteger(process.env.HYB_FARM_WAIT_WINDOW_MIN, DEFAULT_WAIT_WINDOW_MIN) * 60 * 1000,
     maxWaitRounds: parseNonNegativeInteger(process.env.HYB_FARM_WAIT_ROUNDS, DEFAULT_WAIT_ROUNDS),
+    // 429 限流退避：整轮运行共享的剩余等待预算（毫秒）
+    rateLimitBudget: {
+      remainingMs: parseNonNegativeInteger(process.env.HYB_FARM_RATE_LIMIT_WAIT_SEC, DEFAULT_RATE_LIMIT_WAIT_SEC) * 1000,
+    },
   };
 }
 
@@ -430,6 +441,7 @@ function printUsage() {
   HYB_FARM_AUTO_EXECUTE  可选，auto 真实执行，默认开启，设 0 回到 dry-run
   HYB_FARM_WAIT_WINDOW_MIN 可选，近成熟守候窗口（分钟），默认 ${DEFAULT_WAIT_WINDOW_MIN}，设 0 关闭
   HYB_FARM_WAIT_ROUNDS   可选，每次运行最多守候补跑轮数，默认 ${DEFAULT_WAIT_ROUNDS}
+  HYB_FARM_RATE_LIMIT_WAIT_SEC 可选，遇 HTTP 429 限流时每次运行累计最多等待秒数，默认 ${DEFAULT_RATE_LIMIT_WAIT_SEC}，设 0 不重试
   HYB_FARM_MIN_ENERGY    可选，护理前保留的体力阈值，默认 ${DEFAULT_MIN_ENERGY}
   HYB_FARM_AUTO_SELL     可选，auto 自动卖出盈余果实，默认开启，设 0 关闭
   HYB_FARM_SELL_RATIO    可选，当前价 ≥ 7日均价×该值才卖，默认 ${DEFAULT_SELL_RATIO}
@@ -556,12 +568,12 @@ function isChallengeMessage(message) {
     text.includes('nonce') ||
     text.includes('token 为空') ||
     text.includes('验证') ||
-    text.includes('人机') ||
-    text.includes('频率限制');
+    text.includes('人机');
 }
 
 function classifyFailure(statusCode, message, looksLikeHtml) {
-  if (looksLikeHtml || statusCode === 429 || isChallengeMessage(message)) return 'challenge_required';
+  if (statusCode === 429 || String(message || '').includes('频率限制')) return 'rate_limited';
+  if (looksLikeHtml || isChallengeMessage(message)) return 'challenge_required';
   if (statusCode === 401 || statusCode === 403 || isAuthMessage(message)) return 'auth_failed';
   if (statusCode >= 500) return 'api_error';
   return 'api_error';
@@ -593,7 +605,48 @@ function scrubResponse(value) {
   return clone;
 }
 
-function requestJson(config, apiPath, options = {}) {
+function parseRetryAfterMs(value, nowMs = Date.now()) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) return Number(text) * 1000;
+  const dateMs = Date.parse(text);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : null;
+}
+
+function getRateLimitDelayMs(error, attempt) {
+  const backoffMs = Math.min(RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1), RATE_LIMIT_MAX_DELAY_MS);
+  const retryAfterMs = getNumber(error?.details?.retryAfterMs, null);
+  return Math.min(Math.max(backoffMs, retryAfterMs ?? 0), RATE_LIMIT_MAX_DELAY_MS);
+}
+
+// 429 限流时按预算退避重试；其它错误原样抛出。budget 缺省时不重试。
+async function requestJson(config, apiPath, options = {}, dependencies = {}) {
+  const request = dependencies.request || requestJsonOnce;
+  const wait = dependencies.wait || sleep;
+  const log = dependencies.log || console.log;
+  const budget = config.rateLimitBudget;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await request(config, apiPath, options);
+    } catch (error) {
+      if (!(error instanceof HybFarmError) || error.type !== 'rate_limited' || !budget) throw error;
+      const delayMs = getRateLimitDelayMs(error, attempt);
+      if (budget.remainingMs < delayMs) {
+        error.message += '，已用完本轮限流等待预算';
+        throw error;
+      }
+      budget.remainingMs -= delayMs;
+      log(
+        `${LOG_PREFIX} ${options.method || 'GET'} ${apiPath} 被限流（HTTP ${error.details?.statusCode}` +
+        `${error.details?.cfRay ? `，cf-ray ${error.details.cfRay}` : ''}），` +
+        `${formatDuration(delayMs)}后重试（第 ${attempt} 次，剩余预算 ${formatDuration(budget.remainingMs)}）`
+      );
+      await wait(delayMs);
+    }
+  }
+}
+
+function requestJsonOnce(config, apiPath, options = {}) {
   const method = options.method || 'GET';
   const body = options.body === undefined || options.body === null
     ? null
@@ -663,15 +716,20 @@ function requestJson(config, apiPath, options = {}) {
 
         if (statusCode < 200 || statusCode >= 300) {
           const apiMessage = parsed ? getMessage(parsed) : '';
+          const isWaitingRoom = statusCode === 429 && responseBody.includes('/__vwr/');
           const message = apiMessage || (
-            looksLikeHtml
-              ? `服务器返回 HTML，可能触发 Cloudflare/CAP/频率限制（HTTP ${statusCode}）`
-              : `HTTP ${statusCode} - ${method} ${apiPath}`
+            isWaitingRoom
+              ? '站点等候室限流：同一网络并发访问过多（HTTP 429）'
+              : looksLikeHtml
+                ? `服务器返回 HTML，可能触发 Cloudflare/CAP/频率限制（HTTP ${statusCode}）`
+                : `HTTP ${statusCode} - ${method} ${apiPath}`
           );
           reject(new HybFarmError(message, {
             type: classifyFailure(statusCode, message, looksLikeHtml),
             statusCode,
             contentType,
+            cfRay: String(res.headers['cf-ray'] || ''),
+            retryAfterMs: parseRetryAfterMs(res.headers['retry-after']),
             body: scrubBody(responseBody),
           }));
           return;
@@ -1046,7 +1104,8 @@ async function fetchState(config) {
   ];
   const state = {};
 
-  for (const [key, apiPath, required] of endpoints) {
+  for (const [index, [key, apiPath, required]] of endpoints.entries()) {
+    if (index > 0) await sleep(STATE_REQUEST_GAP_MS);
     try {
       const result = await requestJson(config, apiPath);
       assertSuccess(result, `获取 ${key} 失败`);
@@ -1219,6 +1278,7 @@ function getResultIcon(type) {
   if (type === 'skipped') return '⏭️';
   if (type === 'dry_run') return '🧪';
   if (type === 'challenge_required') return '🧩';
+  if (type === 'rate_limited') return '⏳';
   if (type === 'warehouse_full') return '📦';
   if (type === 'vip_required') return '👑';
   return '❌';
@@ -1928,6 +1988,7 @@ module.exports = {
   normalizeNotificationState,
   parseArgs,
   parseMatureTimestamp,
+  parseRetryAfterMs,
   parseWarehouse,
   parseFreeSlots,
   parseRecyclePrices,
