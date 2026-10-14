@@ -1293,7 +1293,7 @@ function formatResult(summary) {
 
   const fatal = summary.errors.find(e => e.type === 'auth_failed');
   if (fatal && !summary.signin) {
-    lines.push('❌ 登录失败，请更新 WHOS_COOKIE');
+    lines.push('❌ Cookie 已失效,请重新登录获取后更新 WHOS_COOKIE');
     return lines.join('\n');
   }
 
@@ -1369,7 +1369,7 @@ function formatResult(summary) {
       lines.push(`  [${err.stage}] ${err.type}: ${err.message}`);
     }
     if (summary.errors.some(e => e.type === 'auth_failed')) {
-      lines.push('请更新环境变量 WHOS_COOKIE');
+      lines.push('❌ Cookie 已失效,请重新登录获取后更新环境变量 WHOS_COOKIE');
     }
   }
 
@@ -1446,7 +1446,8 @@ async function main() {
     console.log(`\n${LOG_PREFIX} ========== 执行结果 ==========`);
     console.log(resultText);
 
-    await sendNotification(TASK_TITLE, resultText);
+    const fatalAuth = summary.errors.some(e => e.type === 'auth_failed');
+    await sendNotification(fatalAuth ? `${TASK_TITLE} · Cookie 已失效` : TASK_TITLE, resultText);
     notified = true;
 
     process.exitCode = decideExitCode(summary);
@@ -1454,7 +1455,7 @@ async function main() {
     console.error(`${LOG_PREFIX} ❌ 执行失败: ${scrubText(error.message)}`);
 
     if (!notified && error.type !== 'config_error') {
-      const failureText = `❌ 执行失败\n\n错误类型: ${error.type || 'runtime_error'}\n错误信息: ${scrubText(error.message)}`;
+      const failureText = `❌ 发生异常:执行失败\n\n错误类型: ${error.type || 'runtime_error'}\n错误信息: ${scrubText(error.message)}`;
       await sendNotification(TASK_TITLE, failureText).catch(() => {});
     }
 

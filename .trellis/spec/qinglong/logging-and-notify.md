@@ -188,6 +188,37 @@ async function notify(title, content) {
 
 注意 `console.error` 只打印 `error.message`,**不打印整个 error 对象**(可能含响应体里的凭证)。
 
+### 失败通知必须对齐下游分流关键词(青龙 Node-RED)
+
+青龙的通知链路是 `sendNotify.js` → `POST /ql-notify` → Node-RED function node「配置区:双TG Bot分流」→ 双 TG Bot。分流**唯一依据**是通知文本里的关键词:
+
+- 关键词表:`已失效, 无效用户, 失效, cookie失效, ck失效, 登录失效, 账号失效, 账号过期, 重新登录, 发生异常, invalid, expired`(该表由 Node-RED 节点维护,**不在本仓库**,改动需人工同步)
+- 待判定文本 = **标题 + 正文拼接**(标题也参与匹配)
+- 匹配规则:大小写不敏感;对「原文小写」与「去掉全部空白后的紧凑串」**各匹配一次**,任一命中即算
+- 命中 → 失效提醒 Bot(且 `sendNormalWhenAlert: false`,**不再**发普通 Bot);未命中 → 普通 Bot
+
+因此失败文案必须按失败类别对齐关键词:
+
+| 类别 | 要求 | 示例 |
+|------|------|------|
+| 凭证 / 登录类失败 | 标题或正文**至少**覆盖 `已失效`(或 `失效`/`cookie失效`)与 `重新登录`,并保留要更新的环境变量名 | `❌ Cookie 已失效,请重新登录获取后更新 HYB_FARM_COOKIE` |
+| 顶层异常兜底 | 文案统一以 `❌ 发生异常:` 开头 | `❌ 发生异常:执行失败\n\n错误类型: ...` |
+| 非凭证类失败(网络超时、`schema_changed`、任务级失败) | **不得**引入上述关键词,避免误入失效 Bot | `⚠️ 进度接口结构未识别(schema_changed),请维护`、`❌ 签到失败: ...` |
+
+等价匹配函数(人工核对 / 新增脚本自检用,与 Node-RED 侧一致):
+
+```js
+const ALERT_KEYWORDS = '已失效,无效用户,失效,cookie失效,ck失效,登录失效,账号失效,账号过期,重新登录,发生异常,invalid,expired';
+function matchesAlertRouting(text) {
+  const lower = String(text).toLowerCase();
+  const compact = lower.replace(/\s+/g, '');
+  return ALERT_KEYWORDS.split(',').map(k => k.trim()).filter(Boolean)
+    .some(k => lower.includes(k) || compact.includes(k.replace(/\s+/g, '')));
+}
+```
+
+**新增脚本收尾自检**:把凭证/登录类失败文案与顶层兜底文案喂给 `matchesAlertRouting`,必须返回 `true`;把网络超时、`schema_changed`、任务级失败文案喂进去,必须返回 `false`。
+
 ### 发送时机
 
 | 时机 | 要求 |

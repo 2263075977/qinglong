@@ -37,17 +37,18 @@
 |------|------|
 | [directory-structure.md](./directory-structure.md) | 脚本放哪、单脚本自包含原则、不可手改的文件 |
 | [env-and-config.md](./env-and-config.md) | 环境变量命名前缀、必需/可选约定、多账号写法 |
-| [logging-and-notify.md](./logging-and-notify.md) | 脚本头注释格式、日志前缀与 emoji、sendNotify 加载与降级 |
+| [logging-and-notify.md](./logging-and-notify.md) | 脚本头注释格式、日志前缀与 emoji、sendNotify 加载与降级、失败通知对齐 Node-RED 分流关键词 |
 | [error-handling.md](./error-handling.md) | 自定义错误类、顶层兜底、429 限流退避 |
 | [quality-guidelines.md](./quality-guidelines.md) | 本地能做什么检查(唯一能自动化的部分)、代码审阅要点 |
 
 ---
 
-## 三条最容易被违反的约定
+## 四条最容易被违反的约定
 
 1. **单脚本自包含** —— 除 `sendNotify` 外,不要在脚本间抽公共 utils。每个脚本必须能单独复制进青龙面板运行。
 2. **`gongyizhan/newapi.js` 不要手改** —— 它是压缩产物(71 行 / 434KB)。
 3. **文档与注释用中文** —— 与仓库现状一致(日志、通知文案、错误提示全为中文)。
+4. **失败通知对齐下游分流关键词** —— 凭证 / 登录类失败文案必须覆盖 `已失效`/`重新登录`,顶层异常兜底用 `❌ 发生异常:`,非凭证类失败**不得**引入这些词(详见 [logging-and-notify.md](./logging-and-notify.md))。
 
 ---
 
