@@ -21,36 +21,43 @@ the rest conversationally.
 
 ## Status (update the checkboxes as you complete each item)
 
-- [ ] Fill backend guidelines
-- [ ] Fill frontend guidelines
-- [ ] Add code examples
+- [x] Fill backend guidelines → 已改为 `qinglong/` 单层(详见下方"本项目适配说明")
+- [x] Fill frontend guidelines → **不适用,已删除**
+- [x] Add code examples
+
+---
+
+## 本项目适配说明(2026-10 实际执行)
+
+`trellis init` 把本仓库探测为 fullstack,生成了 `backend/` + `frontend/` 双层
+spec。实际仓库是**青龙签到脚本集合**(无 `package.json`、无前端代码),故:
+
+1. 删除 `.trellis/spec/frontend/`(6 个 React/TS 模板文件,本仓库无对应代码)
+2. `.trellis/spec/backend/` 重命名为 `.trellis/spec/qinglong/`,并按真实关注点重组:
+   - `index.md` —— 仓库定位、运行环境、三条最易违反的约定
+   - `directory-structure.md` —— 单脚本自包含原则、不可手改文件
+   - `env-and-config.md` —— 环境变量前缀与命名现状
+   - `logging-and-notify.md` —— `cron`/`new Env` 头声明、日志前缀、sendNotify 加载
+   - `error-handling.md` —— 站点专属错误类、顶层兜底、429 预算退避
+   - `quality-guidelines.md` —— 本地可验证范围、审阅清单、提交约定
+3. 删除模板生成的 `database-guidelines.md`(本仓库无数据库)
+4. spec **使用中文**(有意覆盖模板的英文要求):仓库内注释、日志、通知文案全为中文
+5. 补充根目录 `.gitignore`(`__pycache__/`、`*.pyc`、`node_modules/`)
 
 ---
 
 ## Spec files to populate
 
+### 已填充的规范(替代原 backend/frontend 模板)
 
-### Backend guidelines
-
-| File | What to document |
-|------|------------------|
-| `.trellis/spec/backend/directory-structure.md` | Where different file types go (routes, services, utils) |
-| `.trellis/spec/backend/database-guidelines.md` | ORM, migrations, query patterns, naming conventions |
-| `.trellis/spec/backend/error-handling.md` | How errors are caught, logged, and returned |
-| `.trellis/spec/backend/logging-guidelines.md` | Log levels, format, what to log |
-| `.trellis/spec/backend/quality-guidelines.md` | Code review standards, testing requirements |
-
-
-### Frontend guidelines
-
-| File | What to document |
-|------|------------------|
-| `.trellis/spec/frontend/directory-structure.md` | Component/page/hook organization |
-| `.trellis/spec/frontend/component-guidelines.md` | Component patterns, props conventions |
-| `.trellis/spec/frontend/hook-guidelines.md` | Custom hook naming, patterns |
-| `.trellis/spec/frontend/state-management.md` | State library, patterns, what goes where |
-| `.trellis/spec/frontend/type-safety.md` | TypeScript conventions, type organization |
-| `.trellis/spec/frontend/quality-guidelines.md` | Linting, testing, accessibility |
+| 文件 | 记录内容 |
+|------|----------|
+| `.trellis/spec/qinglong/index.md` | 仓库定位、青龙运行环境、规范索引 |
+| `.trellis/spec/qinglong/directory-structure.md` | 单脚本自包含原则、命名约定、`newapi.js` 勿手改 |
+| `.trellis/spec/qinglong/env-and-config.md` | 站点前缀命名、`_COOKIE` vs `_ACCOUNTS`、多账号 JSON、`.env` 优先级 |
+| `.trellis/spec/qinglong/logging-and-notify.md` | `cron:`/`new Env()` 头格式、日志前缀与脱敏、sendNotify 多路径加载 |
+| `.trellis/spec/qinglong/error-handling.md` | 9 个站点错误类、顶层兜底结构、429 预算退避 |
+| `.trellis/spec/qinglong/quality-guidelines.md` | 本地唯一可验证项(`node --check` / `py_compile`)、审阅清单 |
 
 
 ### Thinking guides (already populated)
@@ -82,6 +89,11 @@ usually much faster than documenting from scratch.
 | `CONVENTIONS.md` / `.aider.conf.yml` | aider |
 | `CONTRIBUTING.md` | General project conventions |
 | `.editorconfig` | Editor formatting rules |
+
+> **本项目实际结果**:仓库内无任何上述约定文档(仅有一个 Trellis 自己生成的 `AGENTS.md`,
+> 其中除 TRELLIS 托管块外无项目约定)。因此 spec 完全基于**代码勘察**写成
+> (逐脚本提取头部声明、环境变量、错误类、通知与退避实现,并记录真实行号作为证据)。
+> `.trellis/spec/guides/` 的通用思考指南保留未改(内容对本项目适用)。
 
 ### Step 2: Analyze the codebase for anything not covered by existing docs
 
