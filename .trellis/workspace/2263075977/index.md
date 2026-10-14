@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
+- **Total Sessions**: 2
 - **Last Active**: 2026-10-14
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~47 | Active |
+| `journal-1.md` | ~69 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-10-14 | whos-daily 失败通知对齐失效提醒 Bot 分流关键词 | `832f937` | `main` |
 | 1 | 2026-10-14 | 初始化 Trellis 并按真实约定填充 spec | `85d564f`, `ce9939e` | `main` |
 <!-- @@@/auto:session-history -->
 

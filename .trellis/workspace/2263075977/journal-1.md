@@ -45,3 +45,25 @@
 ### Next Steps
 
 - 无。bootstrap 任务可归档。
+
+
+## Session 2: whos-daily 失败通知对齐失效提醒 Bot 分流关键词
+<!-- trellis-session: v=2 fp=9b31ade0bbaeb243 -->
+
+**Date**: 2026-10-14
+**Task**: whos-daily 失败通知对齐失效提醒 Bot 分流关键词
+**Branch**: `main`
+
+### Summary
+
+定位 whos.tv 每日任务 Cookie 失效时未进青龙失效提醒 Bot 的根因:通知确实发出且 exitCode=1,但失败文案不含 Node-RED「双TG Bot分流」节点的关键词(表里是「登录失效」,脚本写「登录失败」;表里有「已失效/失效」,通知正文零覆盖),whos-daily 是全仓库唯一漏网脚本。按用户裁定 D1=方案 A(仅凭证/登录类失败 + 顶层异常兜底进 alertBot),改 whos-daily.js 四处文案:会话验证失败与中途 auth_failed 熔断改为「❌ Cookie 已失效,请重新登录获取后更新 WHOS_COOKIE」、标题在 auth_failed 时追加「· Cookie 已失效」、顶层兜底改「❌ 发生异常:执行失败」。同步把「失败通知必须对齐下游分流关键词」固化进 spec(关键词表 + 匹配规则 + 等价自检函数,index.md 新增第 4 条最易违反约定)。验证:node --check 通过;AC1-3 命中关键词,AC10 负向(schema_changed/任务级失败/全成功)命中 0。检查子代理额外发现 run() 内部从不 throw(失败均被 recordError 吞下并 return summary),故顶层 catch 只接设计外故障,加「发生异常」不会误将常规网络超时送入失效 Bot。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `832f937` | fix(gongyizhan): whos-daily 失败通知对齐失效提醒分流关键词 |
+
+### Status
+
+[OK] **Completed**
