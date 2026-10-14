@@ -1,3 +1,0 @@
-{"file": ".trellis/spec/qinglong/logging-and-notify.md", "reason": "核对异常路径必发通知、降级行为、凭证不外泄"}
-{"file": ".trellis/spec/qinglong/error-handling.md", "reason": "核对失败分类与文案一致性(含本次新增约定)"}
-{"file": ".trellis/spec/qinglong/quality-guidelines.md", "reason": "Quality Check 段落:语法检查与 diff 范围核对"}

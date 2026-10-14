@@ -1,3 +1,0 @@
-{"file": ".trellis/spec/qinglong/logging-and-notify.md", "reason": "通知加载/降级/发送时机约定;异常结束必须也发通知"}
-{"file": ".trellis/spec/qinglong/error-handling.md", "reason": "失败分类表与凭证失效文案范例(:113 / :206),改造后需同步"}
-{"file": ".trellis/spec/qinglong/quality-guidelines.md", "reason": "改完自检项:语法检查命令、脱敏、不新建依赖"}
