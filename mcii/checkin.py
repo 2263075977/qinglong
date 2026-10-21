@@ -828,8 +828,121 @@ def build_and_check_notification(results):
 # 通知（多候选路径查找 sendNotify，失败降级 print，绝不因通知中断任务）
 # --------------------------------------------------------------------------
 
+# 查找必须有界：青龙面板的 /ql/data/scripts 可能有上千个脚本目录，无界递归/无界展开会
+# 在每次启动时拖慢任务。下面四个常量分工明确，每个都必须真能触发（不能摆一个永不可达的数字）。
+#
+# 注意：候选目录是**两遍构建**（见 _candidate_dirs）：先占固定位置，再单独做子目录展开，
+# 两遍各有独立预算，互不打架。
+MAX_UP_LEVELS = 3            # 从脚本目录向上最多走 3 代：仓库通常只有 <repo>/mcii/ 一层，
+                             #   向上 3 代足够覆盖 <repo>、<repo>/.. 这类常见落位，再往上就出仓库了
+MAX_CHILDREN_PER_ROOT = 40   # 单个根最多展开多少个子目录：防止某一个巨型根（如平铺了
+                             #   上百个脚本的 /ql/data/scripts）独吞整个展开预算；必须小于
+                             #   MAX_EXPANSIONS 才有意义（曾写成 200，而总闸只有 60，永不可达）
+MAX_EXPANSIONS = 50          # 子目录展开产物总数：多个根共享的展开预算，只统计真正 add 的目录
+MAX_CANDIDATES = 60          # 候选目录总数上限（固定位置 + 展开），最后一道硬闸
+
+# 降级告警文案（模块级常量：--selfcheck 直接断言同一份文本，避免两处漂移）。
+# ⚠️ 文案**不得**含失效分流关键词（已失效/失效/expired/invalid/重新登录/发生异常 等）；
+#    它只走 log()（console / 面板日志），**不**拼进 build_notification() 的通知正文。
+MSG_SEND_NOTIFY_MISSING = "⚠️ 未找到 sendNotify.py，本次通知未发送（已搜索 %d 个目录）"
+MSG_SEND_NOTIFY_FIX = (
+    "⚠️ 修复：把 sendNotify.py 放到脚本同目录，"
+    "或复制 fuliba/sendNotify.py 到青龙脚本根 /ql/data/scripts/"
+)
+
+# 一轮运行最多会调 2–3 次通知（配置缺失分支 + 结果汇总），重复刷屏会让人关掉通知，
+# 所以降级告警用模块级 flag 保证只打一次。
+_send_notify_missing_warned = False
+
+
+def _safe_listdir(path):
+    """列目录，权限不足/不存在一律吞掉返回空列表（不能让通知查找把任务搞崩）。"""
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def _candidate_dirs():
+    """按优先级返回可能存放 sendNotify.py 的目录。有界：不递归、层数与子目录数都有硬上限。
+
+    **两遍构建**（关键，不要写成一遍）：
+      · 第一遍只加**固定位置**（脚本同目录 → 逐代向上 → cwd → 两个 /ql 字面路径 +
+        它们的 function 子目录），这些位置永远吃得下，不会被子目录扫描挤掉；
+      · 第二遍才做**子目录展开**，用独立预算 MAX_EXPANSIONS，且只 add 真目录。
+
+    为什么必须分两遍：青龙面板的 /ql/data/scripts 是**平铺**着上百个脚本的目录。
+    若边加固定位置边展开、共用一个 MAX_CANDIDATES，它作为 generation 0 的父目录展开时会
+    把平铺条目全部塞进候选、吃光额度，导致后面的 /ql/data/scripts/function
+    （标准候选位，function/sendNotify.py 的实际落点）被挤出列表 —— 于是**老版本能找到、
+    新版本找不到**，纯回归。分两遍后固定位置先占位，展开走自己的预算，互不干扰。
+
+    为什么只展开最近两代：脚本在 <repo>/mcii/ 时，generation 0 的父目录正好是 <repo>，
+    展开后覆盖 <repo>/fuliba/ —— 即「同仓库不同子目录」这一核心修复点；再往上的代
+    只加自己，避免在 /ql 这种大目录下做多余扫描。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    out, seen = [], set()
+
+    def add(path):
+        if len(out) >= MAX_CANDIDATES:
+            return
+        try:
+            resolved = os.path.abspath(path)
+        except Exception:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        out.append(resolved)
+
+    # —— 第一遍：固定位置（约 10 个，永远吃得下） ——
+    add(here)  # 1) 脚本同目录
+    roots = []
+    cur = here
+    for generation in range(MAX_UP_LEVELS):  # 2) 逐代向上
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:  # 到文件系统根了
+            break
+        add(parent)
+        if generation < 2:  # 只对最近两代展开子目录
+            roots.append(parent)
+        cur = parent
+
+    add(os.getcwd())  # 3) cwd
+    for base in ("/ql/data/scripts", "/ql/scripts"):
+        add(base)
+        add(os.path.join(base, "function"))
+
+    # —— 第二遍：子目录展开（独立预算，只取目录） ——
+    expanded = 0
+    for root in roots:
+        for name in sorted(_safe_listdir(root))[:MAX_CHILDREN_PER_ROOT]:
+            if expanded >= MAX_EXPANSIONS:
+                break
+            sub = os.path.join(root, name)
+            if not os.path.isdir(sub):  # 只要真目录；平铺的脚本文件跳过
+                continue
+            add(sub)
+            expanded += 1
+    return out
+
+
+def _warn_send_notify_missing(searched):
+    """降级不再静默：找不到通知模块时打一次 ⚠️ 告警，说明未发送 + 该放哪。
+
+    只打一次（模块级 flag）；只走 log()，不改退出码、不中断任务。
+    """
+    global _send_notify_missing_warned
+    if _send_notify_missing_warned:
+        return
+    _send_notify_missing_warned = True
+    log(MSG_SEND_NOTIFY_MISSING % searched)
+    log(MSG_SEND_NOTIFY_FIX)
+
 
 def load_send_notify():
+    """返回 sendNotify.send，找不到返回 None（并在返回前打一次降级告警）。"""
     try:
         from sendNotify import send
 
@@ -837,21 +950,8 @@ def load_send_notify():
     except Exception:
         pass
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidate_dirs = [
-        here,
-        os.getcwd(),
-        os.path.join(here, os.pardir),
-        os.path.join("/ql", "data", "scripts"),
-        os.path.join("/ql", "scripts"),
-        os.path.join("/ql", "data", "scripts", "function"),
-        os.path.join("/ql", "scripts", "function"),
-    ]
+    candidate_dirs = _candidate_dirs()
     for directory in candidate_dirs:
-        try:
-            directory = os.path.abspath(directory)
-        except Exception:
-            continue
         if not os.path.isfile(os.path.join(directory, "sendNotify.py")):
             continue
         if directory not in sys.path:
@@ -861,11 +961,16 @@ def load_send_notify():
 
             return send
         except Exception:
+            # 坏副本不能挡住后面的好副本：失败的 import 可能把半成品留在 sys.modules，
+            # 不清理的话下一个候选会直接命中缓存里那个坏模块。
+            sys.modules.pop("sendNotify", None)
             continue
+    _warn_send_notify_missing(len(candidate_dirs))
     return None
 
 
 def send_notification(title, content):
+    """发送通知；任何失败一律降级为 print，绝不抛、绝不改退出码。"""
     try:
         send = load_send_notify()
         if send is not None:
@@ -1043,6 +1148,18 @@ def run_selfcheck():
     )
     cases.append(("通知回落：明细注入自由文本后剔除可消除命中", True, fallback_ok,
                   "include_details=True → 命中；include_details=False → 不命中"))
+
+    # —— 通知降级告警：文案必须无分流关键词（AC11），且真的说了"未发送"（AC7） ——
+    #     文案取自模块级常量，与实际 load_send_notify() 打出的文本同源，避免两处漂移。
+    for label, text in (
+        ("未找到 sendNotify.py 告警", MSG_SEND_NOTIFY_MISSING % 24),
+        ("修复提示", MSG_SEND_NOTIFY_FIX),
+    ):
+        check(label, text, False)
+        # AC7：告警合起来必须明确告诉用户"本次通知未发送" —— 该说明在「未找到…」那行，
+        #       「修复提示」行只讲怎么放文件，两行合起来才是完整、可行动的告警。
+        cases.append((label + "（含'未发送'说明）", True,
+                      "未发送" in (MSG_SEND_NOTIFY_MISSING % 24 + text), text))
 
     failed = 0
     for label, expected, actual, text in cases:
