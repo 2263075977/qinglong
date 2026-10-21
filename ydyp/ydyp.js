@@ -628,18 +628,6 @@ const LOG_PREFIX = "[ydyp]",
 const u = {
 		defaultTimeout: 5e3,
 		userAgent: "Mozilla/5.0 (Linux; Android 11; M2012K10C Build/RP1A.200720.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/90.0.4430.210 Mobile Safari/537.36 MCloudApp/10.0.1",
-		noteHeaders: {
-			"X-Tingyun-Id": "p35OnrDoP8k;c=2;r=1122634489;u=43ee994e8c3a6057970124db00b2442c::8B3D3F05462B6E4C",
-			Charset: "UTF-8",
-			Connection: "Keep-Alive",
-			"User-Agent": "mobile",
-			APP_CP: "android",
-			CP_VERSION: "3.2.0",
-			"x-huawei-channelsrc": "10001400",
-			Host: "mnote.caiyun.feixin.10086.cn",
-			"Content-Type": "application/json; charset=UTF-8",
-			Accept: "*/*"
-		}
 	},
 	l = {
 		missingCookie: "未配置环境变量 ydyp_ck\n请在青龙面板添加环境变量 ydyp_ck（或通过 $argument 传入 cookie）\n值格式为 Authorization#手机号#authToken，多账号用 @ 或换行分隔\n获取方式：打开「中国移动云盘」App 抓包，搜索 refresh，找到 authTokenRefresh.do 请求，\n取请求头中的 Authorization 与响应体 <token> 中的值拼成上述格式",
@@ -3111,13 +3099,6 @@ function nt(e) {
 	return [e.getFullYear(), String(e.getMonth() + 1).padStart(2, "0"), String(e.getDate()).padStart(2, "0"), String(e.getHours()).padStart(2, "0"), String(e.getMinutes()).padStart(2, "0"), String(e.getSeconds()).padStart(2, "0")].join("")
 }
 
-function it(e) {
-	const t = "19f3a063d67e4694ca63a4227ec9a94a19088404f9a28084e3e486b928039a299bf756ebc77aa4f6bfa250308ec6a8be8b63b5271a00350d136d117b8a72f39c5bd15cdfd350cba4271dc797f15412d9f269e666aea5039f5049d00739b320bb9e8585a008b52c1cbd86970cae9476446f3e41871de8d9f6112db94b05e5dc7ea0a942a9daf145ac8e487d3d5cba7cea145680efc64794d43dd15c5062b81e1cda7bf278b9bc4e1b8955846e6bc4b6a61c28f831f81b2270289e5a8a677c3141ddc9868129060c0c3b5ef507fbd46c004f6de346332ef7f05c0094215eae1217ee7c13c8dca6d174cfb49c716dd42903bb4b02d823b5f1ff93c3f88768251b56cc";
-	let r = "";
-	for (let o = 0; o < e; o += 1) r += t.charAt(Math.floor(514 * Math.random()));
-	return r
-}
-
 function st(e) {
 	const t = [];
 	for (let r = 0; r < e; r += 4) t.push(4294967296 * Math.random() | 0);
@@ -3527,7 +3508,6 @@ function dt() {
 }
 "object" == typeof module && module.exports && (module.exports = dt);
 const ft = u.userAgent,
-	pt = u.noteHeaders,
 	{
 		Axios: yt
 	} = dt(),
@@ -3715,124 +3695,18 @@ function wt(e) {
 		}
 	}
 }
-const kt = "http://mnote.caiyun.feixin.10086.cn/noteServer/api/authTokenRefresh.do",
-	_t = "http://mnote.caiyun.feixin.10086.cn/noteServer/api/syncNotebookV3.do",
-	xt = "http://mnote.caiyun.feixin.10086.cn/noteServer/api/createNote.do";
-
-function St(e) {
-	return {
-		refreshNoteToken: async function() {
-			return e.request({
-				url: kt,
-				method: "post",
-				headers: pt,
-				data: {
-					authToken: e.authToken,
-					userPhone: e.account
-				},
-				throwHttpErrors: !1
-			})
-		},
-		syncNotebook: async function(t) {
-			return e.requestJson({
-				url: _t,
-				method: "post",
-				headers: t,
-				data: {
-					addNotebooks: [],
-					delNotebooks: [],
-					notebookRefs: [],
-					updateNotebooks: []
-				}
-			})
-		},
-		createNote: async function(t, r) {
-			const o = e.randomHex(32),
-				n = String(Date.now());
-			return e.request({
-				url: xt,
-				method: "post",
-				headers: t,
-				data: {
-					archived: 0,
-					attachmentdir: o,
-					attachmentdirid: "",
-					attachments: [],
-					audioInfo: {
-						audioDuration: 0,
-						audioSize: 0,
-						audioStatus: 0
-					},
-					contentid: "",
-					contents: [{
-						contentid: 0,
-						data: '<font size="3">000000</font>',
-						noteId: o,
-						sortOrder: 0,
-						type: "RICHTEXT"
-					}],
-					cp: "",
-					createtime: n,
-					description: "android",
-					expands: {
-						noteType: 0
-					},
-					latlng: "",
-					location: "",
-					noteid: o,
-					notestatus: 0,
-					remindtime: "",
-					remindtype: 1,
-					revision: "1",
-					sharecount: "0",
-					sharestatus: "0",
-					system: "mobile",
-					tags: [{
-						id: r,
-						orderIndex: "0",
-						text: "默认笔记本"
-					}],
-					title: "00000",
-					topmost: "0",
-					updatetime: n,
-					userphone: e.account,
-					version: "1.00",
-					visitTime: ""
-				},
-				throwHttpErrors: !1
-			})
-		}
-	}
-}
 const Bt = {
-		wxSign: "https://caiyun.feixin.10086.cn/market/playoffic/followSignInfo?isWx=true",
 		drawInfo: "https://caiyun.feixin.10086.cn/market/playoffic/drawInfo",
 		draw: "https://caiyun.feixin.10086.cn/market/playoffic/draw",
 		shake: "https://caiyun.feixin.10086.cn:7071/market/shake-server/shake/shakeIt?flag=1"
 	},
-	At = {
-		info: "https://caiyun.feixin.10086.cn/market/signin/hecheng1T/info?op=info",
-		invite: "https://caiyun.feixin.10086.cn/market/signin/hecheng1T/beinvite",
-		finish: "https://caiyun.feixin.10086.cn/market/signin/hecheng1T/finish?flag=true"
-	},
 	Tt = {
 		info: "https://caiyun.feixin.10086.cn/market/backupgift/info",
 		receive: "https://caiyun.feixin.10086.cn/market/backupgift/receive"
-	},
-	Ct = {
-		status: "https://caiyun.feixin.10086.cn/market/msgPushOn/task/status",
-		obtain: "https://caiyun.feixin.10086.cn/market/msgPushOn/task/obtain"
 	};
 
 function Et(e) {
 	return {
-		getWxSignInfo: async function() {
-			return e.requestJson({
-				url: Bt.wxSign,
-				method: "get",
-				headers: e.jwtHeaders
-			})
-		},
 		getDrawInfo: async function() {
 			return e.requestJson({
 				url: Bt.drawInfo,
@@ -3854,27 +3728,6 @@ function Et(e) {
 				headers: e.jwtHeaders
 			})
 		},
-		getCloudGameInfo: async function() {
-			return e.requestJson({
-				url: At.info,
-				method: "get",
-				headers: e.jwtHeaders
-			})
-		},
-		inviteCloudGame: async function() {
-			return e.requestJson({
-				url: At.invite,
-				method: "get",
-				headers: e.jwtHeaders
-			})
-		},
-		finishCloudGame: async function() {
-			return e.requestJson({
-				url: At.finish,
-				method: "get",
-				headers: e.jwtHeaders
-			})
-		},
 		getBackupInfo: async function() {
 			return e.requestJson({
 				url: Tt.info,
@@ -3887,23 +3740,6 @@ function Et(e) {
 				url: Tt.receive,
 				method: "get",
 				headers: e.jwtHeaders
-			})
-		},
-		getMsgPushStatus: async function() {
-			return e.requestJson({
-				url: Ct.status,
-				method: "get",
-				headers: e.jwtHeaders
-			})
-		},
-		obtainMsgPushReward: async function(t) {
-			return e.requestJson({
-				url: Ct.obtain,
-				method: "post",
-				headers: e.jwtHeaders,
-				data: {
-					type: t
-				}
 			})
 		}
 	}
@@ -4009,7 +3845,6 @@ const $t = "https://caiyun.feixin.10086.cn/market/signin/page/info?client=app",
 	Rt = "https://caiyun.feixin.10086.cn/market/manager/commonMarketconfig/getByMarketRuleName?marketName=sign_in_3",
 	zt = e => `https://caiyun.feixin.10086.cn/market/signin/task/taskList?marketname=${e}`,
 	Dt = e => `https://caiyun.feixin.10086.cn/market/signin/task/click?key=task&id=${e}`,
-	Ht = "https://caiyun.feixin.10086.cn/market/signin/page/receive",
 	Mt = e => `https://caiyun.feixin.10086.cn/market/prizeApi/checkPrize/getUserPrizeLogPage?currPage=1&pageSize=15&_=${e}`,
 	jt = "https://caiyun.feixin.10086.cn/market/signin/page/taskExpansion",
 	It = e => `https://caiyun.feixin.10086.cn/market/signin/page/receiveTaskExpansion?acceptDate=${e}`;
@@ -4046,14 +3881,6 @@ function Ft(e) {
 				method: "get",
 				headers: e.jwtHeaders,
 				...r
-			})
-		},
-		// receiveClouds(B1/旧 /market/signin/page/receive)已下线(404), 已由 reportCloudNum()+receiveV3 取代, 勿再调用
-		receiveClouds: async function() {
-			return e.requestJson({
-				url: Ht,
-				method: "get",
-				headers: e.jwtHeaders
 			})
 		},
 		getPrizeLog: async function(t) {
@@ -4408,7 +4235,7 @@ class Ut {
 			"User-Agent": ft,
 			Accept: "*/*",
 			Host: "caiyun.feixin.10086.cn:7071"
-		}, this.noteToken = "", this.noteAuth = "", this.notebookId = "", this.clickNum = t.clickNum, this.drawTimes = t.drawTimes, this.parseCookie(), this.requester = function(e, t) {
+		}, this.clickNum = t.clickNum, this.drawTimes = t.drawTimes, this.parseCookie(), this.requester = function(e, t) {
 			return {
 				request: r,
 				requestJson: async function(e, t = 3) {
@@ -4448,9 +4275,6 @@ class Ut {
 				get account() {
 					return o.account
 				},
-				get authToken() {
-					return o.authToken
-				},
 				get config() {
 					return o.config
 				},
@@ -4461,14 +4285,12 @@ class Ut {
 				requestJson: (...e) => o.requestJson(...e),
 				requestText: (...e) => o.requestText(...e),
 				md5: e => Ze.MD5(e).toString().toUpperCase(),
-				randomHex: it,
 				randomWordArray: st,
 				formatDate: nt
 			}),
 			...Ft(n),
 			...Yt(n),
 			...Et(n),
-			...St(n),
 			...qt(n)
 		}
 	}
@@ -4500,11 +4322,8 @@ class Ut {
 				["签到", () => this.signinStatus()],
 				["戳一下", () => this.clickTask()],
 				["云盘任务", () => this.processTaskList("sign_in_3", "cloud_app")],
-				["云朵大作战", () => this.cloudGame()],
-				["公众号签到", () => this.wxSign()],
 				["摇一摇", () => this.shake()],
 				["抽奖", () => this.surplusNum()],
-				["消息推送奖励", () => this.openSend()],
 				["邮箱任务", () => this.processTaskList("newsign_139mail", "email_app")],
 				["上传任务", () => this.uploadForTask()],
 				["分享任务", () => this.shareForTask()],
@@ -4637,25 +4456,7 @@ class Ut {
 			case 106:
 				await this.uploadZeroFile();
 				break;
-			case 107:
-				await this.createDefaultNote()
 		}
-	}
-	async refreshNoteToken() {
-		if (!this.authToken || "00" === this.authToken) return !1;
-		const e = await this.api.refreshNoteToken();
-		return this.noteToken = e.headers?.NOTE_TOKEN || e.headers?.note_token || "", this.noteAuth = e.headers?.APP_AUTH || e.headers?.app_auth || "", !(!this.noteToken || !this.noteAuth)
-	}
-	async createDefaultNote() {
-		if (!await this.refreshNoteToken()) return void this.log("跳过创建笔记: 缺少 authToken");
-		const e = {
-				...pt,
-				APP_NUMBER: this.account,
-				APP_AUTH: this.noteAuth,
-				NOTE_TOKEN: this.noteToken
-			},
-			t = await this.api.syncNotebook(e);
-		this.notebookId = t?.notebooks?.[0]?.notebookId || "", this.notebookId ? (await this.api.createNote(e, this.notebookId), this.log("创建笔记完成")) : this.log("获取默认笔记本失败")
 	}
 	async uploadZeroFile() {
 		try {
@@ -4737,9 +4538,6 @@ class Ut {
 			this.reporter.tasks.push(`${this.maskedAccount} 522 当月上传文件满100个: 进度未知`)
 		}
 	}
-	async wxSign() {
-		this.log("⚠️ 公众号签到活动已结束(接口返回「活动已结束」), 跳过")
-	}
 	async shake() {
 		let e = 0;
 		for (let t = 0; t < this.clickNum; t += 1) try {
@@ -4759,10 +4557,7 @@ class Ut {
 				this.log(0 === e?.code ? `抽奖成功: ${e?.result?.prizeName||""}` : "抽奖失败")
 			}
 	}
-	async cloudGame() {
-		this.log("⚠️ 云朵大作战接口已下线(404), 跳过")
-	}
-	// 云朵统计改走新网关 getCloudNum(旧 /market/signin/page/receive 已 404);
+	// 云朵统计改走新网关 getCloudNum(旧的签到页领取接口已 404, 相关常量与方法已删除);
 	// receiveV3 的 615/614(「活动太火爆」)属正常业务响应, 记为提示而非失败
 	async reportCloudNum() {
 		await this.sleep();
@@ -4786,9 +4581,6 @@ class Ut {
 			const e = await this.api.receiveTaskExpansion(r.result.acceptDate);
 			this.log(`膨胀云朵领取: ${e?.result?.cloudCount||e?.msg||""}`)
 		}
-	}
-	async openSend() {
-		this.log("⚠️ 消息推送奖励接口已下线(404), 跳过")
 	}
 	async uploadLargeFile() {
 		this.config.uploadDirId ? (await this.api.uploadLargeFile(), this.log(`大文件上传任务已执行: ${this.config.uploadFilename}`)) : this.log("跳过大文件上传: 缺少 dirId")
@@ -4987,7 +4779,7 @@ function runSelfCheck() {
 		["凭证失效汇总", `已失效账号(请重新登录获取并更新 ydyp_ck):\n1**********`, !0],
 		["顶层异常兜底", "❌ 发生异常:执行失败\n\n错误类型: YdypError: 云朵总数解析失败", !0],
 		["成功汇总(含云朵统计)", "执行完成\n云朵统计:\n1**********: 云朵 100", !1],
-		["已下线提示", "ℹ️ 云朵大作战接口已下线(404), 跳过", !1],
+		["已下线提示", "⚠️ 旧签到状态接口已下线(404), 直接尝试旧签到接口", !1],
 		["非凭证步骤失败汇总", `异常信息:\n1********** 云朵统计: ${NOTICE_SAFE_PLACEHOLDER}`, !1],
 		["配置缺失文案", `❌ ${l.missingCookie}`, !1]
 	];
