@@ -14,7 +14,11 @@
  *   CLOUD139_TIMEOUT=5000        单请求超时(毫秒)
  *   CLOUD139_DELAY_MIN/MAX       请求间隔(毫秒)
  *   CLOUD139_PUSH=1              是否发送青龙通知
- *   CLOUD139_UPLOAD/SHARE/DIR_ID/UPLOAD_FILENAME/SHARE_FILENAME  上传与分享任务(A2/A3 重建中, 默认关闭)
+ *   CLOUD139_UPLOAD_TIMES=25     上传任务(522 当月上传满100个)单次运行次数上限, 0=跳过; 每次间隔随机 1-3s, 连续 3 次失败即停; 负值告警后按 0 处理
+ *   CLOUD139_UPLOAD_FILENAME=000000.txt  上传文件名(522 上传与大文件上传共用), 默认 000000.txt
+ *   CLOUD139_DIR_ID              上传目录 ID(空=根目录); 522 上传与大文件上传共用
+ *   CLOUD139_SHARE_FILENAME      分享任务匹配的文件名关键字(A3 重建中)
+ *   CLOUD139_UPLOAD/SHARE        大文件上传 / 分享任务开关(默认关闭, A3 重建中)
  *
  * 宿主说明: 本脚本同时兼容 Surge / Loon / Stash / Egern / Shadowrocket / Quantumult X / Node.js，
  *   但实际部署宿主 = 青龙面板(Node ≥18，无 npm 依赖)。
@@ -656,8 +660,11 @@ const u = {
 			delayMax: 1500,
 			timeout: 5e3,
 			tasklistV3: !0,
-			uploadFilename: "7",
+			// 2026-10-21: 原默认 "7" 是 uploadLargeFile 遗留的占位名, 会让 522 上传落到名为 7 的文件上;
+			// 统一改为 000000.txt, 以匹配 A2 PRD AC6(522 的简单上传与大文件上传共用此变量)
+			uploadFilename: "000000.txt",
 			uploadSizeMb: 7,
+			uploadTimes: 25,
 			uploadDirId: "",
 			shareFilename: ""
 		}
@@ -2997,7 +3004,7 @@ y.exports = function(e) {
 var Ze = p(y.exports);
 class Ye {
 	constructor() {
-		this.lines = [], this.errors = [], this.amounts = [], this.invalid = []
+		this.lines = [], this.errors = [], this.amounts = [], this.invalid = [], this.tasks = []
 	}
 	info(e) {
 		this.lines.push(e), t.log(`${LOG_PREFIX} ${e}`)
@@ -3010,7 +3017,7 @@ class Ye {
 	}
 	renderSummary() {
 		const e = [];
-		return this.invalid.length && e.push(`已失效账号(请重新登录获取并更新 ydyp_ck):\n${this.invalid.join("\n")}`), this.amounts.length && e.push(`云朵统计:\n${this.amounts.join("\n")}`), this.errors.length && e.push(`异常信息:\n${this.errors.join("\n")}`), e.join("\n\n") || "执行完成"
+		return this.invalid.length && e.push(`已失效账号(请重新登录获取并更新 ydyp_ck):\n${this.invalid.join("\n")}`), this.tasks.length && e.push(`任务进度:\n${this.tasks.join("\n")}`), this.amounts.length && e.push(`云朵统计:\n${this.amounts.join("\n")}`), this.errors.length && e.push(`异常信息:\n${this.errors.join("\n")}`), e.join("\n\n") || "执行完成"
 	}
 }
 
@@ -3021,6 +3028,13 @@ function et(e) {
 function tt(e, t) {
 	const r = Number(e);
 	return Number.isFinite(r) ? r : t
+}
+// CLOUD139_UPLOAD_TIMES 负值属配置笔误: 告警后回落 0(跳过本步), 不静默透传以免日志打出误导性的「=0」;
+// 选 0 而非 25, 是因为写负数的用户更可能想关掉本步; 非数字/空串仍由 tt 回落默认值 25
+function ptimes(e, t) {
+	const r = tt(e, t);
+	if (r < 0) return console.warn(`${LOG_PREFIX} ⚠️ CLOUD139_UPLOAD_TIMES=${r} 非法(不能为负), 已按 0 处理(跳过本步)`), 0;
+	return r
 }
 
 function rt(e) {
@@ -3111,6 +3125,7 @@ function ct() {
 		uploadDirId: String(ut(e, ["dirId", "dir_id"], lt([`${r}_DIR_ID`, "cloud139_dir_id", "DIR_ID"], t.uploadDirId)) || ""),
 		uploadFilename: String(ut(e, ["uploadFilename"], lt([`${r}_UPLOAD_FILENAME`, "cloud139_upload_filename"], t.uploadFilename)) || t.uploadFilename),
 		uploadSizeMb: tt(ut(e, ["uploadSizeMb"], lt([`${r}_UPLOAD_SIZE_MB`, "cloud139_upload_size_mb"], t.uploadSizeMb)), t.uploadSizeMb),
+		uploadTimes: ptimes(ut(e, ["uploadTimes"], lt([`${r}_UPLOAD_TIMES`, "cloud139_upload_times"], t.uploadTimes)), t.uploadTimes),
 		shareEnabled: et(ut(e, ["share"], lt([`${r}_SHARE`, "cloud139_share"], t.share))),
 		shareFilename: String(ut(e, ["shareFilename"], lt([`${r}_SHARE_FILENAME`, "cloud139_share_filename"], t.shareFilename)) || ""),
 		push: et(ut(e, ["push"], lt([`${r}_PUSH`, "cloud139_push"], t.push))),
@@ -4048,16 +4063,40 @@ function Ft(e) {
 		}
 	}
 }
+// 上传通道(2026-10-21 实测): http/https ose、yun.139.com 同名路径、personal-kd-njs 等候选域全部 404,
+// 且 orchestration 网关自报后端 IUploadAndDownload 不可用(1010000501) —— 属服务端故障, 非参数问题。
+// 保留原 App XML 通道, 待服务端恢复后本步骤即可自然生效; 详见 .trellis/tasks/10-21-ydyp-a2-upload/prd.md
 const Nt = "http://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload",
 	Pt = "https://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload",
 	Ot = "https://personal-kd-njs.yun.139.com/hcy/file/list",
 	Lt = "https://yun.139.com/orchestration/personalCloud-rebuild/outlink/v1.0/getOutLink";
 
+// 上传写接口的业务码提取/校验(见 error-handling.md「写接口空转与陈旧数据」): HTTP 2xx 不算成功,
+// 必须服务端返回明确的成功业务码; 上传是否真正生效以 taskListV3 的 522.process 前后快照为准。
+function extractUploadCode(e) {
+	if (null == e) return null;
+	if ("object" == typeof e) {
+		const t = e.code ?? e.resultCode ?? e.retCode;
+		return null == t ? null : String(t).trim()
+	}
+	const t = String(e).replace(/^\uFEFF/, ""),
+		r = t.match(/<(?:\w+:)?(?:resultCode|code|retCode)>\s*([^<]*?)\s*<\//i);
+	if (r) return r[1];
+	const o = t.match(/"code"\s*:\s*"?([^",}\s]+)"?/i);
+	return o ? o[1] : null
+}
+const UPLOAD_SUCCESS_CODES = ["0", "00", "0000", "000000", "success"];
+function isUploadSuccessCode(e) {
+	return null != e && UPLOAD_SUCCESS_CODES.includes(String(e).trim().toLowerCase())
+}
+
 function qt(e) {
 	return {
 		uploadSimpleFile: async function() {
-			const t = ["<pcUploadFileRequest>", `<ownerMSISDN>${e.account}</ownerMSISDN>`, "<fileCount>1</fileCount>", "<totalSize>1</totalSize>", '<uploadContentList length="1">', "<uploadContentInfo>", "<comlexFlag>0</comlexFlag>", "<contentDesc><![CDATA[]]></contentDesc>", "<contentName><![CDATA[000000.txt]]></contentName>", "<contentSize>1</contentSize>", "<contentTAGList></contentTAGList>", "<digest>C4CA4238A0B923820DCC509A6F75849B</digest>", "<exif/>", "<fileEtag>0</fileEtag>", "<fileVersion>0</fileVersion>", "<updateContentID></updateContentID>", "</uploadContentInfo>", "</uploadContentList>", "<newCatalogName></newCatalogName>", "<parentCatalogID></parentCatalogID>", "<operation>0</operation>", "<path></path>", "<manualRename>2</manualRename>", '<autoCreatePath length="0"/>', "<tagID></tagID>", "<tagType></tagType>", "</pcUploadFileRequest>"].join("");
-			return e.request({
+			const t = ["<pcUploadFileRequest>", `<ownerMSISDN>${e.account}</ownerMSISDN>`, "<fileCount>1</fileCount>", "<totalSize>1</totalSize>", '<uploadContentList length="1">', "<uploadContentInfo>", "<comlexFlag>0</comlexFlag>", "<contentDesc><![CDATA[]]></contentDesc>", `<contentName><![CDATA[${e.config.uploadFilename}]]></contentName>`, "<contentSize>1</contentSize>", "<contentTAGList></contentTAGList>", "<digest>C4CA4238A0B923820DCC509A6F75849B</digest>", "<exif/>", "<fileEtag>0</fileEtag>", "<fileVersion>0</fileVersion>", "<updateContentID></updateContentID>", "</uploadContentInfo>", "</uploadContentList>", "<newCatalogName></newCatalogName>", `<parentCatalogID>${e.config.uploadDirId}</parentCatalogID>`, "<operation>0</operation>", "<path></path>", "<manualRename>2</manualRename>", '<autoCreatePath length="0"/>', "<tagID></tagID>", "<tagType></tagType>", "</pcUploadFileRequest>"].join("");
+			let r;
+			try {
+				r = await e.request({
 				url: Nt,
 				method: "post",
 				headers: {
@@ -4081,6 +4120,15 @@ function qt(e) {
 				responseType: "text",
 				throwHttpErrors: !1
 			})
+			} catch (e) {
+				throw new YdypError(`上传通道不可用(${redactLog(e?.message||String(e))})`, "upload_unavailable")
+			}
+			// 写接口空转修复: HTTP 2xx 不算成功, 必须校验业务码(见 error-handling.md)
+			const o = Number(r?.status ?? r?.statusCode ?? 0) || 0;
+			if (o < 200 || o >= 300) throw new YdypError(`上传通道不可用(HTTP ${o||"未知"})`, "upload_unavailable");
+			const n = extractUploadCode(r?.data);
+			if (!isUploadSuccessCode(n)) throw new YdypError(null == n ? "上传通道响应缺少业务码, 已按失败处理" : `上传通道返回业务码 ${n}, 已按失败处理`, "upload_unavailable");
+			return r
 		},
 		uploadLargeFile: async function() {
 			const t = e.randomWordArray(1024 * e.config.uploadSizeMb * 1024),
@@ -4275,6 +4323,7 @@ class Ut {
 				["抽奖", () => this.surplusNum()],
 				["消息推送奖励", () => this.openSend()],
 				["邮箱任务", () => this.processTaskList("newsign_139mail", "email_app")],
+				["上传任务", () => this.uploadForTask()],
 				["备份奖励", () => this.backupCloud()],
 				["云朵统计", () => this.reportCloudNum()]
 			];
@@ -4425,7 +4474,84 @@ class Ut {
 		this.notebookId = t?.notebooks?.[0]?.notebookId || "", this.notebookId ? (await this.api.createNote(e, this.notebookId), this.log("创建笔记完成")) : this.log("获取默认笔记本失败")
 	}
 	async uploadZeroFile() {
-		await this.api.uploadSimpleFile(), this.log("上传任务文件完成")
+		try {
+			await this.api.uploadSimpleFile(), this.log("✅ 上传任务文件完成")
+		} catch (e) {
+			// 上传通道不可用属外部服务故障: 记为提示而非异常, 不污染退出码语义(见 A2 PRD)
+			this.log(`⚠️ ${redactLog(e?.message||String(e))}, 已跳过(不影响其它任务)`)
+		}
+	}
+	// 读任务进度(V3 扁平数组 + process 字段); 失败抛错, 由调用方决定是否降级
+	async readTaskProgress(e) {
+		const t = await this.api.getTaskListV3("sign_in_3");
+		if (!Array.isArray(t?.result)) throw new Error(`taskListV3 返回结构异常(code=${t?.code??"?"})`);
+		const r = normalizeTasksV3(t.result).find(t => Number(t.id) === Number(e));
+		if (!r) return null;
+		const o = null == r.progress || "" === r.progress ? NaN : Number(r.progress),
+			n = Number.isFinite(o) ? o : null,
+			i = TASK_GOALS[e];
+		return {
+			state: r.state,
+			progress: n,
+			finished: "FINISH" === r.state || (null != i && null !== n && n >= i)
+		}
+	}
+	// A2: 上传任务(522 当月上传文件满100个)。写接口空转修复: 上传响应必须校验业务码,
+	// 且以 522.process 前后快照为唯一成功判据(见 error-handling.md); 失败/风控只终止本步。
+	async uploadForTask() {
+		const times = this.config.uploadTimes;
+		let before = null;
+		try {
+			before = await this.readTaskProgress(522)
+		} catch (err) {
+			this.log(`⚠️ 读取 522 进度失败: ${redactLog(err?.message||String(err))}, 仍将尝试上传`)
+		}
+		if (before && null != before.progress) this.log(`📄 522 当月上传文件满100个 起始进度: ${before.progress}/100`);
+		if (before?.finished) return void this.log("✅ 522 当月上传文件满100个 已完成");
+		if (!(times > 0)) return void this.log("⚠️ CLOUD139_UPLOAD_TIMES 为非正数, 跳过上传任务");
+		let ok = 0,
+			fail = 0;
+		for (let n = 0; n < times; n += 1) {
+			try {
+				await this.api.uploadSimpleFile(), ok += 1, fail = 0, this.log(`✅ 上传任务文件完成(${ok}/${times})`)
+			} catch (err) {
+				fail += 1, this.log(`⚠️ ${redactLog(err?.message||String(err))}(连续失败 ${fail}/3)`);
+				if (fail >= 3) {
+					this.log("⚠️ 连续 3 次上传失败, 终止本步(外部服务故障不影响其它任务)");
+					break
+				}
+			}
+			n < times - 1 && await at(1e3, 3e3)
+		}
+		let after = null;
+		try {
+			after = await this.readTaskProgress(522)
+		} catch (err) {
+			this.log(`⚠️ 读取 522 进度失败: ${redactLog(err?.message||String(err))}`)
+		}
+		const b = null == before?.progress ? "?" : before.progress,
+			a = null == after?.progress ? "?" : after.progress;
+		this.log(`522 prog=${b}→${a}`);
+		if (!ok) {
+			this.log("⚠️ 上传通道不可用, 本步未上传任何文件");
+			// A2: 通知里写明本步已跳过, 避免用户误以为「只是还没攒够」(文案已避开失效分流关键词)
+			this.reporter.tasks.push(`${this.maskedAccount} 522 上传通道不可用, 本步已跳过`)
+		}
+		// A1: 有成功响应但 522.process 未增长时如实告警, 防止通道恢复后出现「成功 N/N 但 prog 永远 32」的空转
+		if (ok > 0 && null != after?.progress && null != before?.progress && after.progress <= before.progress) {
+			this.log("⚠️ 上传返回成功但 522 进度未增长(疑似计数口径或风控), 请观察");
+			this.reporter.tasks.push(`${this.maskedAccount} 522 上传返回成功(${ok} 个)但进度未增长(${before.progress}→${after.progress}), 请观察`)
+		}
+		if (after?.finished) {
+			this.log("✅ 522 当月上传文件满100个 已完成");
+			this.reporter.tasks.push(`${this.maskedAccount} 522 当月上传文件满100个: 已完成`)
+		} else if (null != after?.progress) {
+			const e = Math.max(0, (TASK_GOALS[522] || 100) - after.progress);
+			this.log(`ℹ️ 522 当月上传文件满100个 当前进度 ${after.progress}/100, 还差 ${e} 个`);
+			this.reporter.tasks.push(`${this.maskedAccount} 522 当月上传文件满100个: ${after.progress}/100, 还差 ${e} 个`)
+		} else {
+			this.reporter.tasks.push(`${this.maskedAccount} 522 当月上传文件满100个: 进度未知`)
+		}
 	}
 	async wxSign() {
 		this.log("⚠️ 公众号签到活动已结束(接口返回「活动已结束」), 跳过")
