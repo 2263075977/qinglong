@@ -33,7 +33,8 @@ MCII 节点共享（proxy.mcii.cc）每日签到并激活订阅（青龙面板 /
 
 鉴权链路（Session Cookie，无 Cloudflare 挑战 / 无验证码 / 无 CSRF token）：
   A. Cookie 形态（LinuxDo / GitHub OAuth 账号 has_password:false，只能用这条）
-       浏览器复制 Cookie: proxy_sid=<JWT>; nodepool_session=<会话>
+       浏览器复制的 Cookie 里**只需保留 nodepool_session=<会话> 这一段**
+       （proxy_sid 是展示用 JWT，与鉴权无关，可省略；证据见下方「凭证寿命」）
        --直接带 Cookie-->  POST /api/v1/me/checkin  {"confirm_partial": <bool>}
   B. 账号密码形态
        POST /api/v1/auth/login  {"username":"...","password":"...","remember":true}
@@ -42,6 +43,21 @@ MCII 节点共享（proxy.mcii.cc）每日签到并激活订阅（青龙面板 /
      因此实现上不解析响应体细节，只校验 authenticated 为真。
   ⚠️ 两条路径都**每次运行从零建会话**：登录换来的 Cookie 不落盘、不复用
      （cron 日频，缓存只带来过期判定与并发写两类新 bug）。
+
+凭证寿命（2026-10-23 实测，回答「为什么 Cookie 很快失效」）：
+  1. proxy_sid 是 90 天有效期的签名 JWT，但**不是鉴权凭证**：只带它 GET /auth 返回
+     authenticated:false、GET /me 返回 401。它只含展示用快照（name/level/xp/points），
+     且不会随服务端数据更新。**唯一鉴权凭证是 nodepool_session**。
+  2. 会话**默认非持久**（GET /auth 的 persistent:false），服务端 TTL 很短
+     ——实测一份 Cookie 只活约 15 小时，这才是「很容易失效」的真因。
+  3. 续期只能靠 POST /api/v1/auth/persist {"remember":true}（前端「保持登录 30 天」弹窗
+     调的就是它）；站点没有 /auth/refresh。实测该调用**原地**把同一会话续到 30 天
+     （Set-Cookie 的 Max-Age=2592000），且**不轮换令牌值**（Set-Cookie 与发送值逐字相同）
+     → 静态环境变量可以一直用下去。
+  4. 因此本脚本每次运行先调一次 persist：正常情况**不需要再手换 Cookie**。
+  5. 读操作（GET /me 等）不下发 Set-Cookie，单纯使用既不轮换也不续期。
+     真过期时（persist 返回 401）才需要重新从浏览器复制 nodepool_session；
+     换 Cookie 时以最新一次复制的为准（在浏览器退出登录会作废该会话）。
 
 调度说明（cron: 0 1 * * *）：
   站点**未公布**签到重置时刻，前端只用「当天」判定（checkin_on），没有小时级窗口说明，
@@ -86,6 +102,9 @@ BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
 API_PREFIX = "/api/v1"
 PATH_LOGIN = "/auth/login"
 PATH_CHECKIN = "/me/checkin"
+# 会话续期端点：把非持久会话**原地**续到 30 天（Max-Age=2592000）。
+# 实测**不轮换令牌值**（Set-Cookie 与发送值逐字相同）→ 静态环境变量够用，无需写回或落盘。
+PATH_PERSIST = "/auth/persist"
 
 # 下游青龙 Node-RED「配置区:双TG Bot分流」的关键词表（与节点侧保持一致）。
 # 匹配规则：大小写不敏感；「原文小写」与「去掉全部空白后的紧凑串」各匹配一次。
@@ -101,6 +120,12 @@ MSG_AUTH_FAILED = (
 
 MSG_EMAIL_REQUIRED = "⚠️ 该账号需要先到 proxy.mcii.cc 网页绑定或验证邮箱后才能签到"
 
+# 续期预步骤的告警（非鉴权类失败专用）：**固定模板 + 受控的 exc.type**。
+# ⚠️ 不要拼 exc.message 或任何服务端文本 —— 那会回显响应体，且可能带进 invalid/expired
+#    这类失效分流关键词；这里只有 type（来自固定枚举），天然不可能带偏。
+# ⚠️ 只走 log()（console / 面板日志），**不**进通知正文：续期失败不代表签到失败。
+MSG_PERSIST_FAILED = "⚠️ 会话续期未成功（%s），本次仍继续尝试签到"
+
 # ⚠️ 这段文案属「配置缺失」，不是「凭证失效」：
 #    用户只需去面板填一个变量，不需要重新登录，因此**不得**出现 已失效 / 重新登录。
 MSG_CONFIG_MISSING = (
@@ -108,11 +133,14 @@ MSG_CONFIG_MISSING = (
     "请登录 https://proxy.mcii.cc 后按下面步骤复制 Cookie：\n"
     "  1. 打开 https://proxy.mcii.cc/subscriptions 并确认页面已是登录状态\n"
     "  2. 按 F12 打开开发者工具 → Network（网络）→ 刷新页面\n"
-    "  3. 点任一 /api/v1 请求 → Request Headers（请求标头）→ 整行复制 Cookie\n"
-    "     （应包含 proxy_sid=… 与 nodepool_session=… 两段）\n"
-    "  4. 青龙面板 → 环境变量 → 新建：MCII_COOKIE=<粘贴的 Cookie>\n"
+    "  3. 点任一 /api/v1 请求 → Request Headers（请求标头）→ 复制 Cookie\n"
+    "     **只需其中的 nodepool_session=… 这一段**\n"
+    "     （proxy_sid 是展示用 JWT，与鉴权无关，可省略）\n"
+    "  4. 青龙面板 → 环境变量 → 新建：MCII_COOKIE=<粘贴的 nodepool_session=…>\n"
     "多账号写成 JSON 数组 MCII_ACCOUNTS：\n"
-    '  MCII_ACCOUNTS=[{"cookie":"...","name":"账号1"},{"username":"...","password":"..."}]'
+    '  MCII_ACCOUNTS=[{"cookie":"...","name":"账号1"},{"username":"...","password":"..."}]\n'
+    "脚本每次运行会把会话自动续期到 30 天，正常情况下不必再手换；\n"
+    "只有会话真的过期时才需重新复制一次 nodepool_session。"
 )
 
 __all__ = [
@@ -687,6 +715,31 @@ def login(session, username, password):
     return doc
 
 
+def persist_session(session, where="会话续期"):
+    """POST /auth/persist {"remember":true}：把同一会话**原地**续到 30 天。
+
+    实测三条性质（缺一不可，是本方案成立的前提）：
+      ① 令牌值不变 —— Set-Cookie 的 nodepool_session 与发送值逐字相同
+         → 静态环境变量够用，不需要写回、不需要落盘；
+      ② 滑动 30 天 —— Max-Age=2592000，每天跑一次即等于永久续期；
+      ③ 鉴权失败状态码 401 —— 与 /me/* 一致，直接复用既有 auth_failed 分类。
+
+    错误分类完全交给 `request_json`（network / rate_limited / auth_failed /
+    email_required / api_error / schema_changed，且不回显响应体）。
+    调用方负责决定「哪些 type 阻断」：只有 auth 类才阻断，其余只告警。
+    """
+    doc = request_json(
+        session, "POST", PATH_PERSIST, payload={"remember": True}, where=where,
+    )
+    if not isinstance(doc, dict) or doc.get("authenticated") is not True:
+        raise MciiError(
+            "schema_changed",
+            "⚠️ MCII 接口结构未识别（schema_changed）：%s 响应缺少 authenticated=true（%s）"
+            % (where, _json_keys_from(doc)),
+        )
+    return doc
+
+
 def checkin(session, confirm_partial):
     """POST /me/checkin {"confirm_partial": <bool>} —— 签到与激活订阅是同一个接口。
 
@@ -763,9 +816,24 @@ def run_account(account, index, confirm_partial):
             log("%s 登录成功（账号密码形态，会话仅存内存）" % tag)
         else:
             session = make_session(account.get("cookie"))
-            # Cookie 形态不做额外的 GET /me 预校验：签到接口本身就会返回 401，
+            # Cookie 形态不做额外的 GET /me **预校验**：签到接口本身就会返回 401，
             # 多打一个请求只是多一个失败点（design.md §2.3）。
+            # 下面的 persist 是**续期**，不是校验 —— 它把非持久会话续到 30 天。
             log("%s Cookie 形态，直接签到（签到接口同时校验登录态）" % tag)
+
+        # 会话续期（预步骤，**必须在签到之前**）：站点会话默认非持久（TTL 约 15h），
+        # 不续期就得天天手换 Cookie。实测 persist 不轮换令牌值 → 静态环境变量可长期使用。
+        # 错误处理严格区分两类（design.md §2.2/§2.3）：
+        #   · auth 类（auth_failed / email_required）→ 抛出去，会话确实死了，走凭证失效路径；
+        #   · 其它（network / api_error / rate_limited / schema_changed）→ 只告警 + 继续签到。
+        # 预步骤**不参与 verdict**：成败只由唯一业务步骤 checkin 定稿。
+        try:
+            persist_session(session)
+            log("%s 会话已续期至 30 天" % tag)
+        except MciiError as exc:
+            if exc.type in ("auth_failed", "email_required"):
+                raise  # 会话确实死了 / 需先验证邮箱 → 交给外层按既有分类判失败
+            log("%s %s" % (tag, MSG_PERSIST_FAILED % exc.type))
 
         doc = checkin(session, confirm_partial)
         ok, message = describe_award(doc, confirm_partial)
@@ -1160,6 +1228,19 @@ def run_selfcheck():
         #       「修复提示」行只讲怎么放文件，两行合起来才是完整、可行动的告警。
         cases.append((label + "（含'未发送'说明）", True,
                       "未发送" in (MSG_SEND_NOTIFY_MISSING % 24 + text), text))
+
+    # —— 会话续期（persist）的告警与缺配置指引（R5 / R8） ——
+    #     告警只进 console、不进通知正文，所以它**必须**不命中分流关键词；
+    #     type 来自固定枚举，逐个 type 都验一遍，避免日后新增 type 时漏掉。
+    for persist_type in ("network", "api_error", "schema_changed", "rate_limited"):
+        check("会话续期未成功告警（%s）" % persist_type,
+              MSG_PERSIST_FAILED % persist_type, False)
+    # 改过文案的 MSG_CONFIG_MISSING 必须重验：仍不命中（上行已验），且两件事都写清了 ——
+    # ① 只需 nodepool_session 一段；② 脚本会自动续期（不必再手换）。
+    check_bool("缺配置指引：说明只需 nodepool_session 一段",
+               "nodepool_session" in MSG_CONFIG_MISSING)
+    check_bool("缺配置指引：说明 proxy_sid 可省略", "可省略" in MSG_CONFIG_MISSING)
+    check_bool("缺配置指引：说明脚本会自动续期", "续期" in MSG_CONFIG_MISSING)
 
     failed = 0
     for label, expected, actual, text in cases:
