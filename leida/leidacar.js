@@ -68,8 +68,11 @@ const API = {
 const ESSAY_CHANNEL_ID = 'PD3455168030976339970';
 const ESSAY_PAGE_SIZE = 20;
 // 分页上限：实测第一页可能被逐日点满（20/20 已点赞），必须往后翻才能找到目标。
-// 5 页 = 100 篇候选，远超单轮 10 个点赞需求；它只是防无限翻的保险，不是目标值。
-const MAX_ESSAY_PAGES = Number(process.env.LEIDA_MAX_ESSAY_PAGES) || 5;
+// 100 页 = 2000 篇候选，按每天点 10 篇的速度够用很多年。
+// 注意它只是防无限翻的**保险丝**，不是目标值：正常情况下凑够差额（≤10 个）就停，
+// 通常只翻 1-2 页，只有前面若干页全已点赞时才会真的往后翻。
+// 极端情况（前面 99 页全点过）最坏代价 = 100 次串行 GET，按实测单页百毫秒级约几十秒。
+const MAX_ESSAY_PAGES = Number(process.env.LEIDA_MAX_ESSAY_PAGES) || 100;
 
 // 业务码口径：同一站点两种，勿混用
 const CODE_READ_OK = 0; // 读接口（文章列表、点赞）成功码
