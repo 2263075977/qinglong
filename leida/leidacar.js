@@ -67,6 +67,9 @@ const API = {
 // 社区频道 ID（实测取自原脚本，服务端按此下发文章列表）
 const ESSAY_CHANNEL_ID = 'PD3455168030976339970';
 const ESSAY_PAGE_SIZE = 20;
+// 分页上限：实测第一页可能被逐日点满（20/20 已点赞），必须往后翻才能找到目标。
+// 5 页 = 100 篇候选，远超单轮 10 个点赞需求；它只是防无限翻的保险，不是目标值。
+const MAX_ESSAY_PAGES = Number(process.env.LEIDA_MAX_ESSAY_PAGES) || 5;
 
 // 业务码口径：同一站点两种，勿混用
 const CODE_READ_OK = 0; // 读接口（文章列表、点赞）成功码
@@ -368,27 +371,76 @@ function normalizeTasks(response) {
 }
 
 /**
- * 挑选点赞目标：essayId 必须是非空字符串，thumb 必须是严格 false。
- * 用 slice 截断，越界在纯函数层就消除（原脚本 artList[i] 裸取会崩）。
+ * 从一页文章里挑点赞目标，并**分开**统计跳过原因。
+ * 三类跳过必须分别计数：把它们合并成一个数字会让「第一页全点过了」和
+ * 「字段异常」看起来一模一样，实测排查时得多跑一轮探针才能分清。
+ *
+ * 返回的 `likeTargets` 不做 needLikes 截断（分页要靠它累积），截断交给调用方。
  */
-function pickArticles(records, needLikes) {
+function classifyArticles(records) {
   const list = Array.isArray(records) ? records : [];
-  const eligible = [];
-  let skipped = 0;
+  const likeTargets = [];
+  const skipped = { alreadyLiked: 0, badEssayId: 0, badThumb: 0 };
   for (const record of list) {
-    const essayId = record && record.essayId;
+    if (!record || typeof record !== 'object') {
+      skipped.badEssayId += 1;
+      continue;
+    }
+    const essayId = record.essayId;
     if (typeof essayId !== 'string' || !essayId.trim()) {
-      skipped += 1;
+      skipped.badEssayId += 1;
+      continue;
+    }
+    if (record.thumb === true) {
+      // 已点赞：正常状态，不是异常
+      skipped.alreadyLiked += 1;
       continue;
     }
     if (record.thumb !== false) {
-      skipped += 1; // 已点赞 或 thumb 字段异常，都不作为目标
+      // 既不是 true 也不是 false：字段形态变了，当不可用并单独计数
+      skipped.badThumb += 1;
       continue;
     }
-    eligible.push(essayId.trim());
+    likeTargets.push(essayId.trim());
   }
+  return { likeTargets, skipped };
+}
+
+/**
+ * 挑选点赞目标（单页入口，保持既有签名供自检/外部调用）。
+ * 用 slice 截断，越界在纯函数层就消除（原脚本 artList[i] 裸取会崩）。
+ */
+function pickArticles(records, needLikes) {
+  const { likeTargets, skipped } = classifyArticles(records);
   const limit = Math.max(0, Math.min(toSafeInt(needLikes), MAX_LIKES_PER_RUN));
-  return { likeTargets: eligible.slice(0, limit), skipped };
+  return {
+    likeTargets: likeTargets.slice(0, limit),
+    skipped: skipped.alreadyLiked + skipped.badEssayId + skipped.badThumb,
+    skippedDetail: skipped,
+  };
+}
+
+/**
+ * 跨页累积：把每页的 classifyArticles 结果合并，够了就停。
+ * 这是修「只翻第一页」的核心：第一页全已点赞时，目标来自第 2 页及以后。
+ */
+function mergePageTargets(accumulated, pageResult, needLikes) {
+  const merged = {
+    likeTargets: accumulated.likeTargets.concat(pageResult.likeTargets),
+    skipped: {
+      alreadyLiked: accumulated.skipped.alreadyLiked + pageResult.skipped.alreadyLiked,
+      badEssayId: accumulated.skipped.badEssayId + pageResult.skipped.badEssayId,
+      badThumb: accumulated.skipped.badThumb + pageResult.skipped.badThumb,
+    },
+  };
+  const limit = Math.max(0, Math.min(toSafeInt(needLikes), MAX_LIKES_PER_RUN));
+  return {
+    likeTargets: merged.likeTargets.slice(0, limit),
+    skipped: merged.skipped,
+    // 已凑够目标 → 不再翻下一页
+    enough: merged.likeTargets.length >= limit && limit > 0,
+    collected: merged.likeTargets.length,
+  };
 }
 
 /**
@@ -581,8 +633,8 @@ class LeidaClient {
     });
   }
 
-  getArticles() {
-    const query = `?current=1&size=${ESSAY_PAGE_SIZE}&channelId=${encodeURIComponent(ESSAY_CHANNEL_ID)}`;
+  getArticles(page = 1) {
+    const query = `?current=${page}&size=${ESSAY_PAGE_SIZE}&channelId=${encodeURIComponent(ESSAY_CHANNEL_ID)}`;
     return this.request({ method: 'GET', path: API.essayPage + query, okCode: CODE_READ_OK });
   }
 
@@ -609,6 +661,7 @@ class LeidaAccount {
       tasks: [], // 进度类信息（进普通 Bot）
       errors: [], // 异常类信息（影响退出码）
       verdict: 'ok', // ok / partial / failed —— 所有子步骤跑完后才定稿
+      incomplete: false, // 有差额但未能执行点赞（如无可点目标）
       like: null, // { before, after, gained, maxNum }
       shareUnsupported: false,
       points: null,
@@ -658,34 +711,80 @@ class LeidaAccount {
     await this.runLikeStep(likeTask, before);
 
     // verdict 在所有子步骤跑完之后才定稿
+    // ⚠ 实测踩过：找不到可点赞文章时 reporter.like 为 null，旧逻辑直接落到 ok，
+    // 通知写「✅ 无需操作」而任务实际 0/10 —— 正是本任务要消灭的假成功。
+    // 因此「有差额但没拿到目标」必须显式标为未完成。
+    const goal = Math.min(likeTask.remain, MAX_LIKES_PER_RUN);
     if (this.reporter.errors.length > 0) {
       this.reporter.verdict = this.reporter.like && this.reporter.like.gained > 0 ? 'partial' : 'failed';
-    } else if (this.reporter.like && this.reporter.like.gained < Math.min(likeTask.remain, MAX_LIKES_PER_RUN)) {
+    } else if (!this.reporter.like) {
+      // 根本没跑成点赞（无可点目标 / 列表读失败被隔离）→ 未完成，不能算 ok
+      this.reporter.verdict = 'partial';
+      this.reporter.incomplete = true;
+    } else if (this.reporter.like.gained < goal) {
       this.reporter.verdict = 'partial'; // 接口成功但进度未足额增长
     }
     return this.reporter;
   }
 
   async runLikeStep(likeTask, before) {
-    let articles;
-    try {
-      articles = await this.client.getArticles();
-    } catch (error) {
-      this.recordError('读取文章列表', error);
-      return;
+    // ── 按需翻页收集点赞目标 ────────────────────────────────────────────
+    // 实测（2026-10-24）：第一页 20 篇可能被逐日点满（全部 thumb:true）而任务仍为
+    // 0/10；只拉第一页会让脚本永久空转。因此必须往后翻，凑够差额即停。
+    const needLikes = likeTask.remain;
+    let collected = { likeTargets: [], skipped: { alreadyLiked: 0, badEssayId: 0, badThumb: 0 } };
+    let pagesFetched = 0;
+    let firstPage = true;
+    for (let page = 1; page <= MAX_ESSAY_PAGES; page += 1) {
+      let articles;
+      try {
+        articles = await this.client.getArticles(page);
+      } catch (error) {
+        this.recordError(`读取文章列表第 ${page} 页`, error);
+        break; // 已经收集到的目标仍然继续用
+      }
+      pagesFetched = page;
+      const records = (articles.data && articles.data.records) || [];
+      const pageResult = classifyArticles(records);
+      const merged = mergePageTargets(collected, pageResult, needLikes);
+      collected = { likeTargets: merged.likeTargets, skipped: merged.skipped };
+
+      if (firstPage) {
+        firstPage = false;
+        // 「已点赞」是正常状态，只有存在异常类跳过时才提醒
+        if (pageResult.skipped.badEssayId || pageResult.skipped.badThumb) {
+          this.warn(
+            `第 1 页数据异常：essayId 非法 ${pageResult.skipped.badEssayId} 条，` +
+              `thumb 类型异常 ${pageResult.skipped.badThumb} 条`,
+          );
+        }
+        if (pageResult.skipped.alreadyLiked > 0) {
+          this.log(`ℹ️ 第 1 页 ${pageResult.skipped.alreadyLiked}/${records.length} 篇已点赞，继续往后翻`);
+        }
+      }
+
+      if (merged.enough) break; // 凑够即停，不白翻后面的页
+      if (records.length === 0) break; // 没下一页了
     }
 
-    const records = (articles.data && articles.data.records) || [];
-    const { likeTargets, skipped } = pickArticles(records, likeTask.remain);
-    if (skipped > 0) {
-      this.warn(`文章列表中有 ${skipped} 条不可用作点赞目标（已点赞 / 缺少 essayId / thumb 非布尔）`);
-    }
+    const likeTargets = collected.likeTargets;
+    const summary =
+      `已点赞 ${collected.skipped.alreadyLiked}` +
+      (collected.skipped.badEssayId ? ` / essayId 非法 ${collected.skipped.badEssayId}` : '') +
+      (collected.skipped.badThumb ? ` / thumb 类型异常 ${collected.skipped.badThumb}` : '');
+
     if (!likeTargets.length) {
-      this.warn('未找到可点赞文章，跳过点赞步骤（不视为成功）');
-      this.reporter.tasks.push(`${this.label}: 无可点赞文章，未完成`);
+      this.warn(
+        `未找到可点赞文章，跳过点赞步骤（不视为成功）。已翻 ${pagesFetched}/${MAX_ESSAY_PAGES} 页，` +
+          `跳过统计：${summary}`,
+      );
+      this.reporter.tasks.push(`${this.label}: 无可点赞文章（翻 ${pagesFetched} 页），未完成`);
       return;
     }
-    this.log(`👍 计划点赞 ${likeTargets.length} 篇（差额 ${likeTask.remain}，单轮上限 ${MAX_LIKES_PER_RUN}）`);
+    this.log(
+      `👍 翻 ${pagesFetched} 页共得 ${likeTargets.length} 个目标（跳过：${summary}），` +
+        `差额 ${needLikes}，单轮上限 ${MAX_LIKES_PER_RUN}`,
+    );
 
     let accepted = 0;
     for (let i = 0; i < likeTargets.length; i += 1) {
@@ -777,8 +876,10 @@ function buildSummary(accounts, total, configErrors) {
       );
     }
     if (reporter.shareUnsupported) parts.push(`${SHARE_TASK_NAME}任务未支持(已跳过)`);
-    // 不能在有异常时写「无需操作」——那会与 verdict=failed 自相矛盾
-    if (!parts.length) parts.push(reporter.verdict === 'failed' ? '未完成' : '无需操作');
+    // 不能在有异常或未完成时写「无需操作」——那会与 verdict 自相矛盾
+    if (!parts.length) {
+      parts.push(reporter.verdict === 'ok' ? '无需操作' : reporter.incomplete ? '未完成' : '未完成');
+    }
     const mark = reporter.verdict === 'ok' ? '✅' : reporter.verdict === 'partial' ? '⚠️' : '❌';
     lines.push(`${mark} ${item.label} ${parts.join(' | ')}`);
     for (const task of reporter.tasks) lines.push(`   ${task}`);
@@ -949,6 +1050,41 @@ function runSelfCheck() {
   check('筛选:空列表不越界', pickArticles([], 5).likeTargets, []);
   check('筛选:非数组不崩', pickArticles(null, 5).likeTargets, []);
 
+  // 4b. 跳过原因必须分开计数（旧版合并成一个数字，导致「第一页全点过了」与「字段异常」无法区分）
+  check('分类:三类跳过分别计数', picked.skippedDetail, { alreadyLiked: 1, badEssayId: 1, badThumb: 1 });
+
+  // 4c. 分页累积——本任务的核心回归网
+  const page1AllLiked = classifyArticles([
+    { essayId: 'P1A', thumb: true },
+    { essayId: 'P1B', thumb: true },
+  ]);
+  const page2Mixed = classifyArticles([
+    { essayId: 'P2A', thumb: false },
+    { essayId: 'P2B', thumb: false },
+    { essayId: 'P2C', thumb: true },
+  ]);
+  const afterPage1 = mergePageTargets(
+    { likeTargets: [], skipped: { alreadyLiked: 0, badEssayId: 0, badThumb: 0 } },
+    page1AllLiked,
+    2,
+  );
+  check('分页:第一页全已点赞时不够', afterPage1.enough, false);
+  check('分页:第一页未得目标', afterPage1.likeTargets, []);
+  const afterPage2 = mergePageTargets(
+    { likeTargets: afterPage1.likeTargets, skipped: afterPage1.skipped },
+    page2Mixed,
+    2,
+  );
+  check('分页:第二页凑够即停', afterPage2.enough, true);
+  check('分页:目标来自第二页', afterPage2.likeTargets, ['P2A', 'P2B']);
+  check('分页:跳过数跨页累加', afterPage2.skipped.alreadyLiked, 3);
+  check('分页:页数上限是正数', MAX_ESSAY_PAGES >= 1, true);
+  check('分页:上限不超过需求时仍截断', mergePageTargets(
+    { likeTargets: [], skipped: { alreadyLiked: 0, badEssayId: 0, badThumb: 0 } },
+    classifyArticles(Array.from({ length: 50 }, (_, i) => ({ essayId: 'X' + i, thumb: false }))),
+    100,
+  ).likeTargets.length, MAX_LIKES_PER_RUN);
+
   // 5. 任务归一
   let schemaError = false;
   try {
@@ -1010,6 +1146,25 @@ function runSelfCheck() {
   // 回归：失败账号不得写「无需操作」（否则与 verdict 自相矛盾）
   check('汇总:失败账号不写无需操作', authNotice.content.includes('无需操作'), false);
 
+  // 回归：无可点目标时不能算 ok，也不能写「无需操作」（否则又是一条假成功）
+  const incompleteAccounts = [
+    {
+      label: '账号***1234',
+      reporter: {
+        verdict: 'partial',
+        incomplete: true,
+        tasks: ['账号***1234: 无可点赞文章（翻 5 页），未完成'],
+        errors: [],
+        like: null,
+        shareUnsupported: false,
+      },
+    },
+  ];
+  const incompleteNotice = buildSummary(incompleteAccounts, 1, []);
+  check('汇总:无可点目标不写无需操作', incompleteNotice.content.includes('无需操作'), false);
+  check('汇总:无可点目标标未完成', incompleteNotice.content.includes('未完成'), true);
+  check('汇总:无可点目标成功数不为 1', incompleteNotice.okCount, 0);
+
   // 8. 收口
   check('收口:命中关键词换占位', noticeSafe('服务端说 invalid token'), NOTICE_SAFE_PLACEHOLDER);
   check('收口:普通文案原样', noticeSafe('业务码非成功 code=500'), '业务码非成功 code=500');
@@ -1059,6 +1214,8 @@ module.exports = {
   parseAccounts,
   normalizeTasks,
   pickArticles,
+  classifyArticles,
+  mergePageTargets,
   diffProgress,
   buildSummary,
   renderNotification,
@@ -1068,4 +1225,6 @@ module.exports = {
   TASK_TITLE,
   ENV_NAME,
   NOTICE_SAFE_PLACEHOLDER,
+  MAX_ESSAY_PAGES,
+  MAX_LIKES_PER_RUN,
 };
