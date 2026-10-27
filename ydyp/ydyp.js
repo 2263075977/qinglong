@@ -8,7 +8,7 @@
  *   获取方式: 开抓包进 App, 搜 refresh, 找到 authTokenRefresh.do 请求, 取请求头中的 Authorization 与响应体 <token> 中的值
  *
  * 环境变量(可选, 前缀 CLOUD139_, 亦可用 $argument 同名键覆盖):
- *   CLOUD139_CLICK_NUM=15        戳一下/摇一摇次数
+ *   CLOUD139_CLICK_NUM=15        戳一下次数(「摇一摇」已于 2026-10-27 实测下线并移除, 详见下方常量区注释)
  *   CLOUD139_DRAW_TIMES=1        抽奖次数
  *   CLOUD139_TASKLIST_V3=1       1=走 taskListV3(默认), 0=强制走旧 V2 任务列表(排障用)
  *   CLOUD139_TIMEOUT=5000        单请求超时(毫秒)
@@ -634,7 +634,7 @@ const LOG_PREFIX = "[ydyp]",
 	MCLOUD_PAGE = "https://m.mcloud.139.com/portal/mobilecloud/index.html?path=newsignin",
 	MCLOUD_ORIGIN = "https://m.mcloud.139.com",
 	// 换票(ssoToken→jwtToken)新端点: 旧 caiyun.feixin.10086.cn:7071 门户换票端点已被移动下线(404),
-	// 新端点额外要求 4 个 x-* 签名头。响应结构与旧接口一致({code:0,result:{token}}) → 下游 10 步零改动(R5.1)
+	// 新端点额外要求 4 个 x-* 签名头。响应结构与旧接口一致({code:0,result:{token}}) → 下游全部步骤零改动(R5.1)
 	MCLOUD_AUTH = `${MCLOUD_BASE}/auth-service/auth/tyrzLogin`,
 	// 免签、免鉴权的对时接口(实测 {"code":0,"result":<ms>}), 用于校准 x-timestamp
 	MCLOUD_TS = `${MCLOUD_BASE}/api/timestamp`,
@@ -3860,7 +3860,7 @@ function aggregateSsoOutcome(primary, backup) {
 function wt(e) {
 	return {
 		// sso 取 token 第一跳(orches)。加容错: d255773 修掉的 tyrzLogin 崩溃与本路径是**同一个 bug 的另一半**
-		// (probe-findings §1.1 P0: 这两跳原先既无 throwHttpErrors 也无 try/catch, 404 直接抛穿崩掉全部 10 步)
+		// (probe-findings §1.1 P0: 这两跳原先既无 throwHttpErrors 也无 try/catch, 404 直接抛穿崩掉全部步骤)
 		ssoForMCloud: async function() {
 			let t;
 			try {
@@ -4007,10 +4007,17 @@ function wt(e) {
 		}
 	}
 }
+// 「摇一摇」已于 2026-10-27 实测下线并移除(端点 shakeIt 已不存在, 无公开替代):
+//   1) POST .../market/shake-server/shake/shakeIt?flag=1 在 :7071 与 :443 均回 404 {"code":404,"msg":"Not Found"};
+//   2) 同端口对照: click 与 infoV3 回 405「请求方法异常」→ 端口活着、路由被删(不是网络/端口问题);
+//   3) ycloud 网关 5 个候选路径(shakeIt/shake/info 等)全 404 → 不是搬家到新网关;
+//   4) 现行 H5 前端 6 个 bundle 中 shake-server/shakeIt/shakePrize 命中 0 → 不是我们路径写错。
+// 原代码在端点 404 时把 15 次失败吞成「摇一摇未中奖 x 15」(静默假成功), 故整步移除, 见本任务 PRD R4。
+// 若将来恢复: 复采步骤见 .trellis/tasks/archive/2026-10/10-27-ydyp-auth-hardening/research/probe-findings.md §4,
+//   加回时需同时恢复 Bt.shake 常量、doShake API 方法、步骤表条目与 shake() 步骤函数。
 const Bt = {
 		drawInfo: "https://caiyun.feixin.10086.cn/market/playoffic/drawInfo",
-		draw: "https://caiyun.feixin.10086.cn/market/playoffic/draw",
-		shake: "https://caiyun.feixin.10086.cn:7071/market/shake-server/shake/shakeIt?flag=1"
+		draw: "https://caiyun.feixin.10086.cn/market/playoffic/draw"
 	},
 	Tt = {
 		info: "https://caiyun.feixin.10086.cn/market/backupgift/info",
@@ -4030,13 +4037,6 @@ function Et(e) {
 			return e.requestJson({
 				url: Bt.draw,
 				method: "get",
-				headers: e.jwtHeaders
-			})
-		},
-		doShake: async function() {
-			return e.requestJson({
-				url: Bt.shake,
-				method: "post",
 				headers: e.jwtHeaders
 			})
 		},
@@ -4157,7 +4157,6 @@ const $t = "https://caiyun.feixin.10086.cn/market/signin/page/info?client=app",
 	Rt = "https://caiyun.feixin.10086.cn/market/manager/commonMarketconfig/getByMarketRuleName?marketName=sign_in_3",
 	zt = e => `https://caiyun.feixin.10086.cn/market/signin/task/taskList?marketname=${e}`,
 	Dt = e => `https://caiyun.feixin.10086.cn/market/signin/task/click?key=task&id=${e}`,
-	Mt = e => `https://caiyun.feixin.10086.cn/market/prizeApi/checkPrize/getUserPrizeLogPage?currPage=1&pageSize=15&_=${e}`,
 	jt = "https://caiyun.feixin.10086.cn/market/signin/page/taskExpansion",
 	It = e => `https://caiyun.feixin.10086.cn/market/signin/page/receiveTaskExpansion?acceptDate=${e}`;
 
@@ -4193,13 +4192,6 @@ function Ft(e) {
 				method: "get",
 				headers: e.jwtHeaders,
 				...r
-			})
-		},
-		getPrizeLog: async function(t) {
-			return e.requestJson({
-				url: Mt(t),
-				method: "get",
-				headers: e.jwtHeaders
 			})
 		},
 		getTaskExpansion: async function() {
@@ -4636,7 +4628,6 @@ class Ut {
 				["签到", () => this.signinStatus()],
 				["戳一下", () => this.clickTask()],
 				["云盘任务", () => this.processTaskList("sign_in_3", "cloud_app")],
-				["摇一摇", () => this.shake()],
 				["抽奖", () => this.surplusNum()],
 				["邮箱任务", () => this.processTaskList("newsign_139mail", "email_app")],
 				["上传任务", () => this.uploadForTask()],
@@ -4894,14 +4885,6 @@ class Ut {
 		} else {
 			this.reporter.tasks.push(`${this.maskedAccount} 522 当月上传文件满100个: 进度未知`)
 		}
-	}
-	async shake() {
-		let e = 0;
-		for (let t = 0; t < this.clickNum; t += 1) try {
-			const t = await this.api.doShake();
-			t?.result?.shakePrizeconfig?.name && (e += 1, this.log(`摇一摇获得: ${t.result.shakePrizeconfig.name}`)), await i(1e3)
-		} catch (e) {}
-		e || this.log(`摇一摇未中奖 x ${this.clickNum}`)
 	}
 	async surplusNum() {
 		await this.sleep();
@@ -5341,6 +5324,25 @@ async function runSelfCheck() {
 		// 通知正文不得带服务端原文/detail(只进 console)
 		["sso interface 通知正文不含 detail 原文", String(wIface.rep.errors[0] || "").includes("FAKE_HT"), !1],
 		["sso credential 通知日志不含 detail 原文", wCred.rep.lines.some(l => String(l).includes("FAKE_RAW")), !1]
+	);
+	// B2 回归网: 驱动真实的 API 工厂与 URL 常量表(不是抄一份实现), 锁住「已下线的摇一摇/死代码不得被重新引入」
+	// 与「抽奖/戳一下必须仍在」。任一删除或复活都会让下列断言转红。
+	const apiProbe = {
+			requestJson: async () => ({}),
+			jwtHeaders: {}
+		},
+		probePlay = Et(apiProbe),
+		probeSign = Ft(apiProbe);
+	eqCases.push(
+		["B2 摇一摇已移除: Et() 无 doShake", "doShake" in probePlay, !1],
+		["B2 摇一摇已移除: 无 shake() 步骤函数", typeof Ut.prototype.shake, "undefined"],
+		["B2 抽奖必须保留: Bt 仍含 drawInfo 与 draw", [Object.values(Bt).some(u => u.endsWith("/playoffic/drawInfo")), Object.values(Bt).some(u => u.endsWith("/playoffic/draw"))], [!0, !0]],
+		["B2 死代码 getPrizeLog 已删除", "getPrizeLog" in probeSign, !1],
+		["B2 戳一下必须保留: clickTask 仍是方法", typeof probeSign.clickTask, "function"],
+		// ⚠ 同时锁 API 方法与 Ut.prototype 上的**步骤函数**: 只锁其中一个时,
+		//   重命名另一个自检仍全绿(实测漏网) —— 两者是不同对象, 不可互相代表
+		["B2 戳一下必须保留: clickTask 步骤函数仍在", typeof Ut.prototype.clickTask, "function"],
+		["B2 备份接口必须保留: Tt 仍有 info/receive", [Object.values(Tt).some(u => u.endsWith("/backupgift/info")), Object.values(Tt).some(u => u.endsWith("/backupgift/receive"))], [!0, !0]]
 	);
 	for (const [name, actual, expected] of eqCases) {
 		const pass = JSON.stringify(actual) === JSON.stringify(expected);
