@@ -3797,43 +3797,132 @@ async function syncServerTimestamp(e) {
 	return r
 }
 
+// sso 两跳(ssoForMCloud / ssoForPortal)的失败分类。与 classifyAuthFailure 的关键差别(容易写错, 故意不合并):
+//  换票接口的失败也回 HTTP 200 → 那里 HTTP 码没有任何分类价值;
+//  sso 端点被下线回的是**真 404**(probe-findings §1.2) → 这里 HTTP 码是「端点死没死」的主判据。
+// 🔴 成功与否**只看顶层 `success` 布尔**: 实测 orches 顶层 `code:"0"`、`data.resultCode:"104000"`、
+//   `data.result.resultCode:"0"` 三处互相矛盾(§1.2/§5.1, 采集 2026-10-27), 只有 success 可靠。
+//   不得"顺手统一"成按 code/resultCode 判 —— 自检有专门夹具锁死这一点(AC4)。
+// 返回统一分类对象(不用抛异常控制流程); ⚠ 对象恒为真值, 调用方**禁止**对它做 `||`/`if` 真值判断,
+//   必须显式取 `?.token`, 否则备用通道 user-njs 会静默失效(implement.md 坑 1)
+function classifySsoFailure(data, httpStatus) {
+	const status = Number(httpStatus) || 0,
+		isObj = !!data && "object" == typeof data && !Array.isArray(data);
+	// 1) 业务层**明确拒绝** → 凭证问题(与 HTTP 码无关)。实测唯一凭证态形态就是 `success:false`:
+	//    orches/user-njs 在凭证/参数不合法时都回 HTTP 200 + success:false(probe-findings §1.2)。
+	//    ⚠ 只认严格 `false`: 若移动日后把 success 改成 "true"/1, 不得因此把全量账号报成
+	//    「已失效、请更新 ydyp_ck」(用户会去做无效动作), 而应 fail-closed 归接口异常。
+	if (isObj && !1 === data.success) return {
+		kind: "credential",
+		msg: `sso 未受理: ${String(data.message ?? data.msg ?? data.code ?? "未给出原因").slice(0, 60)}`
+	};
+	// 2) 成功: success 必须**严格为 true** 且真拿到 token。「success:true 但没给 token」不能放行, 否则下游空转
+	if (isObj && !0 === data.success && data?.data?.token) return {
+		kind: "ok",
+		token: String(data.data.token)
+	};
+	// 3) 其余一律 fail-closed 归「接口异常」(error-handling.md「未知码归接口异常」的镜像要求):
+	//    真 404/5xx(实测 orches 回 nginx HTML)、非 JSON、或形状异常(success 缺失/非布尔、success:true 但无 token)。
+	//    成因分档保留可诊断性, 避免出现自相矛盾的「接口变更: HTTP 200」。
+	const why = status >= 400 ? `HTTP ${status}` : isObj ? `响应形状异常(HTTP ${status || "未知"})` : `响应非 JSON(HTTP ${status || "未知"})`;
+	// 文案**不得**含 已失效/失效/重新登录(否则被 noticeSafe 换掉并误入失效 Bot, prd R1.3)
+	return {
+		kind: "interface",
+		msg: `鉴权接口变更(疑似移动侧调整): ${why}`
+	};
+}
+
+// sso 两跳结果的聚合(离网纯函数, 供 --selfcheck 直接断言优先级规则 prd R1.4 / design §3.3)。
+// 入参是两个分类对象(任一可能为 null/undefined), 只在**两跳都没拿到 token** 时调用。
+// 优先级(误报代价不对称):
+//   · 任一跳是 credential → 归 credential。理由: 至少一跳活着并给出了业务层回复 → 接口没死;
+//     把它报成「接口变更」会让用户空等一个不存在的服务端故障(design §3.3)。
+//   · 否则任一跳是 interface → 归 interface(去重后拼接两跳文案)。
+//   · 其余(两跳都拿不到结果)→ 维持既有「获取 ssoToken 失败」文案 + invalid 通道(零行为变化)。
+function aggregateSsoOutcome(primary, backup) {
+	const hops = [primary, backup];
+	if (hops.some(e => "credential" === e?.kind)) return {
+		kind: "credential",
+		msg: "获取 ssoToken 失败"
+	};
+	const iface = [...new Set(hops.filter(e => "interface" === e?.kind).map(e => String(e?.msg || "")))];
+	if (iface.length) return {
+		kind: "interface",
+		msg: iface.join(" / "),
+		detail: hops.map(e => e?.detail).filter(Boolean).join(" | ")
+	};
+	return {
+		kind: "credential",
+		msg: "获取 ssoToken 失败"
+	};
+}
+
 function wt(e) {
 	return {
+		// sso 取 token 第一跳(orches)。加容错: d255773 修掉的 tyrzLogin 崩溃与本路径是**同一个 bug 的另一半**
+		// (probe-findings §1.1 P0: 这两跳原先既无 throwHttpErrors 也无 try/catch, 404 直接抛穿崩掉全部 10 步)
 		ssoForMCloud: async function() {
-			const t = await e.requestJson({
-				url: mt,
-				method: "post",
-				headers: {
-					Authorization: e.authorization,
-					"User-Agent": ft,
-					"Content-Type": "application/json",
-					Accept: "*/*",
-					Host: "orches.yun.139.com"
-				},
-				data: {
-					account: e.account,
-					toSourceId: "001005"
+			let t;
+			try {
+				// 用 request 而非 requestJson: 分类需要 res.status(requestJson 只给 data, 拿不到状态码)。
+				// throwHttpErrors:!1 兜真 404/5xx; retry=1 关掉默认 3 次空转(端点下线时重试无意义, 白等约 2s)
+				t = await e.request({
+					url: mt,
+					method: "post",
+					headers: {
+						Authorization: e.authorization,
+						"User-Agent": ft,
+						"Content-Type": "application/json",
+						Accept: "*/*",
+						Host: "orches.yun.139.com"
+					},
+					data: {
+						account: e.account,
+						toSourceId: "001005"
+					},
+					responseType: "json",
+					throwHttpErrors: !1
+				}, 1)
+			} catch (r) {
+				// 兼容层在 throwHttpErrors:!1 下仍可能因网络/超时抛出 → 不得抛穿成 AxiosError(prd R1.1)。
+				// 原始异常文本只进 console(可能是 JSON 语法错等自带 invalid 字样的自由文本), 不进通知正文
+				return {
+					kind: "interface",
+					msg: "鉴权接口变更(疑似移动侧调整): 请求未成功(网络或网关异常)",
+					detail: redactLog(r?.message || String(r))
 				}
-			});
-			return t?.success ? t.data.token : null
+			}
+			return classifySsoFailure(t?.data, Number(t?.status ?? t?.statusCode ?? 0) || 0)
 		},
+		// sso 取 token 第二跳(user-njs)。与第一跳同样的容错; 两跳 404 响应体形态不同(HTML vs JSON), 见上
 		ssoForPortal: async function() {
-			const t = await e.requestJson({
-				url: vt,
-				method: "post",
-				headers: {
-					Authorization: rt(e.authorization),
-					"Content-Type": "application/json",
-					Accept: "*/*",
-					Host: "user-njs.yun.139.com",
-					"User-Agent": ft
-				},
-				data: {
-					phoneNumber: e.account,
-					toSourceId: "001003"
+			let t;
+			try {
+				t = await e.request({
+					url: vt,
+					method: "post",
+					headers: {
+						Authorization: rt(e.authorization),
+						"Content-Type": "application/json",
+						Accept: "*/*",
+						Host: "user-njs.yun.139.com",
+						"User-Agent": ft
+					},
+					data: {
+						phoneNumber: e.account,
+						toSourceId: "001003"
+					},
+					responseType: "json",
+					throwHttpErrors: !1
+				}, 1)
+			} catch (r) {
+				return {
+					kind: "interface",
+					msg: "鉴权接口变更(疑似移动侧调整): 请求未成功(网络或网关异常)",
+					detail: redactLog(r?.message || String(r))
 				}
-			});
-			return t?.success ? t.data.token : null
+			}
+			return classifySsoFailure(t?.data, Number(t?.status ?? t?.statusCode ?? 0) || 0)
 		},
 		// 换票(ssoToken→jwtToken): 旧端点已下线(404), 迁到签名版 MCLOUD_AUTH。
 		// 三条实测约束决定了本函数的形状(research/tyrzlogin-signature.md):
@@ -4593,8 +4682,41 @@ class Ut {
 		return this.api.ssoForPortal()
 	}
 	async jwt() {
-		const e = await this.ssoForMCloud() || await this.ssoForPortal();
-		if (!e) return this.log("获取 ssoToken 失败"), !1;
+		// 🔴 坑 1(implement.md): sso 方法现在返回**分类对象**, 对象恒为真值, 绝不能再写
+		//   `await this.ssoForMCloud() || await this.ssoForPortal()` —— 那样备通道 user-njs 静默失效。
+		//   一律显式取 `?.token`, 仅主跳没拿到 token 才回落(R1.4 回落顺序不变)。
+		//   外层 try 只兜 sso 两跳(步骤 4.4): fetchJwt 已有自己的容错, 不重复包
+		let a, b;
+		try {
+			a = await this.ssoForMCloud();
+			b = a?.token ? null : await this.ssoForPortal()
+		} catch (err) {
+			// 理论上不应到达(sso 方法已自包), 但这是唯一能崩掉全账号的路径, 必须兜住(R1.1)。
+			// 措辞保持中性: 这里兜的是**任何**异常, 包括 TypeError 这类脚本自身缺陷 —— 不能一律
+			// 写成「移动侧调整」, 否则会把代码 bug 伪装成上游故障(排错方向被带偏)。
+			// 异常原文只进 console: json 解析类报错自带 invalid 字样, 进通知会误入失效 Bot
+			const m = "sso 取 token 异常(疑似接口变更或脚本内部错误)";
+			return this.authInterfaceFailure = !0, this.reporter.errors.push(`${this.maskedAccount}: ${m}`), this.log(`❌ ${m}: ${redactLog(err?.message || String(err))}`), !1
+		}
+		let e = a?.token ?? null;
+		if (!e) e = b?.token ?? null;
+		// 主跳没拿到 token 但回落 succeeded → 留痕, 避免「回落成功」被当成「主通道正常」(design §6)
+		if (e && !a?.token) this.log(`⚠️ 主 sso 通道未取到 ssoToken(${redactLog(a?.msg || a?.kind || "未知")}), 已改用备用通道`);
+		if (!e) {
+			// 两跳都没拿到: 按 design §3.3 的优先级定类, 不再只走 invalid 一条路(R1.3)
+			const ssoFail = aggregateSsoOutcome(a, b);
+			if ("interface" === ssoFail.kind) {
+				// 复用 d255773 已建立的机制: authInterfaceFailure + errors → run() 不再归 invalid, 不改步骤表
+				const msg = noticeSafe(ssoFail.msg || "鉴权接口变更(疑似移动侧调整)"),
+						line = ssoFail.detail ? `${msg} ${redactLog(ssoFail.detail)}` : msg;
+				return this.authInterfaceFailure = !0, this.reporter.errors.push(`${this.maskedAccount}: ${msg}`), this.log(`❌ ${line}`), !1
+			}
+			// credential: 走既有失效通道(run() push invalid → renderSummary 负「已失效账号…更新 ydyp_ck」)。
+			// 通知正文不拼服务端 msg(只进 console), 文案保持原样以免改变下游分流行为。
+			// 两跳 msg 都回显(仍只进面板日志), 否则另一跳的诊断信息在日志里看不到
+			const why = [a?.msg, b?.msg].filter(Boolean).map(redactLog).join(" | ") || "服务端未受理";
+			return this.log(`获取 ssoToken 失败: ${why}`), !1
+		}
 		const t = await this.api.fetchJwt(e);
 		// 成功路径赋值不变(jwtHeaders.jwtToken / cookies.jwtToken) → 下游 10 个步骤零改动(R5.1)
 		if (t?.ok && t.token) return this.jwtHeaders.jwtToken = t.token, this.cookies.jwtToken = t.token, this.log("jwtToken 获取成功"), !0;
@@ -5009,7 +5131,7 @@ async function Kt(r = ct()) {
 	}
 }
 // 不联网自检: 校验通知文案与 Node-RED 双 Bot 分流关键词表一致(见 .trellis/spec/qinglong/logging-and-notify.md)
-function runSelfCheck() {
+async function runSelfCheck() {
 	const cases = [
 		["凭证失效汇总", `已失效账号(请重新登录获取并更新 ydyp_ck):\n1**********`, !0],
 		["顶层异常兜底", "❌ 发生异常:执行失败\n\n错误类型: YdypError: 云朵总数解析失败", !0],
@@ -5020,7 +5142,9 @@ function runSelfCheck() {
 		// 换票失败分流(AC9): 接口/签名变更类不得命中失效关键词(否则会把用户引向「重抓 Cookie」这一无效动作)
 		["换票接口变更文案(签名被拒)", `异常信息:\n1**********: ${classifyAuthFailure(401, "请求签名校验失败", 200).msg}`, !1],
 		["换票接口变更文案(重放+时钟漂移提示)", `异常信息:\n1**********: ${classifyAuthFailure(401, "重复请求", 200).msg}`, !1],
-		["换票非 JSON/限流文案", `异常信息:\n1**********: ${classifyAuthFailure(null, "", 404).msg}`, !1]
+		["换票非 JSON/限流文案", `异常信息:\n1**********: ${classifyAuthFailure(null, "", 404).msg}`, !1],
+		// B1(AC2.6): sso 端点下线属接口变更, 文案不得包含已失效/重新登录(不误导用户重抓 Cookie, 进普通 Bot)
+		["鉴权接口变更(sso 404)", `异常信息:\n1**********: ${classifySsoFailure(null, 404).msg}`, !1]
 	];
 	let failed = 0;
 	for (const [name, text, expected] of cases) {
@@ -5147,15 +5271,77 @@ function runSelfCheck() {
 		["redactLog 脱敏裸 JWT", redactLog(fakeJwt).includes(fakeJwt), !1],
 		// 虚构 ssoToken 夹具(与真实值同前缀形状, 但内容全 0, 不入库任何真实凭证)
 		["假 ssoToken 夹具为虚构值", /^YZsidssolg0+$/.test(fakeSso), !0],
-		["redactLog 脱敏 ssoToken 形态", redactLog("ssoToken=YZsidssolg37e6be0000000000000000000000").includes("YZsidssolg"), !1],
-		["redactLog 脱敏裸 ssoToken 值", redactLog("ssoToken=YZsidssolg37e6be0000000000000000000000"), "ssoToken=[redacted]"],
+		["redactLog 脱敏 ssoToken 形态", redactLog(`ssoToken=${fakeSso}`).includes("YZsidssolg"), !1],
+		["redactLog 脱敏裸 ssoToken 值", redactLog(`ssoToken=${fakeSso}`), "ssoToken=[redacted]"],
 		// ssoToken 这一候选项**不可删**: 只有它能覆盖 JSON 形态(此处就是它的回归网)
 		["redactLog 脱敏 JSON 形态 ssoToken", redactLog(`{"success":true,"data":{"ssoToken":"${fakeSso}"}}`).includes(fakeSso), !1],
 		// 盐值不得进日志/通知(R3.3)
 		["redactLog 脱敏盐值环境变量形态", redactLog(`CLOUD139_AUTH_SALT=${AUTH_SALT_DEFAULT}`).includes(AUTH_SALT_DEFAULT), !1],
 		// $argument 走 JSON.stringify(282 行), 盐值若以 JSON 形态出现同样必须被脱敏
-		["redactLog 脱敏 JSON 形态盐值", redactLog(`{"CLOUD139_AUTH_SALT":"${AUTH_SALT_DEFAULT}"}`).includes(AUTH_SALT_DEFAULT), !1]
+		["redactLog 脱敏 JSON 形态盐值", redactLog(`{"CLOUD139_AUTH_SALT":"${AUTH_SALT_DEFAULT}"}`).includes(AUTH_SALT_DEFAULT), !1],
+		// ——— B1 sso 两跳容错与分类断言 (implement.md 步骤 2.1–2.7) ———
+		["classifySsoFailure 成功拿 token", classifySsoFailure({success: !0, code: "0", data: {token: "FAKE_TOKEN_VALUE"}}).token, "FAKE_TOKEN_VALUE"],
+		["classifySsoFailure 成功 kind 为 ok", classifySsoFailure({success: !0, code: "0", data: {token: "FAKE_TOKEN_VALUE"}}).kind, "ok"],
+		["classifySsoFailure 业务失败归 credential", classifySsoFailure({success: !1, code: "1010199999", message: "未知异常", data: {result: {resultCode: "05010011"}}}).kind, "credential"],
+		["classifySsoFailure HTML 404 归 interface", classifySsoFailure("<html>404 nginx</html>", 404).kind, "interface"],
+		["classifySsoFailure JSON 404 归 interface", classifySsoFailure({error_msg: "404 Route Not Found"}, 404).kind, "interface"],
+		// 🔴 锁死 R1.2/AC4: 实测 orches 三处 code 互相矛盾, 必须只按 success 判, 不得按 code
+		["classifySsoFailure 锁死 success 判据(不按 code 判)", classifySsoFailure({success: !0, code: "1010199999", data: {token: "FAKE"}}).kind, "ok"],
+		// 2.7: success:true 但缺少 token/data 时不得判 ok, 也不能抛异常
+		["classifySsoFailure success:true 但缺少 token 归非 ok", classifySsoFailure({success: !0, code: "0", data: {}}).kind !== "ok", !0],
+		["classifySsoFailure success:true 但 data 缺失归非 ok", classifySsoFailure({success: !0, code: "0"}).kind !== "ok", !0],
+		// 🔴 坑 1 / AC2.5 的**真实**回归在下方「驱动真 jwt()」区块 —— 此处不得写复制品表达式
+		// (历史教训: 曾把正确表达式抄一遍当断言, 被测代码改回 `||` 时自检仍 75/75 全绿)
+		// 两跳聚合优先级断言: 一跳 credential + 一跳 interface 时优先报 credential
+		["aggregateSsoOutcome 一跳 credential 一跳 interface 优先归 credential", aggregateSsoOutcome({kind: "credential", msg: "err"}, {kind: "interface", msg: "404"}).kind, "credential"],
+		["aggregateSsoOutcome 两跳 interface 归 interface 并拼接文案", aggregateSsoOutcome({kind: "interface", msg: "A"}, {kind: "interface", msg: "B"}).msg, "A / B"]
 	];
+	// ——— 驱动**真实** jwt() 的回落链/通道归属(AC2.5/坑 1) ———
+	// 为什么不用纯表达式断言: 那只能证明「写对的表达式是对的」, 无法拦住实现被改回 `||`。
+	// 这里注入两跳与 fetchJwt 的桩, 跑真方法, 因此能抓住 jwt() 层的回归。
+	// 桩值全为虚构(FAKE/BACKUP), 不涉真实凭证; 不发网络请求。
+	const mkReporter = () => ({
+		lines: [], errors: [], amounts: [], invalid: [], tasks: [],
+		info(e) { this.lines.push(e) },
+		line(e) { this.lines.push(e) },
+		section() {},
+		renderSummary() { return "" }
+	});
+	const wireJwt = (primary, backup) => {
+		const rep = mkReporter();
+		const u = new Ut("Basic ZGVmYXVsdDoxMjM0NTY=#13800138000", {
+			clickNum: 0, drawTimes: 0, requestTimeout: 1e3, uploadEnabled: !1
+		}, rep);
+		u.api.ssoForMCloud = async () => primary;
+		u.api.ssoForPortal = async () => backup;
+		u.api.fetchJwt = async tok => ({ ok: !0, token: `JWT_FOR_${tok}` });
+		return { u, rep };
+	};
+	const ssoCred = { kind: "credential", msg: "sso 未受理: FAKE", detail: "FAKE_RAW" },
+		ssoIface = { kind: "interface", msg: "鉴权接口变更(疑似移动侧调整): HTTP 404", detail: "FAKE_HT" },
+		wFallback = wireJwt(ssoCred, { kind: "ok", token: "BACKUP" }),
+		wIface = wireJwt(ssoIface, ssoIface),
+		wCred = wireJwt(ssoCred, ssoCred),
+		rFallback = await wFallback.u.jwt(),
+		rIface = await wIface.u.jwt(),
+		rCred = await wCred.u.jwt();
+	const ssoCaseTitle = "sso 回落链(驱动真 jwt): 主跳 credential 备跳 ok 必须拿到 token";
+	eqCases.push(
+		// 🔴 AC2.5 核心: 若 jwt() 被改回 `a || b`, 这里会变成 [false, null]
+		[ssoCaseTitle, [rFallback, wFallback.u.cookies.jwtToken], [!0, "JWT_FOR_BACKUP"]],
+		["sso 回落必须留痕(console)", wFallback.rep.lines.some(l => String(l).includes("已改用备用通道")), !0],
+		["sso 回落留痕不进通知", wFallback.rep.errors.length, 0],
+		// 两跳均 interface → 进 errors + authInterfaceFailure, 不归 invalid(R1.3)
+		["sso 两跳 interface → 不归 invalid", rIface === !1 && wIface.rep.invalid.length === 0, !0],
+		["sso 两跳 interface → 置 authInterfaceFailure", wIface.u.authInterfaceFailure, !0],
+		["sso 两跳 interface → 进 errors 且带 HTTP 成因", String(wIface.rep.errors[0] || "").includes("HTTP 404"), !0],
+		// 两跳均 credential → 不置 authInterfaceFailure(invalid 由 run() 统一 push)
+		["sso 两跳 credential → 不置 authInterfaceFailure", !wCred.u.authInterfaceFailure, !0],
+		["sso 两跳 credential → 进 errors 为 0", wCred.rep.errors.length, 0],
+		// 通知正文不得带服务端原文/detail(只进 console)
+		["sso interface 通知正文不含 detail 原文", String(wIface.rep.errors[0] || "").includes("FAKE_HT"), !1],
+		["sso credential 通知日志不含 detail 原文", wCred.rep.lines.some(l => String(l).includes("FAKE_RAW")), !1]
+	);
 	for (const [name, actual, expected] of eqCases) {
 		const pass = JSON.stringify(actual) === JSON.stringify(expected);
 		pass ? console.log(`PASS  ${name}: ${JSON.stringify(actual)}`) : (failed += 1, console.error(`FAIL  ${name}: expected=${JSON.stringify(expected)} actual=${JSON.stringify(actual)}`))
@@ -5169,7 +5355,7 @@ const Vt = TASK_TITLE,
 		runFailed: Qt
 	} = l;
 !async function() {
-	if ("undefined" != typeof process && Array.isArray(process.argv) && process.argv.includes("--selfcheck")) return void runSelfCheck();
+	if ("undefined" != typeof process && Array.isArray(process.argv) && process.argv.includes("--selfcheck")) return void await runSelfCheck();
 	let exitCode = 1;
 	try {
 		t.log(`${LOG_PREFIX} 🚀 ${Vt} ${Gt}`);
