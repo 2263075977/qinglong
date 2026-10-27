@@ -21,6 +21,7 @@
  *   CLOUD139_SHARE_FILENAME      分享任务优先匹配的文件名关键字(空=取列表首个文件)
  *   CLOUD139_SHARE_DIR_ID        分享取文件的目录 ID(空=回落到 CLOUD139_DIR_ID)
  *   CLOUD139_UPLOAD              大文件上传开关(默认关闭)
+ *   CLOUD139_AUTH_SALT           换票接口(tyrzLogin)签名盐值(默认内置; 移动轮换盐值导致签名被拒时在此覆盖)
  *
  * 宿主说明: 本脚本同时兼容 Surge / Loon / Stash / Egern / Shadowrocket / Quantumult X / Node.js，
  *   但实际部署宿主 = 青龙面板(Node ≥18，无 npm 依赖)。
@@ -435,7 +436,14 @@ function warnFetchCookieMissing() {
 }
 function redactLog(e) {
 	// 兼容 `key: value` 与 JSON 的 `"key":"value"` 两种形态, 否则 $argument 等 JSON 明文会绕过脱敏(M3)
-	return String(null == e ? "" : e).replace(/(["']?)(Authorization|jwtToken|authToken|APP_AUTH|NOTE_TOKEN)\1\s*[:=]\s*["']?(?:Basic|Bearer)?\s*[^"',}\s]+/gi, "$1$2=[redacted]").replace(/\b1[3-9]\d{9}\b/g, "1**********")
+	// token: 换票响应的 result.token 是 907 字符裸 JWT, key 名就叫 token, 原关键词组匹配不到(R7.2)。
+	//   它作子串会连带命中 ssoToken —— 那是期望行为(同样是凭证), 不是误伤。
+	//   ⚠ 但 `ssoToken` 这一项**不可删**: 实测删掉后 `{"ssoToken":"YZ…"}` 会原样泄漏 ——
+	//   因为 `token` 在 JSON 形态里前面是 `s`、后面是 `"`, 反引用 \1(空)+[:=] 无法匹配。
+	//   起作用的是这一项的**存在**, 不是它在候选项里的位置(已实测: 排前排后输出逐字相同)。
+	// authSalt/AUTH_SALT/CLOUD139_AUTH_SALT: 盐值不得进日志/通知正文(R3.3)。
+	//   CLOUD139_AUTH_SALT 单独列出: 否则 `{"CLOUD139_AUTH_SALT":"…"}` 同样因 \1+[:=] 不匹配而漏脱敏
+	return String(null == e ? "" : e).replace(/(["']?)(Authorization|ssoToken|jwtToken|authToken|APP_AUTH|NOTE_TOKEN|authSalt|CLOUD139_AUTH_SALT|AUTH_SALT|token)\1\s*[:=]\s*["']?(?:Basic|Bearer)?\s*[^"',}\s]+/gi, "$1$2=[redacted]").replace(/\b1[3-9]\d{9}\b/g, "1**********").replace(/(eyJ[A-Za-z0-9_-]{10})[A-Za-z0-9_.-]+/g, "$1***")
 }
 // 青龙 Node-RED「双 TG Bot 分流」关键词表(与下游节点维护的表保持一致, 大小写不敏感; 标题+正文拼接后匹配)
 const ALERT_KEYWORDS = "已失效,无效用户,失效,cookie失效,ck失效,登录失效,账号失效,账号过期,重新登录,发生异常,invalid,expired";
@@ -624,7 +632,17 @@ const LOG_PREFIX = "[ydyp]",
 	TASK_TITLE = "中国移动云盘",
 	MCLOUD_BASE = "https://m.mcloud.139.com/ycloud",
 	MCLOUD_PAGE = "https://m.mcloud.139.com/portal/mobilecloud/index.html?path=newsignin",
-	MCLOUD_ORIGIN = "https://m.mcloud.139.com";
+	MCLOUD_ORIGIN = "https://m.mcloud.139.com",
+	// 换票(ssoToken→jwtToken)新端点: 旧 caiyun.feixin.10086.cn:7071 门户换票端点已被移动下线(404),
+	// 新端点额外要求 4 个 x-* 签名头。响应结构与旧接口一致({code:0,result:{token}}) → 下游 10 步零改动(R5.1)
+	MCLOUD_AUTH = `${MCLOUD_BASE}/auth-service/auth/tyrzLogin`,
+	// 免签、免鉴权的对时接口(实测 {"code":0,"result":<ms>}), 用于校准 x-timestamp
+	MCLOUD_TS = `${MCLOUD_BASE}/api/timestamp`,
+	// 换票签名盐值: 官方 H5 bundle 里用 fromCodePoint 混淆的公开值, 不是用户凭证, 入库不构成泄漏。
+	// 全文只允许此字面量出现这一处 —— 移动轮换盐值时改这里或用 CLOUD139_AUTH_SALT 覆盖, 注释只引用常量名
+	AUTH_SALT_DEFAULT = "sekaMdYYLIZfbCfm",
+	// 实测缺失 marketName 会被网关回 HTML 404(不是 JSON 校验错误), 极易误判成「接口不存在」→ 固定携带
+	AUTH_MARKET_NAME = "sign_in_3";
 const u = {
 		defaultTimeout: 5e3,
 		userAgent: "Mozilla/5.0 (Linux; Android 11; M2012K10C Build/RP1A.200720.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/90.0.4430.210 Mobile Safari/537.36 MCloudApp/10.0.1",
@@ -658,7 +676,9 @@ const u = {
 			// A3: 分享会产生对外可见链接, 默认次数与 434 的目标值(7)一致, 不额外制造链接
 			shareTimes: 7,
 			shareFilename: "",
-			shareDirId: ""
+			shareDirId: "",
+			// 换票签名盐值(可被 CLOUD139_AUTH_SALT 覆盖; 见 AUTH_SALT_DEFAULT 注释: 字面量只允许出现一处)
+			authSalt: AUTH_SALT_DEFAULT
 		}
 	};
 var f = "undefined" != typeof globalThis ? globalThis : "undefined" != typeof window ? window : "undefined" != typeof global ? global : "undefined" != typeof self ? self : {};
@@ -3131,7 +3151,10 @@ function ct() {
 		drawTimes: tt(ut(e, ["drawTimes"], lt([`${r}_DRAW_TIMES`, "cloud139_draw_times"], t.drawTimes)), t.drawTimes),
 		delayMin: tt(ut(e, ["delayMin"], lt([`${r}_DELAY_MIN`, "cloud139_delay_min"], t.delayMin)), t.delayMin),
 		delayMax: tt(ut(e, ["delayMax"], lt([`${r}_DELAY_MAX`, "cloud139_delay_max"], t.delayMax)), t.delayMax),
-		requestTimeout: tt(ut(e, ["timeout"], lt([`${r}_TIMEOUT`, "cloud139_timeout"], t.timeout)), t.timeout)
+		requestTimeout: tt(ut(e, ["timeout"], lt([`${r}_TIMEOUT`, "cloud139_timeout"], t.timeout)), t.timeout),
+		// 换票签名盐值: 与其余键同构的三段式($argument 键 → 环境变量 → 默认值)。
+		// 移动轮换盐值导致签名被拒时, 用户只需在面板改 CLOUD139_AUTH_SALT, 不必改代码(R3.1)
+		authSalt: String(ut(e, ["authSalt"], lt([`${r}_AUTH_SALT`, "cloud139_auth_salt"], t.authSalt)) || t.authSalt)
 	}
 }
 
@@ -3645,8 +3668,134 @@ const ft = u.userAgent,
 		})
 	}),
 	mt = "https://orches.yun.139.com/orchestration/auth-rebuild/token/v1.0/querySpecToken",
-	vt = "https://user-njs.yun.139.com/user/querySpecToken",
-	bt = e => `https://caiyun.feixin.10086.cn:7071/portal/auth/tyrzLogin.action?ssoToken=${encodeURIComponent(e)}`;
+	vt = "https://user-njs.yun.139.com/user/querySpecToken";
+
+// ——— 换票签名通道(tyrzLogin)的离网纯函数: 不发网络请求, 供 --selfcheck 直接断言 ———
+// 小写 hex MD5。**不得复用 api.md5** —— 它带 .toUpperCase(), 实测大写签名必被服务端拒(AC3)
+function md5Lower(e) {
+	return Ze.MD5(String(null == e ? "" : e)).toString()
+}
+// 签名式: 官方 bundle 原式为 MD5(salt + x-request-id + x-timestamp + x-nonce + "" + salt),
+// 其中 "" 为恒等拼接(可直接省), 故实现取最简式 MD5(salt+rid+ts+nonce+salt) —— 已用真实抓包样本逐字节回归(AC2)
+function buildAuthSignature(salt, rid, ts, nonce) {
+	return md5Lower(String(salt) + rid + ts + nonce + salt)
+}
+// uuid v4 形态。服务端只做唯一性判定(防重放按 x-request-id), 不强校验版本位; 补成 v4 只为贴近真实客户端
+function authUuid() {
+	let e = "";
+	try {
+		// 优先 crypto-js 的 CSPRNG(内部依赖 native crypto, 缺失时会抛)
+		e = Ze.enc.Hex.stringify(Ze.lib.WordArray.random(16))
+	} catch (r) {
+		// 回落 Math.random 路径(st), 保证任意宿主(无 native crypto)不抛
+		e = Ze.enc.Hex.stringify(st(16))
+	}
+	// 不论哪条路径, 都补齐/截断到 32 个 hex 字符再拼 uuid, 避免形状异常时产出带缺口的 id
+	e = ("00000000000000000000000000000000" + e).replace(/[^0-9a-f]/g, "").slice(-32);
+	// 第 13 位固定版本位 4, 第 17 位取变体位(8/9/a/b)
+	return `${e.slice(0,8)}-${e.slice(8,12)}-4${e.slice(13,16)}-${"89ab".charAt(parseInt(e.slice(16, 17), 16) & 3)}${e.slice(17,20)}-${e.slice(20,32)}`
+}
+// 每次实际请求前必须重新生成: 实测防重放按 x-request-id 判定, 复用必踩 401「重复请求」(R2.2/AC4)
+function newAuthIds() {
+	return {
+		rid: authUuid(),
+		nonce: authUuid()
+	}
+}
+// 实测服务端业务码: ssoToken 一次一用/短时效, 过期或已被用过时回该码 → 属真实凭证态, 走既有失效通道。
+// 只实测到 200050409 这一个值, 不得猜其它失效码(error-handling.md「未登录的业务码必须实测」);
+// 白名单故意保持很窄: 未列入的异常码一律归 interface(fail-closed), 宁可报接口变更也不误报 Cookie 失效
+const AUTH_CREDENTIAL_CODES = [200050409];
+// 「重复请求」在本接口是**误导性**文案: 实测 ts 超出 ±5min 窗口同样回 401 重复请求(research §4.3)。
+// 容器时钟漂移会被当成重放攻击, 因此必须把「本机时钟偏差」这一成因写进文案(AC8)
+const AUTH_REPLAY_HINT = "(若本机时钟偏差超过 5 分钟也会触发此提示, 请先校准容器时间)";
+// 盐值轮换是签名被拒的头号成因: 文案直接点名可行动变量, 避免用户去重抓根本没坏的 Cookie(R3.1/R3.2)
+const AUTH_SALT_HINT = "(移动轮换盐值时可在面板用 CLOUD139_AUTH_SALT 覆盖)";
+// 换票失败分类(AC15): 🔴 **只能按 body 里的业务码判** —— 实测「签名校验失败/重复请求/token 已失效」
+// 三种失败**全部返回 HTTP 200**(research §8.2), HTTP 状态码在此接口没有任何分类价值。
+// httpStatus 仅用于「body 里根本没有业务码」时兜底描述网关层异常(真 404/5xx), 不参与凭证/接口判定。
+// 未知业务码一律归 interface: 把接口变更说成凭证失效会诱导用户去重抓 Cookie(无效动作, R3.2/AC9)
+function classifyAuthFailure(code, msg, httpStatus) {
+	const r = String(null == msg ? "" : msg);
+	// 成功业务码(实测为数字 0, 也兼容字符串形态) → 放行; 其余一律 fail-closed
+	if (isBusinessSuccessCode(code)) return {
+		kind: "ok",
+		msg: "",
+		log: ""
+	};
+	const o = Number(code);
+	if (null == code || "" === code || !Number.isFinite(o)) {
+		const e = Number(httpStatus) || 0;
+		return {
+			kind: "interface",
+			msg: `换票接口异常(疑似限流或接口变更): ${e ? `HTTP ${e}` : "响应缺少业务码"}`,
+			log: ""
+		}
+	}
+	// 凭证态(ssoToken 已失效): 只进 console 日志, 通知正文由 renderSummary 统一生成失效文案,
+	// 因此这里允许带上服务端 msg 便于排查
+	if (AUTH_CREDENTIAL_CODES.includes(o)) return {
+		kind: "credential",
+		msg: `换票未成功: code=${o} ${r}`,
+		log: ""
+	};
+	// 401 在此是**业务码**(签名被拒/重放), 与 HTTP 401 无关; 盐值轮换也落到这一分支(R3.2)。
+	// 非凭证类失败不得回显服务端响应体(logging-and-notify.md): msg 只用于判定该补哪条提示, 不拼进正文
+	return {
+		kind: "interface",
+		msg: `换票接口变更(疑似移动侧调整): code=${o}${r.includes("签名") ? AUTH_SALT_HINT : ""}${r.includes("重复请求") ? AUTH_REPLAY_HINT : ""}`,
+		log: `服务端提示: ${r}`
+	}
+}
+// 服务器对时(免签/免鉴权): 整轮只请求一次并缓存**偏移量**而不是绝对时间戳(PRD Q2) ——
+// 换票可能在流程后期重试, 缓存陈旧 ts 会撞实测 ±5min 窗口; 用偏移则每次签名的 ts 仍随本地时钟单调递增
+let serverTsOffset = null;
+// 对时失败不缓存 0(否则一次瞬时抖动会把整轮的漂移修正静默关掉), 但最多试 2 次就放弃,
+// 不无限重试。/api/timestamp 免签免鉴权且不是限流的那个端点, 多试一次代价可忽略
+let serverTsAttempts = 0;
+// 告警只打一次(与 warnFetchCookieMissing 同模式): 重试上限内多次失败不应刷屏
+let serverTsWarned = !1;
+function warnServerTsFailed(e) {
+	serverTsWarned || (serverTsWarned = !0, t.warn(`${LOG_PREFIX} ${e}, 本次使用本机时钟; 若换票报「重复请求」, 可能是本机时钟偏差超过 5 分钟窗口`))
+}
+async function syncServerTimestamp(e) {
+	if (null !== serverTsOffset) return serverTsOffset;
+	if (serverTsAttempts >= 2) return 0;
+	serverTsAttempts += 1;
+	// 回落值 0 = 用本机时钟; 只有拿到合理服务器时间才改写偏移
+	let r = 0;
+	try {
+		const o = await e({
+			url: MCLOUD_TS,
+			method: "get",
+			headers: {
+				"User-Agent": ft,
+				Accept: "*/*",
+				Origin: MCLOUD_ORIGIN,
+				Referer: MCLOUD_PAGE
+			},
+			responseType: "json",
+			throwHttpErrors: !1
+		}, 1),
+			n = o?.data?.result,
+				i = Number(n);
+		// 下限 1e11 ≈ 1973-03, 作用是拒掉 HTML/脏值/回 0, 并把**秒级** epoch(约 1.79e9) 一并拒掉 ——
+		// 误用秒级值会把签名时间戳推到窗口外, 得到误导性的「重复请求」。HTML/脏值一律当对时失败, 不把错值缓存整轮。
+		// ⚠ 不要给 offset 加上限: 容器时钟真漂移 10 分钟时, offset=±600000 恰恰是必需的修正值;
+		// 限制它等于在漂移真发生时关掉修正, 正好破掉 AC8 要修的场景。实测该端点回的是递增新值(无 CDN 缓存)。
+		if (Number.isFinite(i) && i > 1e11) {
+			r = i - Date.now(), serverTsOffset = r;
+			// AC8「时钟漂移可诊断」: 必须把偏移量打出来, 否则运维只知道对时成功却不知道漂了多少。
+			// 阈值 5s: 实测正常网络下往返偏差约 1–2s, 超过则说明本机时钟确实需要被提醒
+			Math.abs(r) > 5e3 && t.warn(`${LOG_PREFIX} 服务器对时偏移 ${r > 0 ? "+" : ""}${r}ms(本机与服务器之差;偏差超过 300000ms 会使换票报「重复请求」)`)
+		} else warnServerTsFailed("服务器对时未返回有效时间戳")
+	} catch (o) {
+		// 对时失败必须显式告警: 否则后续「重复请求」会被误读成重放攻击(AC8)
+		warnServerTsFailed(`服务器对时失败(${redactLog(o?.message||String(o))})`)
+	}
+	// 失败不缓存偏移(下个账号还能再试, 受 serverTsAttempts 上限约束)
+	return r
+}
 
 function wt(e) {
 	return {
@@ -3686,12 +3835,86 @@ function wt(e) {
 			});
 			return t?.success ? t.data.token : null
 		},
+		// 换票(ssoToken→jwtToken): 旧端点已下线(404), 迁到签名版 MCLOUD_AUTH。
+		// 三条实测约束决定了本函数的形状(research/tyrzlogin-signature.md):
+		//  1) 签名失败/重放/token 失效都回 HTTP 200 → 判活只看 body 的 code, 见 classifyAuthFailure
+		//  2) 防重放按 x-request-id → rid/nonce 每次实际请求前新生成, 不跨请求复用
+		//  3) 限流与 marketName 缺失都回 nginx 级 HTML 404 → retry=1 且必须固定带 marketName
+		// 返回统一结构(不用抛异常控制流程): {ok:true,token} / {ok:false,kind:"credential"|"interface",msg}
 		fetchJwt: async function(t) {
-			return e.requestJson({
-				url: bt(t),
-				method: "post",
-				headers: e.jwtHeaders
-			})
+			const r = String(e.config?.authSalt || AUTH_SALT_DEFAULT);
+			let o;
+			try {
+				// 现取现用: t(ssoToken) 由调用方刚取到, 本函数不缓存也不复用(R1.2)
+				const n = Date.now() + await syncServerTimestamp(e.request),
+						{rid: s, nonce: i} = newAuthIds(),
+						c = String(n);
+				// 独立 header 组: 不复用 this.jwtHeaders(它带旧域名 Host, 语义已错; design §6)。
+				// 实测只有 4 个 x-* 签名头 + content-type 是硬要求, 其余贴近真实客户端即可
+				o = await e.request({
+					url: MCLOUD_AUTH,
+					method: "post",
+					headers: {
+						"User-Agent": ft,
+						Accept: "*/*",
+						Origin: MCLOUD_ORIGIN,
+						Referer: MCLOUD_PAGE,
+						"Content-Type": "application/json;charset=UTF-8",
+						"x-request-id": s,
+						"x-timestamp": c,
+						"x-nonce": i,
+						"x-signature": buildAuthSignature(r, s, c, i),
+						showloading: "true"
+					},
+					data: {
+						token: t,
+						openAccount: 0,
+						marketName: AUTH_MARKET_NAME,
+						sourceId: "1097"
+					},
+					responseType: "json",
+					// throwHttpErrors:!1 只用来兜真 404/5xx(它**不是**分类器 —— 签名类失败回的是 200);
+					// retry=1 关掉默认 3 次: 404/签名失败重试无意义, 且实测连发会撞 nginx 级限流(R4.3/AC10)
+					throwHttpErrors: !1
+				}, 1)
+			} catch (r) {
+				// 兼容层在 throwHttpErrors:!1 下仍可能因网络/超时抛出; 不得抛穿成 AxiosError 崩掉整账号(R4.1)。
+				// 原始异常文本只进 console(可能是 JSON 语法错等自带 invalid 字样的自由文本), 不进通知正文
+				return {
+					ok: !1,
+					kind: "interface",
+					msg: "换票接口异常(疑似限流或接口变更)",
+					detail: redactLog(r?.message||String(r))
+				}
+			}
+			const n = Number(o?.status ?? o?.statusCode ?? 0) || 0,
+				s = o?.data;
+			// 兼容层 JSON 解析失败时返回原始字符串(见 c()), 不抛异常 → 用 typeof 判定即可(AC6)。
+			// nginx 级限流 404 与业务 404 的 body 都是 HTML, 都不可解析成 JSON, 统一归「接口异常/疑似限流或变更」
+			if ("object" != typeof s || null === s) return {
+				ok: !1,
+				kind: "interface",
+				msg: `换票接口异常(返回非 JSON, 疑似限流或接口变更): HTTP ${n||"未知"}`
+			};
+			// 🔴 泄漏红线(R7.1): 响应**只允许读 code / msg / result.token 三个字段**。
+			// result.token 是 907 字符裸 JWT, 严禁把响应体或 result 整体 stringify 进日志/通知(AC16)
+			const i = classifyAuthFailure(s.code ?? null, s.msg ?? "", n);
+			if ("ok" !== i.kind) return {
+				ok: !1,
+				kind: i.kind,
+				msg: i.msg,
+				detail: i.log
+			};
+			const c = s?.result?.token;
+			// 「业务码成功但没给 token」同样不能当成功放行(否则下游静默零产出, 见 error-handling.md 写接口空转)
+			return c ? {
+				ok: !0,
+				token: String(c)
+			} : {
+				ok: !1,
+				kind: "interface",
+				msg: `换票接口异常(未返回 jwtToken): code=${s.code}`
+			}
 		}
 	}
 }
@@ -4315,9 +4538,11 @@ class Ut {
 		this.reporter.line(`[${this.maskedAccount}] ${e}`)
 	}
 	async run() {
-		this.stepResults = [];
+		this.stepResults = [], this.authInterfaceFailure = !1;
 		try {
-			if (!await this.jwt()) return void this.reporter.invalid.push(this.maskedAccount);
+			// 换票失败不等同于凭证失效: 接口/签名变更类失败只进 errors(退出码仍非 0),
+			// 不得被归成「请重新登录取 Cookie」这一无效动作(AC9/design §4)
+			if (!await this.jwt()) return void(this.authInterfaceFailure || this.reporter.invalid.push(this.maskedAccount));
 			const e = [
 				["签到", () => this.signinStatus()],
 				["戳一下", () => this.clickTask()],
@@ -4371,7 +4596,17 @@ class Ut {
 		const e = await this.ssoForMCloud() || await this.ssoForPortal();
 		if (!e) return this.log("获取 ssoToken 失败"), !1;
 		const t = await this.api.fetchJwt(e);
-		return t && 0 === t.code ? (this.jwtHeaders.jwtToken = t.result.token, this.cookies.jwtToken = t.result.token, this.log("jwtToken 获取成功"), !0) : (this.log(`获取 jwtToken 失败: ${t?.msg||"未知错误"}`), !1)
+		// 成功路径赋值不变(jwtHeaders.jwtToken / cookies.jwtToken) → 下游 10 个步骤零改动(R5.1)
+		if (t?.ok && t.token) return this.jwtHeaders.jwtToken = t.token, this.cookies.jwtToken = t.token, this.log("jwtToken 获取成功"), !0;
+		// 换票失败分两类(design §4): credential = 真实凭证态(ssoToken 已失效) → 维持原 invalid 通道;
+		// interface = 签名被拒/重放/HTML/404/5xx → 进 errors 并标记, 避开「已失效/重新登录」文案
+		if ("interface" === t?.kind) {
+			// 通知正文只用可控文案(不拼服务端 msg), 服务端提示只进 console 日志
+			const e = noticeSafe(t.msg || "换票接口异常"),
+					r = t.detail ? `${e} ${redactLog(t.detail)}` : e;
+			return this.authInterfaceFailure = !0, this.reporter.errors.push(`${this.maskedAccount}: ${e}`), this.log(`❌ ${r}`), !1
+		}
+		return this.log(`获取 jwtToken 失败: ${redactLog(t?.msg||"未知错误")}`), !1
 	}
 	async signinStatus() {
 		await this.sleep();
@@ -4781,7 +5016,11 @@ function runSelfCheck() {
 		["成功汇总(含云朵统计)", "执行完成\n云朵统计:\n1**********: 云朵 100", !1],
 		["已下线提示", "⚠️ 旧签到状态接口已下线(404), 直接尝试旧签到接口", !1],
 		["非凭证步骤失败汇总", `异常信息:\n1********** 云朵统计: ${NOTICE_SAFE_PLACEHOLDER}`, !1],
-		["配置缺失文案", `❌ ${l.missingCookie}`, !1]
+		["配置缺失文案", `❌ ${l.missingCookie}`, !1],
+		// 换票失败分流(AC9): 接口/签名变更类不得命中失效关键词(否则会把用户引向「重抓 Cookie」这一无效动作)
+		["换票接口变更文案(签名被拒)", `异常信息:\n1**********: ${classifyAuthFailure(401, "请求签名校验失败", 200).msg}`, !1],
+		["换票接口变更文案(重放+时钟漂移提示)", `异常信息:\n1**********: ${classifyAuthFailure(401, "重复请求", 200).msg}`, !1],
+		["换票非 JSON/限流文案", `异常信息:\n1**********: ${classifyAuthFailure(null, "", 404).msg}`, !1]
 	];
 	let failed = 0;
 	for (const [name, text, expected] of cases) {
@@ -4813,6 +5052,9 @@ function runSelfCheck() {
 	});
 	// M3 脱敏断言用独立字面量, 不引用任何真实凭证/secret
 	const shortSecret = "unitTestTokenAbc42";
+	// AC16 夹具: **虚构**假 JWT, 与实测 result.token 同长度(907 字符), 不对应任何真实凭证
+	const fakeJwt = "eyJhbGciOi".repeat(90) + "FAKEJWT",
+		fakeSso = "YZsidssolg" + "0".repeat(40);
 	const eqCases = [
 		["extractBusinessCode {code:0}", extractBusinessCode({
 			code: 0
@@ -4871,7 +5113,48 @@ function runSelfCheck() {
 				linkUrl: "https://z/w"
 			}]
 		}), "https://z/w"],
-		["extractOutLinkUrl 缺失返回空串", extractOutLinkUrl({}), ""]
+		["extractOutLinkUrl 缺失返回空串", extractOutLinkUrl({}), ""],
+		// ——— 换票签名通道回归网(AC2–AC4/AC15/AC16): 全程离线, 不依赖网络也不依赖有效凭证 ———
+		// AC2: 已知真实抓包样本逐字节对齐(盐值取常量, 不重复其值)
+		["换票签名对齐真实样本", buildAuthSignature(AUTH_SALT_DEFAULT, "9f58ed54-007e-43d9-a45a-882b4373822a", "1793068843531", "1bd7097a-c5ae-4116-b34f-edca6f5f4d69"), "b9ae5d0d36d6429e963d7c28a92854bd"],
+		// AC3: 实测大写 hex 必被拒 → 输出必须为小写(md5Lower 与 api.md5 的大写形式不得相同)
+		["换票签名为小写hex", /^[0-9a-f]{32}$/.test(buildAuthSignature(AUTH_SALT_DEFAULT, "9f58ed54-007e-43d9-a45a-882b4373822a", "1793068843531", "1bd7097a-c5ae-4116-b34f-edca6f5f4d69")), !0],
+		["md5Lower 不等于 api.md5 的大写形态", md5Lower("ydyp-case-guard") === Ze.MD5("ydyp-case-guard").toString().toUpperCase(), !1],
+		// AC4: 防重放按 x-request-id 判定 → rid/nonce 必须每次新生成
+		["换票 ids 每次不同(rid)", newAuthIds().rid !== newAuthIds().rid, !0],
+		["换票 ids 每次不同(nonce)", newAuthIds().nonce !== newAuthIds().nonce, !0],
+		["换票 ids 为 uuid 形态", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(newAuthIds().rid), !0],
+		// AC15: 分类只能按 body 里的业务码 —— 三种失败实测**全部 HTTP 200**, 故 httpStatus 统一传 200
+		["classifyAuthFailure 签名被拒(200+code401)", classifyAuthFailure(401, "请求签名校验失败", 200).kind, "interface"],
+		["classifyAuthFailure 重放(200+code401)", classifyAuthFailure(401, "重复请求", 200).kind, "interface"],
+		["classifyAuthFailure token失效(200+code200050409)", classifyAuthFailure(200050409, "token 已失效", 200).kind, "credential"],
+		["classifyAuthFailure 成功码", classifyAuthFailure(0, "success", 200).kind, "ok"],
+		["classifyAuthFailure 成功码为字符串形态", classifyAuthFailure("0", "success", 200).kind, "ok"],
+		// 重放文案必须点名「本机时钟偏差」(AC8), 签名被拒文案必须点名盐值覆盖变量(R3.2),
+		// 且接口类文案不得出现失效/重新登录(不误导用户去重抓 Cookie)
+		["classifyAuthFailure 重放文案含时钟偏差提示", classifyAuthFailure(401, "重复请求", 200).msg.includes("时钟偏差"), !0],
+		["classifyAuthFailure 签名被拒文案含盐值覆盖提示", classifyAuthFailure(401, "请求签名校验失败", 200).msg.includes("CLOUD139_AUTH_SALT"), !0],
+		["classifyAuthFailure 接口类文案不误导重抓 Cookie", /已失效|重新登录|cookie失效/i.test(classifyAuthFailure(401, "请求签名校验失败", 200).msg), !1],
+		// 网关层真 404/5xx(无业务码)归 interface 并带状态码
+		["classifyAuthFailure 无业务码+HTTP404", classifyAuthFailure(null, "", 404).kind, "interface"],
+		["classifyAuthFailure 非 JSON 文案不报成成功", classifyAuthFailure(null, "", 404).msg.includes("404"), !0],
+		// 必需字段护栏: marketName 缺失会被网关回 HTML 404(R1.4)
+		["换票 marketName 为固定常量", AUTH_MARKET_NAME, "sign_in_3"],
+		// AC16: 响应脱敏 —— 夹具一律用**虚构**假 JWT(绝不用真 result.token)
+		["假 JWT 夹具为 907 字符(与实测 result.token 同形)", fakeJwt.length, 907],
+		["redactLog 脱敏 JSON 形态 token", redactLog(`{"code":0,"result":{"token":"${fakeJwt}"}}`).includes(fakeJwt), !1],
+		["redactLog 命中后给占位", redactLog(`{"code":0,"result":{"token":"${fakeJwt}"}}`).includes("token=[redacted]"), !0],
+		["redactLog 脱敏裸 JWT", redactLog(fakeJwt).includes(fakeJwt), !1],
+		// 虚构 ssoToken 夹具(与真实值同前缀形状, 但内容全 0, 不入库任何真实凭证)
+		["假 ssoToken 夹具为虚构值", /^YZsidssolg0+$/.test(fakeSso), !0],
+		["redactLog 脱敏 ssoToken 形态", redactLog("ssoToken=YZsidssolg37e6be0000000000000000000000").includes("YZsidssolg"), !1],
+		["redactLog 脱敏裸 ssoToken 值", redactLog("ssoToken=YZsidssolg37e6be0000000000000000000000"), "ssoToken=[redacted]"],
+		// ssoToken 这一候选项**不可删**: 只有它能覆盖 JSON 形态(此处就是它的回归网)
+		["redactLog 脱敏 JSON 形态 ssoToken", redactLog(`{"success":true,"data":{"ssoToken":"${fakeSso}"}}`).includes(fakeSso), !1],
+		// 盐值不得进日志/通知(R3.3)
+		["redactLog 脱敏盐值环境变量形态", redactLog(`CLOUD139_AUTH_SALT=${AUTH_SALT_DEFAULT}`).includes(AUTH_SALT_DEFAULT), !1],
+		// $argument 走 JSON.stringify(282 行), 盐值若以 JSON 形态出现同样必须被脱敏
+		["redactLog 脱敏 JSON 形态盐值", redactLog(`{"CLOUD139_AUTH_SALT":"${AUTH_SALT_DEFAULT}"}`).includes(AUTH_SALT_DEFAULT), !1]
 	];
 	for (const [name, actual, expected] of eqCases) {
 		const pass = JSON.stringify(actual) === JSON.stringify(expected);
