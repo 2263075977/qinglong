@@ -4063,8 +4063,9 @@ function wt(e) {
 				kind: "interface",
 				msg: `换票接口异常(返回非 JSON, 疑似限流或接口变更): HTTP ${n||"未知"}`
 			};
-			// 🔴 泄漏红线(R7.1): 响应**只允许读 code / msg / result.token 三个字段**。
-			// result.token 是 907 字符裸 JWT, 严禁把响应体或 result 整体 stringify 进日志/通知(AC16)
+			// 🔴 泄漏红线(R7.1): 响应**只允许读 code / msg / result.token / result.userDomainId 四个字段**。
+			// result.token 是 907 字符裸 JWT, 严禁把响应体或 result 整体 stringify 进日志/通知(AC16)。
+			// userDomainId 不是凭证(可取: hcy v2 的 x-yun-uni), 但也一并不全量打印。
 			const i = classifyAuthFailure(s.code ?? null, s.msg ?? "", n);
 			if ("ok" !== i.kind) return {
 				ok: !1,
@@ -4072,11 +4073,13 @@ function wt(e) {
 				msg: i.msg,
 				detail: i.log
 			};
-			const c = s?.result?.token;
+			const c = s?.result?.token,
+				ud = s?.result?.userDomainId;
 			// 「业务码成功但没给 token」同样不能当成功放行(否则下游静默零产出, 见 error-handling.md 写接口空转)
 			return c ? {
 				ok: !0,
-				token: String(c)
+				token: String(c),
+				userDomainId: null == ud ? "" : String(ud)
 			} : {
 				ok: !1,
 				kind: "interface",
@@ -4307,11 +4310,17 @@ function Ft(e) {
 		}
 	}
 }
-// 上传通道(2026-10-21 实测): http/https ose、yun.139.com 同名路径、personal-kd-njs 等候选域全部 404,
-// 且 orchestration 网关自报后端 IUploadAndDownload 不可用(1010000501) —— 属服务端故障, 非参数问题。
-// 保留原 App XML 通道, 待服务端恢复后本步骤即可自然生效; 详见 .trellis/tasks/10-21-ydyp-a2-upload/prd.md
-const Nt = "http://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload",
-	Pt = "https://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload",
+// 522 上传已迁到 hcy v2 三段式(2026-10-28 端到端实测通过, 含 taskListV3 的 522.process 36→37):
+//   1) POST /hcy/file/create   → data:{fileId, uploadId, partInfos[0].uploadUrl}  ← EOS 预签名, X-Amz-Expires=7200
+//   2) PUT  <uploadUrl>        → 原始字节 + content-type: application/octet-stream, HTTP 200 + 空响应体
+//   3) POST /hcy/file/complete → {"fileId","uploadId","contentHashAlgorithm":"SHA256","contentHash"}
+// 旧 XML 单接口(ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload)已 http/https 双协议 404 下线,
+// 故整段移除; 事实源: .trellis/tasks/10-28-ydyp-hcy-v2/research/probe-findings.md §2
+const HCY_FILE_CREATE_URL = "https://personal-kd-njs.yun.139.com/hcy/file/create",
+	HCY_FILE_COMPLETE_URL = "https://personal-kd-njs.yun.139.com/hcy/file/complete",
+	// ⚠ 旧 XML 通道仅 uploadLargeFile(大文件上传, CLOUD139_UPLOAD 开关, 默认关闭)仍在用;
+	// 本任务不动大文件上传(见 prd「Out of scope」), 故该常量保留原名语义
+	LEGACY_XML_UPLOAD_URL = "https://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload",
 	Ot = "https://personal-kd-njs.yun.139.com/hcy/file/list",
 	// A3: 文件列表首选通道。实测字段名是 catalogID(不是 parentFileId/parentCatalogId),
 	// 带 App Authorization + jwtToken 时认证通过(只卡在后端 ICatalog 故障), 恢复后即可用
@@ -4406,53 +4415,205 @@ function maskShareUrl(e) {
 	const t = String(null == e ? "" : e).trim();
 	return t ? (/^https?:\/\//i.test(t) ? `${t.slice(0,12)}***(共 ${t.length} 字符, 已脱敏)` : `***(共 ${t.length} 字符, 已脱敏)`) : ""
 }
+// ——— 522 上传(hcy v2)的三个离网纯函数: 不发网络请求, 供 --selfcheck 直接断言 ———
+// sha256 用小写 hex。**选已内联的 CryptoJS(Ze.SHA256)而不是 node:crypto**:
+// 上传内容本身来自 CryptoJS WordArray, 同一实现不必在 WordArray 与 Buffer 之间做类型转换
+// (转错就是「hash 与 PUT 上去的字节不一致」这类只能靠 complete 报错才能发现的故障)。
+function sha256Hex(e) {
+	return Ze.SHA256(e).toString(Ze.enc.Hex).toLowerCase()
+}
+// hcy v2 请求头组(create / complete 共用, PUT 不用这组)。逐项来源 probe-findings §2.1/§7.2:
+//  · x-yun-uni = 换票响应的 result.userDomainId(实测值与 App 抓包一致)
+//  · service_identifier_key 是否严格必需**未验证**(实测带上即可用, 带上无害)
+//  · x-yun-client-info 取观测到的 iOS 形态; 它是否参与服务端校验**未验证**(换成 web 形态后 file/list 仍可用)
+const HCY_CLIENT_INFO = "1|10.0.0.102|2|13.2.5|APPLE|iPhone14,3|DA84E91D34498890E91D83099B60A9FE|020000000000|ios 27.0.1|428 * 926|zh-Hans-CN|0.0000|0.0000|aVBob25l|0|";
+function hcyV2Headers({
+	authorization,
+	userDomainId,
+	clientInfo,
+	extra
+}) {
+	return {
+		authorization: String(authorization || ""),
+		"x-yun-uni": String(userDomainId ?? ""),
+		"x-yun-api-version": "v2",
+		"x-yun-svc-type": "1",
+		"x-svctype": "1",
+		"x-yun-app-channel": "10000020",
+		"x-huawei-channelsrc": "10000020",
+		"x-yun-client-info": String(clientInfo || HCY_CLIENT_INFO),
+		service_identifier_key: "service_identifier_cloudDisk",
+		"content-type": "application/json",
+		...(extra || {})
+	}
+}
+// create 请求体: 字段名/顺序/取值集中在一处(实测形态逐字段得来, 缺 contentHash/contentHashAlgorithm 会直接被拒)。
+// parentFileId 空 → "/": 实测 "/" 是根, 而 "" / "0" / "root" / "-1" 全被拒(probe-findings §3.3)。
+// ⚠ 不得补 category 字段: 实测传 "0"/[]/"0" 都报「category 格式不匹配」(probe-findings §3.1)
+function buildUploadCreateBody({
+	name,
+	size,
+	contentHash,
+	parentFileId,
+	localCreatedAt
+}) {
+	const bytes = Number(size) || 0,
+		dir = String(parentFileId ?? "").trim();
+	return {
+		contentType: "application/octet-stream",
+		localCreatedAt: String(localCreatedAt || new Date().toISOString()),
+		parentFileId: dir || "/",
+		type: "file",
+		contentHash: String(contentHash || "").toLowerCase(),
+		contentHashAlgorithm: "SHA256",
+		size: bytes,
+		fileRenameMode: "auto_rename",
+		name: String(name || ""),
+		partInfos: [{
+			parallelHashCtx: {
+				partOffset: 0
+			},
+			partNumber: 1,
+			partSize: bytes
+		}],
+		refreshUpdatedAt: !0,
+		parallelUpload: !0
+	}
+}
+// create 响应解析(纯函数): 成功 = success **严格为 true** 且拿到 fileId/uploadId;
+// uploadUrl 取自 partInfos[0].uploadUrl(EOS 预签名只有 2 小时有效期 → 拿到就立刻 PUT, 不缓存)。
+// ⚠ rapidUpload(true = 服务端已有同 hash 文件, 可能不需要传字节)**语义未验证**:
+// 这里只做防御式分支(无 uploadUrl → 跳过 PUT 直接 complete), 不把它当已知行为。
+// 本任务用「每次唯一的文件内容」主动避开这一分支。
+function parseHcyCreateResult(e) {
+	const t = e?.data;
+	if (!0 !== e?.success) return {
+		ok: !1,
+		msg: `create 未返回成功(success=${e?.success ?? "缺失"} code=${e?.code ?? "?"})`
+	};
+	const r = t?.fileId,
+		o = t?.uploadId;
+	if (!r || !o) return {
+		ok: !1,
+		msg: "create 响应缺少 fileId/uploadId"
+	};
+	const n = t?.partInfos?.[0]?.uploadUrl;
+	return {
+		ok: !0,
+		fileId: String(r),
+		uploadId: String(o),
+		uploadUrl: n ? String(n) : "",
+		rapidUpload: !0 === t?.rapidUpload
+	}
+}
 
 function qt(e) {
 	return {
+		// 522 上传: hcy v2 三段式 create → PUT → complete(旧 XML 单接口已 404 下线, 整段移除)。
+		// 任一步失败都 throw(upload_unavailable → 外部故障: 只进 tasks, 不污染退出码);
+		// **不**打「上传成功」: 真正的成功判据是 taskListV3 的 522.process 前后快照增长(uploadForTask 已实现)。
 		uploadSimpleFile: async function() {
-			const t = ["<pcUploadFileRequest>", `<ownerMSISDN>${e.account}</ownerMSISDN>`, "<fileCount>1</fileCount>", "<totalSize>1</totalSize>", '<uploadContentList length="1">', "<uploadContentInfo>", "<comlexFlag>0</comlexFlag>", "<contentDesc><![CDATA[]]></contentDesc>", `<contentName><![CDATA[${e.config.uploadFilename}]]></contentName>`, "<contentSize>1</contentSize>", "<contentTAGList></contentTAGList>", "<digest>C4CA4238A0B923820DCC509A6F75849B</digest>", "<exif/>", "<fileEtag>0</fileEtag>", "<fileVersion>0</fileVersion>", "<updateContentID></updateContentID>", "</uploadContentInfo>", "</uploadContentList>", "<newCatalogName></newCatalogName>", `<parentCatalogID>${e.config.uploadDirId}</parentCatalogID>`, "<operation>0</operation>", "<path></path>", "<manualRename>2</manualRename>", '<autoCreatePath length="0"/>', "<tagID></tagID>", "<tagType></tagType>", "</pcUploadFileRequest>"].join("");
-			let r;
+			// 每次唯一的文件内容(时间戳 + 随机 hex), 主动避开未验证的 rapidUpload 秒传分支:
+			// 服务端已有同 hash 文件时才可能秒传, 而 hash 每次都不同 → 必走真实 PUT 路径
+			const content = `ql522-${Date.now()}-${Ze.enc.Hex.stringify(e.randomWordArray(8))}`,
+				wordArray = Ze.enc.Utf8.parse(content),
+				// ⚠ size 取 WordArray.sigBytes(UTF-8 **字节数**), 不能用字符串 .length
+				// (非 ASCII 时 .length 偏小, 会让 create 的 size/partSize 与 PUT 的 content-length 不符)
+				size = wordArray.sigBytes,
+				contentHash = sha256Hex(wordArray),
+				// EOS 预签名是 SigV4 且 X-Amz-SignedHeaders=content-length;host → content-length 差一个字节就签名失败。
+				// 发 PUT 前用独立路径复算一次字节数, 不等则**不发请求**直接失败(否则只会得到难归因的 403)
+				byteLength = "undefined" != typeof Buffer && "function" == typeof Buffer.byteLength ? Buffer.byteLength(content, "utf8") : size;
+			if (byteLength !== size) throw new YdypError(`上传通道中止: 内容字节数不一致(${byteLength}≠${size})`, "upload_unavailable");
+			// x-yun-uni 缺失不阻断上传(只告警): 是否真生效仍以 522.process 快照为准
+			e.userDomainId || e.log("⚠️ 未取到 userDomainId, hcy 上传请求可能被拒");
+			const headers = hcyV2Headers({
+				authorization: e.authorization,
+				userDomainId: e.userDomainId,
+				clientInfo: HCY_CLIENT_INFO
+			});
+			// ——— 步骤 1/3: create(明文 JSON, 不需要 cool 加密) ———
+			let createRes;
 			try {
-				r = await e.request({
-				url: Nt,
-				method: "post",
-				headers: {
-					"x-huawei-uploadSrc": "1",
-					"x-ClientOprType": "11",
-					Connection: "keep-alive",
-					"x-NetType": "6",
-					"x-DeviceInfo": "6|127.0.0.1|1|10.0.1|Xiaomi|M2012K10C|CB63218727431865A48E691BFFDB49A1|02-00-00-00-00-00|android 11|1080X2272|zh||||032|",
-					"x-huawei-channelSrc": "10000023",
-					"x-MM-Source": "032",
-					"x-SvcType": "1",
-					APP_NUMBER: e.account,
-					Authorization: e.authorization,
-					"X-Tingyun-Id": "p35OnrDoP8k;c=2;r=1955442920;u=43ee994e8c3a6057970124db00b2442c::8B3D3F05462B6E4C",
-					Host: "ose.caiyun.feixin.10086.cn",
-					"User-Agent": "okhttp/3.11.0",
-					"Content-Type": "application/xml; charset=UTF-8",
-					Accept: "*/*"
-				},
-				data: t,
-				responseType: "text",
-				throwHttpErrors: !1
-			})
-			} catch (e) {
-				throw new YdypError(`上传通道不可用(${redactLog(e?.message||String(e))})`, "upload_unavailable")
+				createRes = await e.request({
+					url: HCY_FILE_CREATE_URL,
+					method: "post",
+					headers,
+					data: buildUploadCreateBody({
+						name: e.config.uploadFilename,
+						size,
+						contentHash,
+						parentFileId: e.config.uploadDirId,
+						localCreatedAt: new Date().toISOString()
+					}),
+					responseType: "json",
+					throwHttpErrors: !1
+				}, 1)
+			} catch (err) {
+				throw new YdypError(`上传通道不可用(create 请求失败: ${redactLog(err?.message||String(err))})`, "upload_unavailable")
 			}
-			// 写接口空转修复: HTTP 2xx 不算成功, 必须校验业务码(见 error-handling.md)
-			const o = Number(r?.status ?? r?.statusCode ?? 0) || 0;
-			if (o < 200 || o >= 300) throw new YdypError(`上传通道不可用(HTTP ${o||"未知"})`, "upload_unavailable");
-			const n = extractUploadCode(r?.data);
-			if (!isUploadSuccessCode(n)) throw new YdypError(null == n ? "上传通道响应缺少业务码, 已按失败处理" : `上传通道返回业务码 ${n}, 已按失败处理`, "upload_unavailable");
-			return r
+			const createStatus = Number(createRes?.status ?? createRes?.statusCode ?? 0) || 0;
+			if (createStatus < 200 || createStatus >= 300) throw new YdypError(`上传通道不可用(create HTTP ${createStatus||"未知"})`, "upload_unavailable");
+			const target = parseHcyCreateResult(createRes?.data);
+			if (!target.ok) throw new YdypError(`上传通道不可用(${target.msg})`, "upload_unavailable");
+			// ——— 步骤 2/3: PUT 分片(预签名 URL 原样使用, 不改 query) ———
+			if (!target.uploadUrl) {
+				// ⚠ rapidUpload 语义**未验证**: 仅做防御 —— 没有 uploadUrl 就 PUT 不了, 只能直接 complete
+				if (!target.rapidUpload) throw new YdypError("上传通道不可用(create 未返回上传地址)", "upload_unavailable");
+				e.log("⚠️ 服务端返回秒传(该分支未验证), 跳过 PUT 直接 complete")
+			} else {
+				let putRes;
+				try {
+					putRes = await e.request({
+						url: target.uploadUrl,
+						method: "put",
+						headers: {
+							"content-type": "application/octet-stream"
+						},
+						// 传字符串体: 适配器把它当 body, content-length 由 HTTP 客户端按 UTF-8 字节数生成
+						data: content,
+						responseType: "text",
+						throwHttpErrors: !1
+					}, 1)
+				} catch (err) {
+					throw new YdypError(`上传通道不可用(PUT 分片请求失败: ${redactLog(err?.message||String(err))})`, "upload_unavailable")
+				}
+				const putStatus = Number(putRes?.status ?? putRes?.statusCode ?? 0) || 0;
+				// 403 SignatureDoesNotMatch 最常见成因是 content-length 与字节数不符 —— 那不是我们改签名能修的
+				if (putStatus < 200 || putStatus >= 300) throw new YdypError(`上传通道不可用(PUT 分片 HTTP ${putStatus||"未知"}${403 === putStatus ? ", 疑似 content-length 与字节数不符(EOS SigV4 预签名)" : ""})`, "upload_unavailable")
+			}
+			// ——— 步骤 3/3: complete(实测 contentHashAlgorithm + contentHash 缺一不可) ———
+			let completeRes;
+			try {
+				completeRes = await e.request({
+					url: HCY_FILE_COMPLETE_URL,
+					method: "post",
+					headers,
+					data: {
+						fileId: target.fileId,
+						uploadId: target.uploadId,
+						contentHashAlgorithm: "SHA256",
+						contentHash
+					},
+					responseType: "json",
+					throwHttpErrors: !1
+				}, 1)
+			} catch (err) {
+				throw new YdypError(`上传通道不可用(complete 请求失败: ${redactLog(err?.message||String(err))})`, "upload_unavailable")
+			}
+			const completeStatus = Number(completeRes?.status ?? completeRes?.statusCode ?? 0) || 0;
+			if (completeStatus < 200 || completeStatus >= 300) throw new YdypError(`上传通道不可用(complete HTTP ${completeStatus||"未知"})`, "upload_unavailable");
+			// 实测成功形态 {"success":true,"code":"0000"}; 但这仍**不是** 522 任务的成败判据(R1.2)
+			const completeCode = extractUploadCode(completeRes?.data);
+			if (!0 !== completeRes?.data?.success || !isUploadSuccessCode(completeCode)) throw new YdypError(`上传通道不可用(complete 未成功: success=${completeRes?.data?.success ?? "缺失"} code=${completeCode ?? "缺失"})`, "upload_unavailable");
+			return completeRes
 		},
 		uploadLargeFile: async function() {
 			const t = e.randomWordArray(1024 * e.config.uploadSizeMb * 1024),
 				r = e.md5(t),
 				o = ["<pcUploadFileRequest>", `<ownerMSISDN>${e.account}</ownerMSISDN>`, "<fileCount>1</fileCount>", `<totalSize>${1024*e.config.uploadSizeMb*1024}</totalSize>`, '<uploadContentList length="1">', "<uploadContentInfo>", `<contentName><![CDATA[${e.config.uploadFilename}]]></contentName>`, `<contentSize>${1024*e.config.uploadSizeMb*1024}</contentSize>`, "<contentDesc></contentDesc>", "<contentTAGList></contentTAGList>", "<comlexFlag>0</comlexFlag>", "<comlexCID></comlexCID>", '<resCID length="0"></resCID>', `<digest>${r}</digest>`, `<extInfo length="1"><entry><key>modifyTime</key><vaule>${e.formatDate(new Date)}</vaule></entry></extInfo>`, "</uploadContentInfo>", "</uploadContentList>", "<newCatalogName></newCatalogName>", `<parentCatalogID>${e.config.uploadDirId}</parentCatalogID>`, "<operation>0</operation>", "<path></path>", "<manualRename>2</manualRename>", "</pcUploadFileRequest>"].join("");
 			return e.request({
-				url: Pt,
+				url: LEGACY_XML_UPLOAD_URL,
 				method: "post",
 				headers: {
 					"x-huawei-uploadSrc": "1",
@@ -4632,7 +4793,7 @@ function qt(e) {
 }
 class Ut {
 	constructor(e, t, r) {
-		this.rawCookie = String(e || "").trim(), this.config = t, this.reporter = r, this.cookies = {}, this.jwtHeaders = {
+		this.rawCookie = String(e || "").trim(), this.config = t, this.reporter = r, this.cookies = {}, this.userDomainId = "", this.jwtHeaders = {
 			"User-Agent": ft,
 			Accept: "*/*",
 			Host: "caiyun.feixin.10086.cn:7071"
@@ -4682,6 +4843,11 @@ class Ut {
 				get jwtHeaders() {
 					return o.jwtHeaders
 				},
+				// hcy v2 的 x-yun-uni 来源: 换票成功后由 jwt() 落到实例
+				get userDomainId() {
+					return o.userDomainId
+				},
+				log: (...t) => o.log(...t),
 				request: (...e) => o.request(...e),
 				requestJson: (...e) => o.requestJson(...e),
 				requestText: (...e) => o.requestText(...e),
@@ -4853,7 +5019,14 @@ class Ut {
 		}
 		const t = await this.api.fetchJwt(e);
 		// 成功路径赋值不变(jwtHeaders.jwtToken / cookies.jwtToken) → 下游 10 个步骤零改动(R5.1)
-		if (t?.ok && t.token) return this.jwtHeaders.jwtToken = t.token, this.cookies.jwtToken = t.token, this.log("jwtToken 获取成功"), !0;
+		if (t?.ok && t.token) {
+			this.jwtHeaders.jwtToken = t.token, this.cookies.jwtToken = t.token;
+			// hcy v2 的 x-yun-uni 取换票响应的 result.userDomainId(probe-findings §7.3)。
+			// 拿不到时**不阻断**上传(仅告警), 上传是否真生效仍以 522.process 前后快照判定
+			this.userDomainId = t.userDomainId ? String(t.userDomainId) : "";
+			this.userDomainId || this.log("⚠️ 未取到 userDomainId, hcy 上传请求可能被拒");
+			return this.log("jwtToken 获取成功"), !0
+		}
 		// 换票失败分两类(design §4): credential = 真实凭证态(ssoToken 已失效) → 维持原 invalid 通道;
 		// interface = 签名被拒/重放/HTML/404/5xx → 进 errors 并标记, 避开「已失效/重新登录」文案
 		if ("interface" === t?.kind) {
@@ -5045,15 +5218,29 @@ class Ut {
 			}
 			n < times - 1 && await at(1e3, 3e3)
 		}
-		let after = null;
+		// 实测(真跑): 上传**确实计入** 522, 但服务端计数器有数秒延迟 —— 上传成功后立刻读 after 会得到
+		// 「未增长」的**假阴性**(隔一轮独立复核才看到 prog 38→39)。所以 after 快照不能读一次就下结论:
+		//   ① 首读即增长 → 直接判定成功, 不多等
+		//   ② 未增长 → 再读, 最多 PROGRESS_POLL_MAX 次尝试(间隔 2~3s, 总等待 ≤ ~8s), 绝不无限等
+		//   ③ 达到上限仍未增长 → 才打「进度未增长」告警(下面的既有 A1 判断保留原文案)
+		// 无 before 基线 / 本轮一次都没上传成功时无从判增长, 只读一次不多等。
+		// 轮询读快照本身抛错沿用既有容错(只告警, 不让本步失败)。
+		const PROGRESS_POLL_MAX = 3;
+		let after = null,
+			pollReads = 0;
 		try {
-			after = await this.readTaskProgress(522)
+			for (;;) {
+				after = await this.readTaskProgress(522), pollReads += 1;
+				const grew = null != after?.progress && null != before?.progress && after.progress > before.progress;
+				if (grew || ok <= 0 || null == before?.progress || pollReads >= PROGRESS_POLL_MAX) break;
+				await this.progressPollDelay()
+			}
 		} catch (err) {
 			this.log(`⚠️ 读取 522 进度失败: ${redactLog(err?.message||String(err))}`)
 		}
 		const b = null == before?.progress ? "?" : before.progress,
 			a = null == after?.progress ? "?" : after.progress;
-		this.log(`522 prog=${b}→${a}`);
+		this.log(`522 prog=${b}→${a}${pollReads > 1 ? ` (已轮询 ${pollReads} 次)` : ""}`);
 		if (!ok) {
 			this.log("⚠️ 上传通道不可用, 本步未上传任何文件");
 			// A2: 通知里写明本步已跳过, 避免用户误以为「只是还没攒够」(文案已避开失效分流关键词)
@@ -5212,6 +5399,11 @@ class Ut {
 	}
 	async sleep() {
 		await at(this.config.delayMin, this.config.delayMax)
+	}
+	// 522 上传进度计数器有数秒延迟, after 快照需有限轮询。间隔复用已有的 at(min,max)(不新造 setTimeout 封装);
+	// 单独成方法只为让离线自检能注入桩, 避免自检真的睡 8 秒。
+	async progressPollDelay() {
+		await at(2e3, 3e3)
 	}
 }
 const Wt = TASK_TITLE,
@@ -5562,6 +5754,8 @@ async function runSelfCheck() {
 				uploadEnabled: !1
 			}, cfg), rep);
 			u.sleep = async () => {};
+			// 522 after 快照轮询间隔也注入掉: 自检不得真的睡 8 秒
+			u.progressPollDelay = async () => {};
 			return { u, rep }
 		},
 		drive = async fn => {
@@ -5822,6 +6016,370 @@ async function runSelfCheck() {
 		["B3 全端点 404 → 不出现「未获得奖励」", deadText.includes("未获得奖励"), !1],
 		["B3 全端点 404 → 无裸堆栈/执行异常", /执行异常|AxiosError/.test(deadText), !1],
 		["B3 全端点 404 → 通知正文不命中失效分流", matchesAlertRouting(deadRun.rep.renderSummary()), !1]
+	);
+	// ——— C3: 522 上传迁 hcy v2 三段式(create→PUT→complete)的回归网 ———
+	// 全程离线, 不发任何网络请求; 夹具一律虚构值(FAKE_*), 不含真实凭证/手机号/JWT
+	const hcyShaAbc = sha256Hex(Ze.enc.Utf8.parse("abc")),
+		hcyBodyEmptyDir = buildUploadCreateBody({
+			name: "unit-test-file.txt",
+			size: 42,
+			contentHash: "ABCDEF",
+			parentFileId: "",
+			localCreatedAt: "2026-10-27T02:05:57.000Z"
+		}),
+		hcyBodyRealDir = buildUploadCreateBody({
+			name: "unit-test-file.txt",
+			size: 42,
+			contentHash: "abcdef",
+			parentFileId: "FAKE_DIR_ID",
+			localCreatedAt: "2026-10-27T02:05:57.000Z"
+		}),
+		hcyHeaders = hcyV2Headers({
+			authorization: "Basic FAKE_AUTH",
+			userDomainId: "FAKE_DOMAIN",
+			clientInfo: "FAKE_CLIENT_INFO"
+		});
+	eqCases.push(
+		// AC3: sha256 用固定向量锁死 —— 换成 MD5 / 大写 / 截断任一种都必须转红
+		["C3 sha256Hex(abc) 固定向量", hcyShaAbc, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"],
+		["C3 sha256Hex 为小写 64 位 hex", /^[0-9a-f]{64}$/.test(hcyShaAbc), !0],
+		["C3 sha256Hex 空串向量", sha256Hex(Ze.enc.Utf8.parse("")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"],
+		// AC4: 目录未配置 → "/"(实测 ""/"0"/"root"/"-1" 都被拒; "/" 才是根)
+		["C3 parentFileId 为空回落根目录 /", hcyBodyEmptyDir.parentFileId, "/"],
+		["C3 parentFileId 已配置时原样使用", hcyBodyRealDir.parentFileId, "FAKE_DIR_ID"],
+		// create body 形状(逐字段实测得来, 缺 contentHash/contentHashAlgorithm 会被拒)
+		["C3 create body size 与 partSize 严格一致", [hcyBodyEmptyDir.size, hcyBodyEmptyDir.partInfos[0].partSize], [42, 42]],
+		["C3 create body 单分片 + 并行上传形态", [hcyBodyEmptyDir.partInfos[0].partNumber, hcyBodyEmptyDir.partInfos[0].parallelHashCtx.partOffset, hcyBodyEmptyDir.parallelUpload], [1, 0, !0]],
+		["C3 create body 必需字段", [hcyBodyEmptyDir.contentType, hcyBodyEmptyDir.type, hcyBodyEmptyDir.contentHashAlgorithm, hcyBodyEmptyDir.fileRenameMode, hcyBodyEmptyDir.refreshUpdatedAt], ["application/octet-stream", "file", "SHA256", "auto_rename", !0]],
+		["C3 create body contentHash 归一为小写", hcyBodyEmptyDir.contentHash, "abcdef"],
+		// R2.3 的教训: category 传了必报「格式不匹配」→ 请求体里绝不能出现
+		["C3 create body 不得含 category", "category" in hcyBodyEmptyDir, !1],
+		// hcy v2 头组(实测必需项)
+		["C3 hcy 头 x-yun-uni 取 userDomainId", hcyHeaders["x-yun-uni"], "FAKE_DOMAIN"],
+		["C3 hcy 头版本/渠道/服务类型", [hcyHeaders["x-yun-api-version"], hcyHeaders["x-yun-app-channel"], hcyHeaders["x-huawei-channelsrc"], hcyHeaders["x-yun-svc-type"], hcyHeaders["x-svctype"]], ["v2", "10000020", "10000020", "1", "1"]],
+		["C3 hcy 头带 service_identifier_key(严格必要性未验证)", hcyHeaders.service_identifier_key, "service_identifier_cloudDisk"],
+		["C3 hcy 头为 JSON 且无 category", [hcyHeaders["content-type"], "category" in hcyHeaders], ["application/json", !1]],
+		["C3 hcy 头 clientInfo 可覆盖/可回落内置 iOS 形态", [hcyV2Headers({
+			authorization: "A",
+			userDomainId: "D"
+		})["x-yun-client-info"] === HCY_CLIENT_INFO, hcyHeaders["x-yun-client-info"]], [!0, "FAKE_CLIENT_INFO"]],
+		// create 响应解析: 成功 / 失败 / 缺字段 / 秒传防御
+		["C3 parseHcyCreateResult 正常取到 fileId/uploadId/uploadUrl", (() => {
+			const r = parseHcyCreateResult({
+				success: !0,
+				code: "0000",
+				data: {
+					fileId: "FAKE_FILE",
+					uploadId: "FAKE_UPLOAD",
+					rapidUpload: !1,
+					partInfos: [{
+						uploadUrl: "https://eos.example/put"
+					}]
+				}
+			});
+			return [r.ok, r.fileId, r.uploadId, r.uploadUrl, r.rapidUpload]
+		})(), [!0, "FAKE_FILE", "FAKE_UPLOAD", "https://eos.example/put", !1]],
+		["C3 parseHcyCreateResult success:false 不算成功", parseHcyCreateResult({
+			success: !1,
+			code: "04000002",
+			data: {
+				fileId: "F",
+				uploadId: "U"
+			}
+		}).ok, !1],
+		["C3 parseHcyCreateResult 缺 fileId 不算成功", parseHcyCreateResult({
+			success: !0,
+			code: "0000",
+			data: {
+				uploadId: "U"
+			}
+		}).ok, !1],
+		["C3 parseHcyCreateResult 无 uploadUrl 时如实为空串", parseHcyCreateResult({
+			success: !0,
+			code: "0000",
+			data: {
+				fileId: "F",
+				uploadId: "U",
+				rapidUpload: !0
+			}
+		}).uploadUrl, ""]
+	);
+	// 三段式端到端离线驱动: 桩 request 记录**真实**调用序列, 断言三步齐全 / hash 与字节一致 / 失败即 throw
+	const mkUploadUnit = (opts = {}) => {
+			const {
+				u,
+				rep
+			} = mkUnit(),
+				calls = [];
+			let createBody = null;
+			u.userDomainId = "FAKE_DOMAIN";
+			u.request = async (cfg, retry) => {
+				const url = String(cfg.url || ""),
+					kind = url.includes("/hcy/file/create") ? "create" : url.includes("/hcy/file/complete") ? "complete" : "put";
+				calls.push([kind, cfg.method, cfg.headers, cfg.data, retry]);
+				if ("create" === kind) {
+					createBody = cfg.data;
+					if (opts.createThrow) throw Object.assign(new Error("FAKE_NETWORK_RESET"), {
+						code: "ERR_NETWORK"
+					});
+					return {
+						status: opts.createStatus ?? 200,
+						data: opts.createData ?? {
+							success: !0,
+							code: "0000",
+							data: {
+								fileId: "FAKE_FILE",
+								uploadId: "FAKE_UPLOAD",
+								rapidUpload: !1,
+								partInfos: [{
+									partNumber: 1,
+									uploadUrl: "https://eos.example/put?partNumber=1"
+								}]
+							}
+						}
+					}
+				}
+				if ("complete" === kind) return {
+					status: opts.completeStatus ?? 200,
+					data: opts.completeData ?? {
+						success: !0,
+						code: "0000"
+					}
+				};
+				return {
+					status: opts.putStatus ?? 200,
+					data: ""
+				}
+			};
+			return {
+				u,
+				rep,
+				calls,
+				createBody: () => createBody
+			}
+		},
+		upOk = mkUploadUnit(),
+		upOk2 = mkUploadUnit(),
+		upOkErr = await drive(() => upOk.u.api.uploadSimpleFile());
+	await drive(() => upOk2.u.api.uploadSimpleFile());
+	const upCreate = upOk.calls.find(c => "create" === c[0]),
+		upPut = upOk.calls.find(c => "put" === c[0]),
+		upCreateBody = upOk.createBody(),
+		upPutText = String(upPut?.[3] ?? ""),
+		upPutBytes = Ze.enc.Utf8.parse(upPutText).sigBytes,
+		// 取某次运行实际上传的字节体(用于断言「内容每次唯一」)
+		upBodyOf = unit => String(unit.calls.find(c => "put" === c[0])?.[3] ?? "");
+	// 失败路径夹具(每一种都必须 throw YdypError(upload_unavailable), 且不得静默跳过步骤)
+	const upCreate404 = mkUploadUnit({
+			createStatus: 404
+		}),
+		upCreate404Err = await drive(() => upCreate404.u.api.uploadSimpleFile()),
+		upCreateNet = mkUploadUnit({
+			createThrow: !0
+		}),
+		upCreateNetErr = await drive(() => upCreateNet.u.api.uploadSimpleFile()),
+		upNoUrl = mkUploadUnit({
+			createData: {
+				success: !0,
+				code: "0000",
+				data: {
+					fileId: "F",
+					uploadId: "U",
+					rapidUpload: !1
+				}
+			}
+		}),
+		upNoUrlErr = await drive(() => upNoUrl.u.api.uploadSimpleFile()),
+		upRapid = mkUploadUnit({
+			createData: {
+				success: !0,
+				code: "0000",
+				data: {
+					fileId: "F",
+					uploadId: "U",
+					rapidUpload: !0
+				}
+			}
+		}),
+		upRapidErr = await drive(() => upRapid.u.api.uploadSimpleFile()),
+		upPut403 = mkUploadUnit({
+			putStatus: 403
+		}),
+		upPut403Err = await drive(() => upPut403.u.api.uploadSimpleFile()),
+		upCompleteFail = mkUploadUnit({
+			completeData: {
+				success: !1,
+				code: "04000002"
+			}
+		}),
+		upCompleteFailErr = await drive(() => upCompleteFail.u.api.uploadSimpleFile()),
+		upTypeProbe = await (async () => {
+			const {
+				u
+			} = mkUploadUnit({
+				createStatus: 404
+			});
+			try {
+				await u.api.uploadSimpleFile()
+			} catch (e) {
+				return [e.name, e.type]
+			}
+			return ["none", "none"]
+		})();
+	eqCases.push(
+		["C3 三段式全部成功时不抛异常", upOkErr, ""],
+		["C3 调用序列严格为 create→PUT→complete", upOk.calls.map(c => c[0]), ["create", "put", "complete"]],
+		["C3 每步只发 1 次请求(失败不立即重试)", upOk.calls.map(c => c[4]), [1, 1, 1]],
+		// AC3: contentHash 必须是**实际 PUT 字节**的 sha256(不是固定值, 也不是别的编码)
+		["C3 create 的 contentHash = PUT 字节的 sha256", upCreateBody.contentHash, sha256Hex(Ze.enc.Utf8.parse(upPutText))],
+		["C3 create 的 size = PUT 字节数", [upCreateBody.size, upPutBytes], [upPutBytes, upPutBytes]],
+		["C3 complete 的 contentHash 与 create 一致", upOk.calls.find(c => "complete" === c[0])[3].contentHash, upCreateBody.contentHash],
+		["C3 complete 用大写算法名 SHA256", upOk.calls.find(c => "complete" === c[0])[3].contentHashAlgorithm, "SHA256"],
+		["C3 PUT 用 octet-stream 且预签名 URL 原样", [upPut[2]["content-type"], String(upPut[2]["x-yun-uni"] ?? "")], ["application/octet-stream", ""]],
+		["C3 hcy 请求头带 x-yun-uni(来自换票)", upCreate[2]["x-yun-uni"], "FAKE_DOMAIN"],
+		["C3 上传内容每次唯一(主动避开未验证的秒传)", [upBodyOf(upOk) !== upBodyOf(upOk2), upBodyOf(upOk).length > 0], [!0, !0]],
+		// ⚠ 断言目标必须是**代码里真实存在**的成功文案, 否则只是装饰(quality-guidelines.md「断言必须有牙齿」)。
+		// 实测: 原写法检查字面量「上传成功」, 而全文件根本没有这句话 → 任何变异都不会转红。
+		// 真正该守住的是: API 层成功返回时**不得自行宣称任务完成**(成败判据只属于 522.process 快照)。
+		["C3 uploadSimpleFile 成功时不自行宣称任务完成", /上传任务文件完成|522 prog|进度已增长/.test(upOk.rep.lines.join("\n")), !1],
+		// 任一步失败都必须 throw, 且类型为 upload_unavailable(外部故障 → 只进 tasks)
+		["C3 失败时抛 YdypError/upload_unavailable", upTypeProbe, ["YdypError", "upload_unavailable"]],
+		["C3 create HTTP 404 → 抛错且不继续 PUT/complete", [upCreate404Err.startsWith("YdypError"), upCreate404Err.includes("create HTTP 404"), upCreate404.calls.length], [!0, !0, 1]],
+		["C3 create 网络异常 → 抛错", [upCreateNetErr.startsWith("YdypError"), upCreateNetErr.includes("create 请求失败")], [!0, !0]],
+		["C3 create 未返回上传地址且非秒传 → 抛错", [upNoUrlErr.startsWith("YdypError"), upNoUrl.calls.length], [!0, 1]],
+		["C3 秒传(未验证分支)无 uploadUrl → 跳过 PUT 只 create+complete", [upRapidErr, upRapid.calls.map(c => c[0]), /秒传/.test(upRapid.rep.lines.join("\n"))], ["", ["create", "complete"], !0]],
+		["C3 PUT 403 → 抛错且不继续 complete", [upPut403Err.startsWith("YdypError"), upPut403Err.includes("PUT 分片 HTTP 403"), upPut403.calls.length], [!0, !0, 2]],
+		["C3 complete 业务失败 → 抛错(HTTP 200 不算成功)", [upCompleteFailErr.startsWith("YdypError"), upCompleteFailErr.includes("complete 未成功"), upCompleteFail.calls.length], [!0, !0, 3]]
+	);
+	// uploadForTask 契约(R1.7 / AC7 的离线部分): 上传失败 = 外部故障 → 只进 tasks, 退出码语义不变, 不谎报
+	const upTask = mkUnit({
+			uploadTimes: 1
+		}),
+		upTaskProg = {
+			state: "WAIT",
+			progress: 36,
+			finished: !1
+		};
+	upTask.u.readTaskProgress = async () => upTaskProg;
+	upTask.u.api.uploadSimpleFile = async () => {
+		throw new YdypError("上传通道不可用(create HTTP 404)", "upload_unavailable")
+	};
+	const upTaskErr = await drive(() => upTask.u.uploadForTask()),
+		upTaskText = upTask.rep.lines.join("\n");
+	eqCases.push(
+		["C3 522 上传失败不抛穿(exit 保持 0)", upTaskErr, ""],
+		["C3 522 上传失败不进 errors", upTask.rep.errors.length, 0],
+		["C3 522 上传失败进 tasks(进度)", upTask.rep.tasks.some(t => String(t).includes("522 上传通道不可用")), !0],
+		["C3 522 上传失败进度文案不命中失效分流", matchesAlertRouting(upTask.rep.tasks.join("\n")), !1],
+		// 同上: 检查真实会出现的成功文案。一旦有人把成功日志挪到 await 之前, 本条即转红。
+		["C3 522 上传失败不谎报完成", /上传任务文件完成/.test(upTaskText), !1],
+		["C3 522 打印 prog=before→after 快照", upTaskText.includes("522 prog=36→36"), !0]
+	);
+	// 522 after 快照**轮询**: 真跑暴露「上传确实计入, 但计时器有数秒延迟」→ 读一次就下结论会误报「进度未增长」。
+	// 用桩驱动**真实** uploadForTask(不抄表达式), 读取序列与等待全部注入, 自检保持离线且不睡。
+	const mkProgUnit = (seq, opts = {}) => {
+			const { u, rep } = mkUnit({ uploadTimes: 1 }),
+				reads = [];
+			let polls = 0,
+				calls = 0,
+				idx = 0;
+			u.readTaskProgress = async () => {
+				calls += 1;
+				if (opts.throwAtCall && calls === opts.throwAtCall) throw new Error("FAKE_PROGRESS_READ_FAIL");
+				const v = seq[Math.min(idx, seq.length - 1)];
+				idx += 1, reads.push(v.progress);
+				return { state: "WAIT", progress: v.progress, finished: !1 }
+			};
+			u.progressPollDelay = async () => { polls += 1 };
+			u.api.uploadSimpleFile = async () => ({ ok: !0 });
+			return { u, rep, reads, polls: () => polls }
+		},
+		// ① 计数延迟: before=38 → 首读 after=38 → 再读 after=39(真跑的实际形态)
+		wDelay = mkProgUnit([{ progress: 38 }, { progress: 38 }, { progress: 39 }]),
+		wDelayErr = await drive(() => wDelay.u.uploadForTask()),
+		delayText = wDelay.rep.lines.join("\n"),
+		// ② 永远不增长: 必须仍然告警, 且尝试次数被封顶(不无限轮询)
+		wNever = mkProgUnit([{ progress: 38 }]),
+		wNeverErr = await drive(() => wNever.u.uploadForTask()),
+		neverText = wNever.rep.lines.join("\n"),
+		// ③ 轮询期间读快照抛错: 沿用既有容错(只告警, 不让本步失败, 也不误报未增长)
+		wPollErr = mkProgUnit([{ progress: 38 }], { throwAtCall: 2 }),
+		wPollErrErr = await drive(() => wPollErr.u.uploadForTask()),
+		pollErrText = wPollErr.rep.lines.join("\n"),
+		// ④ 本轮一次都没上传成功: 无从判增长 → 只读一次 after, 不白等
+		wNoUp = mkProgUnit([{ progress: 38 }]);
+	wNoUp.u.api.uploadSimpleFile = async () => {
+		throw new YdypError("上传通道不可用(create HTTP 404)", "upload_unavailable")
+	};
+	const wNoUpErr = await drive(() => wNoUp.u.uploadForTask());
+	eqCases.push(
+		["C3 522 计数延迟: 轮询后不误报「进度未增长」", /进度未增长/.test(delayText), !1],
+		["C3 522 计数延迟: 最终快照 prog=38→39(增长即判定成功)", delayText.includes("522 prog=38→39"), !0],
+		["C3 522 计数延迟: tasks 里是进度增长的正向文案", wDelay.rep.tasks.some(t => String(t).includes("39/100")), !0],
+		["C3 522 计数延迟: 首读未增长只补 1 次等待(reads=before+2 次 after)", [wDelay.reads, wDelay.polls()], [[38, 38, 39], 1]],
+		["C3 522 计数延迟: 本步不抛穿", wDelayErr, ""],
+		["C3 522 始终不增长 → 仍然告警(告警没被修坏)", /进度未增长/.test(neverText), !0],
+		["C3 522 不增长的尝试上限为 3 次(1 before + 3 after / 2 次等待)", [wNever.reads.length, wNever.polls()], [4, 2]],
+		["C3 522 始终不增长仍如实写进 tasks", wNever.rep.tasks.some(t => String(t).includes("进度未增长")), !0],
+		["C3 522 轮询读快照抛错不中断本步", wPollErrErr, ""],
+		["C3 522 轮询读快照抛错只告警", /读取 522 进度失败/.test(pollErrText), !0],
+		["C3 522 轮询读快照抛错不误报未增长", /进度未增长/.test(pollErrText), !1],
+		["C3 522 未上传成功时不轮询(只读 1 次 after)", [wNoUp.reads, wNoUp.polls(), wNoUpErr], [[38, 38], 0, ""]]
+	);
+	// userDomainId 采集: 注入换票响应桩 → 驱动**真实** jwt()/fetchJwt(), 断言落到实例(不是抄一份表达式)
+	const mkDomainUnit = () => {
+			const {
+				u,
+				rep
+			} = mkUnit();
+			u.api.ssoForMCloud = async () => ({
+				kind: "ok",
+				token: "FAKE_SSO"
+			});
+			u.request = async cfg => String(cfg.url || "").includes("tyrzLogin") ? {
+				status: 200,
+				data: {
+					code: 0,
+					msg: "success",
+					result: {
+						token: "FAKE_JWT_TOKEN",
+						userDomainId: "FAKE_DOMAIN_ID"
+					}
+				}
+			} : {
+				status: 200,
+				data: {
+					result: Date.now()
+				}
+			};
+			return {
+				u,
+				rep
+			};
+		},
+		wDomain = mkDomainUnit(),
+		rDomain = await wDomain.u.jwt(),
+		wNoDomain = mkDomainUnit();
+	wNoDomain.u.request = async cfg => String(cfg.url || "").includes("tyrzLogin") ? {
+		status: 200,
+		data: {
+			code: 0,
+			msg: "success",
+			result: {
+				token: "FAKE_JWT_TOKEN"
+			}
+		}
+	} : {
+		status: 200,
+		data: {
+			result: Date.now()
+		}
+	};
+	const rNoDomain = await wNoDomain.u.jwt();
+	eqCases.push(
+		["C3 换票成功后 userDomainId 落到实例", [rDomain, wDomain.u.userDomainId, wDomain.u.cookies.jwtToken], [!0, "FAKE_DOMAIN_ID", "FAKE_JWT_TOKEN"]],
+		["C3 未取到 userDomainId 不阻断(仍返回成功)", [rNoDomain, wNoDomain.u.userDomainId], [!0, ""]],
+		["C3 未取到 userDomainId 有告警", wNoDomain.rep.lines.some(l => String(l).includes("未取到 userDomainId")), !0]
 	);
 	for (const [name, actual, expected] of eqCases) {
 		const pass = JSON.stringify(actual) === JSON.stringify(expected);
