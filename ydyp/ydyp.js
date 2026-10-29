@@ -17,9 +17,6 @@
  *   CLOUD139_UPLOAD_TIMES=25     上传任务(522 当月上传满100个)单次运行次数上限, 0=跳过; 每次间隔随机 1-3s, 连续 3 次失败即停; 负值告警后按 0 处理
  *   CLOUD139_UPLOAD_FILENAME=000000.txt  上传文件名(522 上传与大文件上传共用), 默认 000000.txt
  *   CLOUD139_DIR_ID              上传目录 ID(空=根目录); 522 上传与大文件上传共用
- *   CLOUD139_SHARE_TIMES=7       分享任务(434 分享文件领好礼)单次运行建链次数, 0=跳过; 每次间隔随机 1-3s, 连续 3 次失败即停; 负值告警后按 0 处理
- *   CLOUD139_SHARE_FILENAME      分享任务优先匹配的文件名关键字(空=取列表首个文件)
- *   CLOUD139_SHARE_DIR_ID        分享取文件的目录 ID(空=回落到 CLOUD139_DIR_ID)
  *   CLOUD139_UPLOAD              大文件上传开关(默认关闭)
  *   CLOUD139_AUTH_SALT           换票接口(tyrzLogin)签名盐值(默认内置; 移动轮换盐值导致签名被拒时在此覆盖)
  *
@@ -673,10 +670,6 @@ const u = {
 			uploadSizeMb: 7,
 			uploadTimes: 25,
 			uploadDirId: "",
-			// A3: 分享会产生对外可见链接, 默认次数与 434 的目标值(7)一致, 不额外制造链接
-			shareTimes: 7,
-			shareFilename: "",
-			shareDirId: "",
 			// 换票签名盐值(可被 CLOUD139_AUTH_SALT 覆盖; 见 AUTH_SALT_DEFAULT 注释: 字面量只允许出现一处)
 			authSalt: AUTH_SALT_DEFAULT
 		}
@@ -3041,9 +3034,9 @@ function tt(e, t) {
 	const r = Number(e);
 	return Number.isFinite(r) ? r : t
 }
-// 次数类变量(CLOUD139_UPLOAD_TIMES / CLOUD139_SHARE_TIMES)负值属配置笔误: 告警后回落 0(跳过本步),
+// 次数类变量(CLOUD139_UPLOAD_TIMES)负值属配置笔误: 告警后回落 0(跳过本步),
 // 不静默透传以免日志打出误导性的「=0」; 选 0 而非默认值, 是因为写负数的用户更可能想关掉本步;
-// 非数字/空串仍由 tt 回落默认值(上传 25 / 分享 7)
+// 非数字/空串仍由 tt 回落默认值(上传 25)
 function timesLimit(e, t, r) {
 	const o = tt(e, t);
 	if (o < 0) return console.warn(`${LOG_PREFIX} ⚠️ ${r}=${o} 非法(不能为负), 已按 0 处理(跳过本步)`), 0;
@@ -3052,10 +3045,6 @@ function timesLimit(e, t, r) {
 
 function ptimes(e, t) {
 	return timesLimit(e, t, "CLOUD139_UPLOAD_TIMES")
-}
-
-function stimes(e, t) {
-	return timesLimit(e, t, "CLOUD139_SHARE_TIMES")
 }
 
 function rt(e) {
@@ -3140,11 +3129,6 @@ function ct() {
 		uploadFilename: String(ut(e, ["uploadFilename"], lt([`${r}_UPLOAD_FILENAME`, "cloud139_upload_filename"], t.uploadFilename)) || t.uploadFilename),
 		uploadSizeMb: tt(ut(e, ["uploadSizeMb"], lt([`${r}_UPLOAD_SIZE_MB`, "cloud139_upload_size_mb"], t.uploadSizeMb)), t.uploadSizeMb),
 		uploadTimes: ptimes(ut(e, ["uploadTimes"], lt([`${r}_UPLOAD_TIMES`, "cloud139_upload_times"], t.uploadTimes)), t.uploadTimes),
-		// A3: 分享任务不再由开关门控(每次运行都跑, CLOUD139_SHARE_TIMES=0 即关闭),
-		// 避免「默认关闭 → 434 永远 0/7」在通道恢复后仍无人执行
-		shareTimes: stimes(ut(e, ["shareTimes"], lt([`${r}_SHARE_TIMES`, "cloud139_share_times"], t.shareTimes)), t.shareTimes),
-		shareFilename: String(ut(e, ["shareFilename"], lt([`${r}_SHARE_FILENAME`, "cloud139_share_filename"], t.shareFilename)) || ""),
-		shareDirId: String(ut(e, ["shareDirId", "share_dir_id"], lt([`${r}_SHARE_DIR_ID`, "cloud139_share_dir_id"], t.shareDirId)) || ""),
 		push: et(ut(e, ["push"], lt([`${r}_PUSH`, "cloud139_push"], t.push))),
 		tasklistV3: et(ut(e, ["tasklistV3", "taskListV3"], lt([`${r}_TASKLIST_V3`, "cloud139_tasklist_v3"], t.tasklistV3))),
 		clickNum: tt(ut(e, ["clickNum"], lt([`${r}_CLICK_NUM`, "cloud139_click_num"], t.clickNum)), t.clickNum),
@@ -4320,14 +4304,7 @@ const HCY_FILE_CREATE_URL = "https://personal-kd-njs.yun.139.com/hcy/file/create
 	HCY_FILE_COMPLETE_URL = "https://personal-kd-njs.yun.139.com/hcy/file/complete",
 	// ⚠ 旧 XML 通道仅 uploadLargeFile(大文件上传, CLOUD139_UPLOAD 开关, 默认关闭)仍在用;
 	// 本任务不动大文件上传(见 prd「Out of scope」), 故该常量保留原名语义
-	LEGACY_XML_UPLOAD_URL = "https://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload",
-	Ot = "https://personal-kd-njs.yun.139.com/hcy/file/list",
-	// A3: 文件列表首选通道。实测字段名是 catalogID(不是 parentFileId/parentCatalogId),
-	// 带 App Authorization + jwtToken 时认证通过(只卡在后端 ICatalog 故障), 恢复后即可用
-	FILE_LIST_URL = "https://yun.139.com/orchestration/personalCloud-rebuild/catalog/v1.0/getDisk",
-	// 建链保留 orchestration outlink: 实测它对无效 fileId 回的是业务码(1010010006「记录已被删除」),
-	// 说明路由有效且请求进了业务校验层; web 的 /richlifeApp/devapp/IOutLink 属于同一故障后端域
-	Lt = "https://yun.139.com/orchestration/personalCloud-rebuild/outlink/v1.0/getOutLink";
+	LEGACY_XML_UPLOAD_URL = "https://ose.caiyun.feixin.10086.cn/richlifeApp/devapp/IUploadAndDownload";
 
 // 上传写接口的业务码提取/校验(见 error-handling.md「写接口空转与陈旧数据」): HTTP 2xx 不算成功,
 // 必须服务端返回明确的成功业务码; 上传是否真正生效以 taskListV3 的 522.process 前后快照为准。
@@ -4347,7 +4324,7 @@ const UPLOAD_SUCCESS_CODES = ["0", "00", "0000", "000000", "success"];
 function isUploadSuccessCode(e) {
 	return null != e && UPLOAD_SUCCESS_CODES.includes(String(e).trim().toLowerCase())
 }
-// 通用业务码提取/校验(文件列表、建链等读写接口共用): 兼容 {code:0} / {code:"0"} / {resultCode} /
+// 通用业务码提取/校验(下游步骤读写接口共用): 兼容 {code:0} / {code:"0"} / {resultCode} /
 // {success:true} / {ok:true} 等形态。无法判定时返回 null, 调用方必须按失败处理(fail-closed),
 // 因为「响应里没有业务码」和「业务码是成功」完全不是一回事(见 error-handling.md「写接口空转」)
 function extractBusinessCode(e) {
@@ -4362,58 +4339,6 @@ function extractBusinessCode(e) {
 const BUSINESS_SUCCESS_CODES = ["0", "00", "0000", "000000", "success", "ok"];
 function isBusinessSuccessCode(e) {
 	return null != e && BUSINESS_SUCCESS_CODES.includes(String(e).trim().toLowerCase())
-}
-// 单条列表项的 kind 判定: hcy 的 items 里文件夹与文件共用 fileId, 靠 type:"folder"|"file" 区分
-// (web 端把 folder 映射成 catalogID 进 caIDLst、file 映射成 contentID 进 coIDLst)。
-// 若不标记 kind, 降级通道下会把目录 ID 当内容 ID 建链, 得到业务码 1010010006 并被误报为「通道不可用」。
-// 判不出时按文件处理: 宁可多试一次建链(失败只多一次请求), 也不漏掉可分享文件
-function detectFileKind(e) {
-	const t = String(e?.type ?? e?.fileType ?? "").trim().toLowerCase();
-	if (["folder", "dir", "directory", "catalog"].includes(t)) return "folder";
-	if (["file", "content", "media"].includes(t)) return "file";
-	if (!0 === e?.isDir || !0 === e?.isFolder) return "folder";
-	if (!1 === e?.isDir || !1 === e?.isFolder) return "file";
-	const r = e?.catalogType;
-	if (r == null) return "file";
-	const o = String(r).trim().toLowerCase();
-	return ["folder", "dir", "directory", "catalog"].includes(o) ? "folder" : "file"
-}
-// 文件列表响应归一: 各网关字段名不一致(getDisk 用 getDiskResult.contentList/contentID, hcy 用 items/fileId),
-// 统一成 {id, name, kind}。kind 保留目录/文件信息, 由 shareForTask 只对 kind==='file' 建链;
-// 这样「列表非空但全是目录」可被如实报为「目录下无文件」, 而不是误报「分享通道不可用」
-function extractFileList(e) {
-	const t = [e?.data?.getDiskResult?.contentList, e?.data?.items, e?.items, e?.data?.contentList, e?.result?.contentList, e?.data?.data?.items, e?.result?.items, e?.data?.fileList, e?.result?.fileList, e?.data?.list, e?.contentList],
-		r = t.find(e => Array.isArray(e)) || [],
-		o = [];
-	for (const t of r) {
-		if (!t || "object" != typeof t) continue;
-		const r = t.fileId ?? t.contentID ?? t.contentId ?? t.id;
-		if (null == r || "" === r) continue;
-		o.push({
-			id: String(r),
-			name: String(t.name ?? t.contentName ?? t.fileName ?? "").trim(),
-			kind: detectFileKind(t)
-		})
-	}
-	return o
-}
-// 建链响应里 linkUrl 的位置随网关版本不同, 依次在常见路径里找; 找不到返回空串由调用方按失败处理
-function extractOutLinkUrl(e) {
-	const t = [e?.data?.getOutLinkRes?.getOutLinkResSet, e?.data?.getOutLinkResSet, e?.result?.getOutLinkRes?.getOutLinkResSet, e?.result?.getOutLinkResSet, e?.getOutLinkRes?.getOutLinkResSet, e?.getOutLinkResSet];
-	for (const r of t) {
-		if (!Array.isArray(r)) continue;
-		const t = r.find(e => e && e.linkUrl);
-		if (t) return String(t.linkUrl)
-	}
-	const r = e?.data?.linkUrl || e?.result?.linkUrl || e?.linkUrl;
-	return null == r ? "" : String(r)
-}
-// 分享链接属「对外可见」副作用产物: 日志只打印脱敏形态, 不得打印完整可访问 URL(A3 PRD Notes)。
-// 只有 http(s) 链接才保留前 12 字符(域名前缀, 无凭证价值); 其余形态(短 token / 裸串)一律完全脱敏,
-// 避免短凭证被 slice(0,12) 泄漏 12/19
-function maskShareUrl(e) {
-	const t = String(null == e ? "" : e).trim();
-	return t ? (/^https?:\/\//i.test(t) ? `${t.slice(0,12)}***(共 ${t.length} 字符, 已脱敏)` : `***(共 ${t.length} 字符, 已脱敏)`) : ""
 }
 // ——— 522 上传(hcy v2)的三个离网纯函数: 不发网络请求, 供 --selfcheck 直接断言 ———
 // sha256 用小写 hex。**选已内联的 CryptoJS(Ze.SHA256)而不是 node:crypto**:
@@ -4634,160 +4559,6 @@ function qt(e) {
 				responseType: "text",
 				throwHttpErrors: !1
 			})
-		},
-		// 文件列表(A3): 两条候选通道依次试, 任一返回成功业务码即用。
-		//  1) orchestration catalog/v1.0/getDisk —— 父节点字段实测为 catalogID, 带 App 凭证可进业务层(恢复后即可用)
-		//  2) personal-kd-njs hcy/file/list —— 脚本旧通道, 实测 HTTP 404「认证失败」, 保留作降级
-		// 写接口空转修复: 失败必须抛错并带上实际 HTTP 状态/业务码, 不再静默返回空列表;
-		// 成功但列表为空不算失败(可能确实没文件), 由上层决定跳过本步
-		// 读接口重试策略(S2): 不走 requestJson 的盲目重试壳(它对非 429 的 5xx/4xx 也重试, 违反
-		// error-handling.md「仅 rate_limited 重试」; 且 outage 期间会把每通道请求量翻 3 倍)。
-		// 改为 e.request + throwHttpErrors:!1, 每次调用只发 1 个请求; 降级由「两通道依次试」提供, 不靠重试
-		listPersonalFiles: async function() {
-			const t = e.config.shareDirId || e.config.uploadDirId || "",
-				r = [{
-					name: "文件列表(getDisk)",
-					call: () => e.request({
-						url: FILE_LIST_URL,
-						method: "post",
-						headers: {
-							...e.jwtHeaders,
-							Authorization: rt(e.authorization),
-							"x-yun-api-version": "v1",
-							"x-yun-app-channel": "10214200",
-							"x-yun-client-info": "1||8|5.10.1|microsoft|microsoft|306d1d1c-016c-4251-9ea6-951dca||windows 10 x64|||||",
-							"x-yun-module-type": "100",
-							"x-yun-op-type": "1",
-							"x-yun-net-type": "1",
-							"x-tingyun": "c=M|4Nl_NnGbjwY",
-							xweb_xhr: "1",
-							"content-type": "application/json"
-						},
-						data: {
-							// 空值会被判「待查询的父节点ID不能为空」; 实测 "0" 可进入业务层(视作根目录查询)
-							catalogID: t || "0",
-							filterType: 0,
-							contentType: 0,
-							sortDirection: 1,
-							startNumber: 1,
-							endNumber: 40,
-							channelList: "",
-							catalogType: -1,
-							contentSuffix: "",
-							commonAccountInfo: {
-								account: e.account,
-								accountType: 1
-							}
-						},
-						responseType: "json",
-						throwHttpErrors: !1
-					})
-				}, {
-					name: "文件列表(hcy)",
-					call: () => e.request({
-						url: Ot,
-						method: "post",
-						headers: {
-							"x-yun-op-type": "1",
-							"x-yun-net-type": "1",
-							"x-yun-module-type": "100",
-							"x-yun-app-channel": "10214200",
-							"x-yun-client-info": "1||8|5.10.1|microsoft|microsoft|306d1d1c-016c-4251-9ea6-951dca||windows 10 x64|||||",
-							"x-tingyun": "c=M|4Nl_NnGbjwY",
-							authorization: rt(e.authorization),
-							"x-yun-api-version": "v1",
-							xweb_xhr: "1",
-							"x-yun-tid": "cb8a2b4b-8eb7-4b05-b1c1-e41020",
-							"content-type": "application/json"
-						},
-						data: {
-							// 空值会被判「待查询的父节点ID不能为空」; 实测 "0" 可进入业务层(视作根目录查询)
-							// M1: hcy 降级通道同样补 || "0", 与首选通道 catalogID 的空值回落保持一致(修注释不如修代码)
-							parentFileId: t || "0",
-							pageInfo: {
-								pageSize: 40,
-								pageCursor: "0|[9-1-0,11-0-1][JzIwMjQtMDMtMDlUMTA6MzM6MTguNzEyWic=,J0ZzSVEweF9NVVVDVmNqQ1plaTJ0SFZxSjVadjNsbEZ5bCc=]"
-							},
-							imageThumbnailStyleList: ["Big", "Small"],
-							orderDirection: "DESC",
-							orderBy: "updated_at"
-						},
-						responseType: "json",
-						throwHttpErrors: !1
-					})
-				}],
-				o = [];
-			for (const t of r) {
-				let r;
-				try {
-					r = await t.call()
-				} catch (n) {
-					o.push(`${t.name} 请求失败(${redactLog(n?.message||String(n))})`);
-					continue
-				}
-				const n = Number(r?.status ?? r?.statusCode ?? 0) || 0,
-					s = r?.data,
-					c = extractBusinessCode(s);
-				if (n >= 200 && n < 300 && isBusinessSuccessCode(c)) return {
-					items: extractFileList(s),
-					code: c,
-					channel: t.name
-				};
-				n < 200 || n >= 300 ? o.push(`${t.name} 通道不可用(HTTP ${n||"未知"}${null==c?"":`, 业务码 ${c}`})`) : o.push(null == c ? `${t.name} 响应缺少业务码` : `${t.name} 返回业务码 ${c}`)
-			}
-			throw new YdypError(`文件列表不可用(${o.join("; ")})`, "share_unavailable")
-		},
-		// S2: 建链是写接口, 且会产生对外可见链接 —— 单次调用只发 1 个请求。
-		// 不用 requestJson 的默认 retry=3(它对非 429 的 5xx/4xx 也重试, 违反 error-handling.md「仅 rate_limited 重试」;
-		// SHARE_TIMES=7 时上限 21 个对外请求, 与 A2「风控优先」不一致)。与 uploadSimpleFile 对齐: e.request + throwHttpErrors:!1
-		createOutLink: async function(t, r) {
-			let o;
-			try {
-				o = await e.request({
-					url: Lt,
-					method: "post",
-					headers: {
-						...e.jwtHeaders,
-						Authorization: rt(e.authorization)
-					},
-					data: {
-						getOutLinkReq: {
-							subLinkType: 0,
-							encrypt: 1,
-							coIDLst: [t],
-							caIDLst: [],
-							pubType: 1,
-							dedicatedName: r,
-							periodUnit: 1,
-							viewerLst: [],
-							extInfo: {
-								isWatermark: 0,
-								shareChannel: "3001"
-							},
-							period: 1,
-							commonAccountInfo: {
-								account: e.account,
-								accountType: 1
-							}
-						}
-					},
-					responseType: "json",
-					throwHttpErrors: !1
-				})
-			} catch (e) {
-				throw new YdypError(`建链请求失败(${redactLog(e?.message||String(e))})`, "share_unavailable")
-			}
-			// 写接口空转修复: 只保留业务码, 不回显服务端 resultDesc(自由文本可能自带失效类词汇并污染下游分流)
-			const n = Number(o?.status ?? o?.statusCode ?? 0) || 0,
-				s = extractBusinessCode(o?.data);
-			if (n < 200 || n >= 300) throw new YdypError(`建链通道不可用(HTTP ${n||"未知"}${null==s?"":`, 业务码 ${s}`})`, "share_unavailable");
-			if (!isBusinessSuccessCode(s)) {
-				// 1010010006 = 「用户没有权限操作文件/目录记录/记录已被删除」: 属分享对象无效, 不是通道故障。
-				// 带上这个判定, 避免把可诊断的对象问题笼统说成「通道不可用」
-				if ("1010010006" === String(s)) throw new YdypError("建链被拒(业务码 1010010006: 记录已被删除或无权限, 属分享对象无效)", "share_unavailable");
-				throw new YdypError(null == s ? "建链响应缺少业务码, 已按失败处理" : `建链返回业务码 ${s}, 已按失败处理`, "share_unavailable")
-			}
-			return o?.data
 		}
 	}
 }
@@ -4894,7 +4665,6 @@ class Ut {
 				["抽奖", () => this.surplusNum()],
 				["邮箱任务", () => this.processTaskList("newsign_139mail", "email_app")],
 				["上传任务", () => this.uploadForTask()],
-				["分享任务", () => this.shareForTask()],
 				["备份奖励", () => this.backupCloud()],
 				["云朵统计", () => this.reportCloudNum()]
 			];
@@ -5312,91 +5082,6 @@ class Ut {
 	async uploadLargeFile() {
 		this.config.uploadDirId ? (await this.api.uploadLargeFile(), this.log(`大文件上传任务已执行: ${this.config.uploadFilename}`)) : this.log("跳过大文件上传: 缺少 dirId")
 	}
-	// A3: 分享任务(434 分享文件领好礼, 目标 7 次)。写接口空转修复: 文件列表与建链都校验业务码;
-	// 成功判据只看 434.process 前后快照。通道不可用属外部服务故障 —— 只跳过本步, 不进 reporter.errors、
-	// 不影响退出码(见 error-handling.md「外部服务故障不该污染退出码」)
-	// S1: 文件列表带 kind, 只对文件建链(目录在 hcy 里与文件共用 fileId; 不区分会把目录 ID 当内容 ID 建链并误报通道故障)
-	// S3: 有起始进度时按差额收紧建链次数, 避免 6/7 时还建 7 条对外可见链接
-	async shareForTask() {
-		let before = null;
-		try {
-			before = await this.readTaskProgress(434)
-		} catch (err) {
-			this.log(`⚠️ 读取 434 进度失败: ${redactLog(err?.message||String(err))}, 仍将尝试分享`)
-		}
-		if (before && null != before.progress) this.log(`🔗 434 分享文件领好礼 起始进度: ${before.progress}/7`);
-		if (before?.finished) return void this.log("✅ 434 分享文件领好礼 已完成");
-		const configTimes = this.config.shareTimes,
-			goal = TASK_GOALS[434] || 7;
-		if (!(configTimes > 0)) return void this.log("⚠️ CLOUD139_SHARE_TIMES 为非正数, 跳过分享任务");
-		// S3: 进度未知(读快照失败)时回落配置值, 仍按原次数尝试; 已知时按差额收紧
-		const times = null == before?.progress ? configTimes : Math.min(configTimes, Math.max(0, goal - before.progress));
-		if (times <= 0) return void this.log("✅ 434 分享文件领好礼 已达目标, 无需建链");
-		let ok = 0,
-			fail = 0,
-			skipText = "",
-			skipKind = "",
-			target = null;
-		try {
-			const e = await this.api.listPersonalFiles(),
-				t = Array.isArray(e?.items) ? e.items : [],
-				files = t.filter(e => e && "file" === e.kind),
-				r = String(this.config.shareFilename || "");
-			// 优先匹配 CLOUD139_SHARE_FILENAME, 否则取列表首个文件(PRD AC6); 只在文件项里选
-			if (target = (r ? files.find(e => String(e?.name || "").includes(r)) : null) || files[0] || null, target) this.log(`📄 选定分享对象: ${redactLog(String(target.name || "未命名文件"))}`);
-			else if (t.length > 0) skipText = `目录下无文件(目录 ${this.config.shareDirId||this.config.uploadDirId||"根目录"}, 共 ${t.length} 个目录项)`, skipKind = "nofile";
-			else skipText = `目录(${this.config.shareDirId||this.config.uploadDirId||"根目录"})下没有可分享的文件`, skipKind = "empty"
-		} catch (err) {
-			skipText = redactLog(err?.message || String(err)), skipKind = "unavailable"
-		}
-		if (skipText) {
-			// 如实区分「接口故障」与「确实没文件(含全是目录)」: 不再把故障说成「未找到可分享文件」
-			const label = "unavailable" === skipKind ? "分享通道不可用" : "无可分享文件";
-			this.log(`⚠️ ${skipText}, 本步已跳过(不影响其它任务)`), this.reporter.tasks.push(`${this.maskedAccount} 434 ${label}, 本步已跳过`)
-		} else {
-			for (let n = 0; n < times; n += 1) {
-				try {
-					const e = await this.api.createOutLink(target.id, target.name),
-						t = extractOutLinkUrl(e);
-					if (!t) throw new YdypError("建链响应缺少 linkUrl, 已按失败处理", "share_unavailable");
-					ok += 1, fail = 0, this.log(`✅ 分享链接创建成功(${ok}/${times}): ${maskShareUrl(t)}`)
-				} catch (err) {
-					fail += 1, this.log(`⚠️ ${redactLog(err?.message||String(err))}(连续失败 ${fail}/3)`);
-					if (fail >= 3) {
-						this.log("⚠️ 连续 3 次建链失败, 终止本步(外部服务故障不影响其它任务)");
-						break
-					}
-				}
-				n < times - 1 && await at(1e3, 3e3)
-			}
-			if (!ok) {
-				// 不再笼统报「通道不可用」: 逐次失败日志已带上具体业务码(如 1010010006 属分享对象无效),
-				// 这里只做中性汇总, 避免把可诊断的对象问题说成通道故障
-				this.log("⚠️ 本次未成功创建任何分享链接, 本步已跳过(不影响其它任务)"), this.reporter.tasks.push(`${this.maskedAccount} 434 分享未成功, 本步已跳过`)
-			}
-		}
-		let after = null;
-		try {
-			after = await this.readTaskProgress(434)
-		} catch (err) {
-			this.log(`⚠️ 读取 434 进度失败: ${redactLog(err?.message||String(err))}`)
-		}
-		const b = null == before?.progress ? "?" : before.progress,
-			a = null == after?.progress ? "?" : after.progress;
-		this.log(`434 prog=${b}→${a}`);
-		// 通道恢复后的防线: 返回成功但进度不涨, 说明计数口径或风控, 需人工观察(同 A2 的 522 告警)
-		if (ok > 0 && null != after?.progress && null != before?.progress && after.progress <= before.progress) {
-			this.log("⚠️ 分享返回成功但 434 进度未增长(疑似计数口径或风控), 请观察"), this.reporter.tasks.push(`${this.maskedAccount} 434 分享返回成功(${ok} 次)但进度未增长(${before.progress}→${after.progress}), 请观察`)
-		}
-		if (after?.finished || null != after?.progress && after.progress >= goal) {
-			this.log("✅ 434 分享文件领好礼 已完成"), this.reporter.tasks.push(`${this.maskedAccount} 434 分享文件领好礼: 已完成`)
-		} else if (null != after?.progress) {
-			const n = Math.max(0, goal - after.progress);
-			this.log(`ℹ️ 434 分享文件领好礼 当前进度 ${after.progress}/7, 还差 ${n} 次`), this.reporter.tasks.push(`${this.maskedAccount} 434 分享文件领好礼: ${after.progress}/7, 还差 ${n} 次`)
-		} else {
-			this.reporter.tasks.push(`${this.maskedAccount} 434 分享文件领好礼: 进度未知`)
-		}
-	}
 	async sleep() {
 		await at(this.config.delayMin, this.config.delayMax)
 	}
@@ -5526,31 +5211,7 @@ async function runSelfCheck() {
 		const actual = matchesAlertRouting(text);
 		actual === expected ? console.log(`PASS  ${name}: expected=${expected} actual=${actual} :: ${text.replace(/\n/g, "\\n")}`) : (failed += 1, console.error(`FAIL  ${name}: expected=${expected} actual=${actual} :: ${text.replace(/\n/g, "\\n")}`))
 	}
-	// A3 纯函数回归网(S1/S2/S3/M3 本可被它当场抓住): 全部离线, 不发网络请求。
-	// 覆盖业务码三态、列表归一(含目录/文件 kind 判定)、链接脱敏与建链 URL 提取
-	const mixed = [{
-		type: "folder",
-		fileId: "CAT000",
-		name: "目录A"
-	}, {
-		type: "file",
-		fileId: "CON111",
-		name: "a.txt"
-	}, {
-		isDir: !0,
-		contentId: "CAT222",
-		contentName: "目录B"
-	}, {
-		fileId: "CON333",
-		name: "b.txt"
-	}];
-	const norm = extractFileList({
-		data: {
-			items: mixed
-		}
-	});
-	// M3 脱敏断言用独立字面量, 不引用任何真实凭证/secret
-	const shortSecret = "unitTestTokenAbc42";
+	// 纯函数回归网(业务码提取/校验): 全部离线, 不发网络请求
 	// AC16 夹具: **虚构**假 JWT, 与实测 result.token 同长度(907 字符), 不对应任何真实凭证
 	const fakeJwt = "eyJhbGciOi".repeat(90) + "FAKEJWT",
 		fakeSso = "YZsidssolg" + "0".repeat(40);
@@ -5576,43 +5237,6 @@ async function runSelfCheck() {
 		["isBusinessSuccessCode '0'", isBusinessSuccessCode("0"), !0],
 		["isBusinessSuccessCode '04000002'", isBusinessSuccessCode("04000002"), !1],
 		["isBusinessSuccessCode null", isBusinessSuccessCode(null), !1],
-		["extractFileList 目录也保留但标记 kind", norm.length, 4],
-		["extractFileList kind(folder by type)", norm[0]?.kind, "folder"],
-		["extractFileList kind(file by type)", norm[1]?.kind, "file"],
-		["extractFileList kind(folder by isDir)", norm[2]?.kind, "folder"],
-		["extractFileList 未知类型按文件处理", norm[3]?.kind, "file"],
-		["extractFileList 只有 file 项进建链候选", norm.filter(e => "file" === e.kind).map(e => e.id).join(","), "CON111,CON333"],
-		["extractFileList 空响应", extractFileList({
-			code: 0
-		}).length, 0],
-		["extractFileList getDisk 形态", extractFileList({
-			data: {
-				getDiskResult: {
-					contentList: [{
-						contentID: "C1",
-						contentName: "x"
-					}]
-				}
-			}
-		})[0]?.id, "C1"],
-		["maskShareUrl 链接保留域名前缀", maskShareUrl("https://yun.139.com/share/abcdefg").startsWith("https://yun."), !0],
-		["maskShareUrl 链接不含完整路径", maskShareUrl("https://yun.139.com/share/abcdefg").includes("/share/"), !1],
-		["maskShareUrl 非链接不含前 12 字符(slice(0,12))", maskShareUrl(shortSecret).includes(shortSecret.slice(0, 12)), !1],
-		["maskShareUrl 非链接只留长度", maskShareUrl(shortSecret), `***(共 ${shortSecret.length} 字符, 已脱敏)`],
-		["maskShareUrl 空值", maskShareUrl(""), ""],
-		["extractOutLinkUrl 常见路径", extractOutLinkUrl({
-			data: {
-				getOutLinkResSet: [{
-					linkUrl: "https://x/y"
-				}]
-			}
-		}), "https://x/y"],
-		["extractOutLinkUrl 根级 getOutLinkResSet", extractOutLinkUrl({
-			getOutLinkResSet: [{
-				linkUrl: "https://z/w"
-			}]
-		}), "https://z/w"],
-		["extractOutLinkUrl 缺失返回空串", extractOutLinkUrl({}), ""],
 		// ——— 换票签名通道回归网(AC2–AC4/AC15/AC16): 全程离线, 不依赖网络也不依赖有效凭证 ———
 		// AC2: 已知真实抓包样本逐字节对齐(盐值取常量, 不重复其值)
 		["换票签名对齐真实样本", buildAuthSignature(AUTH_SALT_DEFAULT, "9f58ed54-007e-43d9-a45a-882b4373822a", "1793068843531", "1bd7097a-c5ae-4116-b34f-edca6f5f4d69"), "b9ae5d0d36d6429e963d7c28a92854bd"],
