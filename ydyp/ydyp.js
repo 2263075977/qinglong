@@ -4991,11 +4991,15 @@ class Ut {
 		// 实测(真跑): 上传**确实计入** 522, 但服务端计数器有数秒延迟 —— 上传成功后立刻读 after 会得到
 		// 「未增长」的**假阴性**(隔一轮独立复核才看到 prog 38→39)。所以 after 快照不能读一次就下结论:
 		//   ① 首读即增长 → 直接判定成功, 不多等
-		//   ② 未增长 → 再读, 最多 PROGRESS_POLL_MAX 次尝试(间隔 2~3s, 总等待 ≤ ~8s), 绝不无限等
+		//   ② 未增长 → 再读, 最多 PROGRESS_POLL_MAX 次尝试(间隔 2~3s, 上限 ≈10~15s: 5 次等待 × 2~3s), 绝不无限等
 		//   ③ 达到上限仍未增长 → 才打「进度未增长」告警(下面的既有 A1 判断保留原文案)
+		// 窗口为何取 6 次(6 读 / 5 等 ≈10~15s): 2026-10-29 同一账号连续三轮实测, 计数器延迟**不是固定值** ——
+		//   第 1 轮 39→40 在第 3 次轮询时才读到; 第 2 轮起始 42, 旧窗口(3 次, 合计约 8s)读完仍报未增长,
+		//   隔一轮纯读取复核真实值已是 43。即延迟**可超过 8s**, 旧窗口不足会让这条告警每轮都出现,
+		//   用户学会忽略它之后真出问题就看不见了(假警报比漏报更消耗信任)。
 		// 无 before 基线 / 本轮一次都没上传成功时无从判增长, 只读一次不多等。
 		// 轮询读快照本身抛错沿用既有容错(只告警, 不让本步失败)。
-		const PROGRESS_POLL_MAX = 3;
+		const PROGRESS_POLL_MAX = 6;
 		let after = null,
 			pollReads = 0;
 		try {
@@ -5086,7 +5090,7 @@ class Ut {
 		await at(this.config.delayMin, this.config.delayMax)
 	}
 	// 522 上传进度计数器有数秒延迟, after 快照需有限轮询。间隔复用已有的 at(min,max)(不新造 setTimeout 封装);
-	// 单独成方法只为让离线自检能注入桩, 避免自检真的睡 8 秒。
+	// 单独成方法只为让离线自检能注入桩, 避免自检真的睡满 10~15 秒。
 	async progressPollDelay() {
 		await at(2e3, 3e3)
 	}
@@ -5190,8 +5194,38 @@ async function Kt(r = ct()) {
 		reporter: s
 	}
 }
+// ——— 自检离线闸门 ———
+// 自检声称「全程离线」, 但 2026-10-29 用 net.Socket.prototype.connect 探针实测发现它真发了
+// 4 个 HTTPS 请求(signin/page/doTaskPost ×2、signin/page/infoV3 ×2): 当时 deadRun 用真 requester 驱动整条 run(),
+// 而桩只覆盖了部分 api 方法, **没桩住的调用点直连真网**。
+// 所以桩必须装在**网络层入口** globalThis.fetch(适配器最终就是调它), 而不是逐个桩 api 方法 ——
+// 后者会随代码演进漏掉新调用点(本次就是这么漏的)。见 .trellis/spec/qinglong/quality-guidelines.md
+// 「自检『离线』必须真的离线」。
+// 验证方式: 去掉下面这个桩(globalThis.fetch = gate), 结尾「网络尝试次数为 0(且闸门在位)」
+// 与「入口 fetch 桩拦截并计数」两条断言必须转红。
+const OFFLINE_FETCH_BLOCKED = "OFFLINE_SELFCHECK_FETCH_BLOCKED";
+function installOfflineFetchGate() {
+	const hadOwnFetch = Object.prototype.hasOwnProperty.call(globalThis, "fetch"),
+		savedFetch = globalThis.fetch,
+		gate = async () => {
+			// ① 计数(供断言「网络尝试次数 === 0」) ② 抛错(模拟断网: 任何真发包都会在这里失败)
+			throw gate.calls += 1, new Error(OFFLINE_FETCH_BLOCKED)
+		};
+	// cookieJar 标记让适配器跳过 fetch-cookie 包装: 保证 globalThis.fetch 始终就是本桩,
+	// 不会被包成未知形态(离线自检不需要 cookieJar, 请求到不了网络)
+	return gate.calls = 0, gate.cookieJar = !0, globalThis.fetch = gate, {
+		calls: () => gate.calls,
+		installed: () => globalThis.fetch === gate,
+		restore: () => {
+			hadOwnFetch ? globalThis.fetch = savedFetch : delete globalThis.fetch
+		}
+	}
+}
 // 不联网自检: 校验通知文案与 Node-RED 双 Bot 分流关键词表一致(见 .trellis/spec/qinglong/logging-and-notify.md)
 async function runSelfCheck() {
+	// 最先装闸门: 必须早于任何一次 run()/request(), 否则适配器里的
+	// `globalThis.fetch || (globalThis.fetch = require("node-fetch"))` 会先一步把真 fetch 装回来
+	const offline = installOfflineFetchGate();
 	const cases = [
 		["凭证失效汇总", `已失效账号(请重新登录获取并更新 ydyp_ck):\n1**********`, !0],
 		["顶层异常兜底", "❌ 发生异常:执行失败\n\n错误类型: YdypError: 云朵总数解析失败", !0],
@@ -5378,7 +5412,7 @@ async function runSelfCheck() {
 				uploadEnabled: !1
 			}, cfg), rep);
 			u.sleep = async () => {};
-			// 522 after 快照轮询间隔也注入掉: 自检不得真的睡 8 秒
+			// 522 after 快照轮询间隔也注入掉: 自检不得真的睡满 10~15 秒
 			u.progressPollDelay = async () => {};
 			return { u, rep }
 		},
@@ -5552,7 +5586,17 @@ async function runSelfCheck() {
 		mkSignin = st => {
 			const { u, rep } = mkUnit();
 			let calls = 0;
-			return u.api.getSigninStatus = async () => st, u.api.doSignin = async () => (calls += 1, {
+			// 签到第一步的 initTaskStatus / getSignInfoV3 也必须桩住: 这两个是本自检里**唯一**会真发包的
+			// 调用点(2026-10-29 实测 4 个真请求全来自这里)。保留网络依赖会让自检被服务端风控计数,
+			// 且断言通过与否取决于真网回什么 —— 离线自检里不该有这种路径, 一律给桩数据。
+			// 桩给「infoV3 不可用」形态: 正是被测路径(降级到旧签到接口)的入口条件。
+			return u.api.initTaskStatus = async () => ({
+				code: 0,
+				msg: "success"
+			}), u.api.getSignInfoV3 = async () => ({
+				code: 401,
+				msg: "FAKE_OFFLINE_INFO_V3_UNAVAILABLE"
+			}), u.api.getSigninStatus = async () => st, u.api.doSignin = async () => (calls += 1, {
 				code: 0,
 				msg: "success"
 			}), { u, rep, calls: () => calls }
@@ -5936,6 +5980,9 @@ async function runSelfCheck() {
 		throw new YdypError("上传通道不可用(create HTTP 404)", "upload_unavailable")
 	};
 	const wNoUpErr = await drive(() => wNoUp.u.uploadForTask());
+	// ⑤ 首读即增长: 必须立刻结束, 不得白等一次(PRD AC1)
+	const wGrowNow = mkProgUnit([{ progress: 38 }, { progress: 39 }]),
+		wGrowNowErr = await drive(() => wGrowNow.u.uploadForTask());
 	eqCases.push(
 		["C3 522 计数延迟: 轮询后不误报「进度未增长」", /进度未增长/.test(delayText), !1],
 		["C3 522 计数延迟: 最终快照 prog=38→39(增长即判定成功)", delayText.includes("522 prog=38→39"), !0],
@@ -5943,12 +5990,15 @@ async function runSelfCheck() {
 		["C3 522 计数延迟: 首读未增长只补 1 次等待(reads=before+2 次 after)", [wDelay.reads, wDelay.polls()], [[38, 38, 39], 1]],
 		["C3 522 计数延迟: 本步不抛穿", wDelayErr, ""],
 		["C3 522 始终不增长 → 仍然告警(告警没被修坏)", /进度未增长/.test(neverText), !0],
-		["C3 522 不增长的尝试上限为 3 次(1 before + 3 after / 2 次等待)", [wNever.reads.length, wNever.polls()], [4, 2]],
+		// 上限改成 3 或 999 都必须让本条转红(M1/M2 变异测试): 它锁的是「有限次 + 次数与实现一致」,
+		// 改实现不改断言会退化成假描述, 所以两者必须同时改。
+		["C3 522 不增长的尝试上限为 6 次(1 before + 6 after / 5 次等待)", [wNever.reads.length, wNever.polls()], [7, 5]],
 		["C3 522 始终不增长仍如实写进 tasks", wNever.rep.tasks.some(t => String(t).includes("进度未增长")), !0],
 		["C3 522 轮询读快照抛错不中断本步", wPollErrErr, ""],
 		["C3 522 轮询读快照抛错只告警", /读取 522 进度失败/.test(pollErrText), !0],
 		["C3 522 轮询读快照抛错不误报未增长", /进度未增长/.test(pollErrText), !1],
-		["C3 522 未上传成功时不轮询(只读 1 次 after)", [wNoUp.reads, wNoUp.polls(), wNoUpErr], [[38, 38], 0, ""]]
+		["C3 522 未上传成功时不轮询(只读 1 次 after)", [wNoUp.reads, wNoUp.polls(), wNoUpErr], [[38, 38], 0, ""]],
+		["C3 522 首读即增长: 立刻结束, 0 次等待", [wGrowNow.reads, wGrowNow.polls(), wGrowNowErr], [[38, 39], 0, ""]]
 	);
 	// userDomainId 采集: 注入换票响应桩 → 驱动**真实** jwt()/fetchJwt(), 断言落到实例(不是抄一份表达式)
 	const mkDomainUnit = () => {
@@ -6005,6 +6055,17 @@ async function runSelfCheck() {
 		["C3 未取到 userDomainId 不阻断(仍返回成功)", [rNoDomain, wNoDomain.u.userDomainId], [!0, ""]],
 		["C3 未取到 userDomainId 有告警", wNoDomain.rep.lines.some(l => String(l).includes("未取到 userDomainId")), !0]
 	);
+	// ——— 离线闸门回归网: 「全程离线」这个承诺必须可证伪(去掉入口桩必须转红) ———
+	// ① 到这里为止的**计划外**网络尝试必须为 0, 且闸门必须真的在位。
+	//    删掉入口的 gate → 本条后半转红; 将来谁再往自检里塞一条会真发包的路径 → 本条前半转红。
+	eqCases.push(["离线自检: 网络尝试次数为 0(且闸门在位)", [offline.calls(), offline.installed()], [0, !0]]);
+	// ② 主动打一次网络层入口, 必须被桩拦住并计数 —— 锁住「计数器与抛错都是活的, 不是永远不会触发的假数字」:
+	//    删掉入口的 gate 后, 这里会变成真实请求(错误文不含 OFFLINE 标记) → 本条转红。
+	//    ① 的 actual 已在上面求值, 不会把这条自证探针算进「计划外」计数。
+	const offlineProbeErr = await drive(() => globalThis.fetch("https://offline-selfcheck.invalid/never"));
+	eqCases.push(["离线自检: 入口 fetch 桩拦截并计数", [String(offlineProbeErr).includes(OFFLINE_FETCH_BLOCKED), offline.calls()], [!0, 1]]);
+	// 恢复原值, 避免影响任何后续运行路径(以及被 require 时的宿主环境)
+	offline.restore();
 	for (const [name, actual, expected] of eqCases) {
 		const pass = JSON.stringify(actual) === JSON.stringify(expected);
 		pass ? console.log(`PASS  ${name}: ${JSON.stringify(actual)}`) : (failed += 1, console.error(`FAIL  ${name}: expected=${JSON.stringify(expected)} actual=${JSON.stringify(actual)}`))
