@@ -4830,11 +4830,59 @@ class Ut {
 		const o = await this.api.doSignInV3(),
 			n = Number(o?.code);
 		if (0 === n) {
-			if (!0 !== o?.result?.todaySignIn) throw new Error("签到响应未确认(todaySignIn 为空)");
-			return void this.log(null === r ? "✅ 今日已签到(已由 startSignIn 确认)" : "✅ 签到成功")
+			// 快路径(R1): 响应自带 result.todaySignIn===true 即成功, **不得**多打一次网络请求
+			if (!0 === o?.result?.todaySignIn) return void this.log(null === r ? "✅ 今日已签到(已由 startSignIn 确认)" : "✅ 签到成功");
+			// 回读确认(R2/R3)。实测 2026-11-01 新月首日: startSignIn 回 code=0 且签到**真的落了**
+			// (隔一轮纯读取复核: signCount 未变、今日已签到), 但响应里**没有** result.todaySignIn。
+			// 旧守卫把「响应字段缺失」当成失败 → 每天第一次运行都误报「签到失败」+ exit 1。
+			// 三态必须分清: 确认已签=成功 / 明确未签=真失败 / 读不到或形状未知=无法确认(不得说成「未签到」)
+			const after = await this.readBackTodaySigned();
+			if (!0 === after) return void this.log("✅ 签到成功(已由 infoV3 回读确认)");
+			if (!1 === after) throw new Error("签到未被确认: startSignIn 回 code=0, 但回读 infoV3 明确显示今日未签到");
+			throw new Error("签到未确认(无法确认): startSignIn 回 code=0 但响应缺 todaySignIn, 回读 infoV3 也不可用")
 		}
 		if ([614, 615].includes(n)) return void this.log(`ℹ️ 签到提示: ${o?.msg||"活动太火爆"}, 属正常业务响应`);
 		throw new Error(`签到未成功: code=${o?.code??"?"} msg=${redactLog(o?.msg||"未知响应")}`)
+	}
+	// R2/R3: startSignIn 回 code=0 但响应缺 result.todaySignIn 时, 回读 infoV3 判今日**真实**状态。
+	// 返回值三态: true=确认已签 / false=明确未签 / null=无法确认(回读抛错、业务码非成功、或 todaySigned 形状未知)。
+	// 判据仍只认服务端状态(既有 todaySigned), **不是**「code=0 就算成功」。
+	// ⚠️ 回读**不能**写后立即单次读: 同一网关的计数器延迟已实测可超过 8s(522.process 第 4 次轮询才读到),
+	//   单次读只会把误报的触发条件从「响应字段缺失」换成「读太早」, 每天照样误报一次。
+	//   故沿用 522 的有限轮询模式(不另发明一套):
+	//     ① 读到 true(已签) → 立刻成功, 不再多读
+	//     ② 读到 false(未签) → 不立刻下结论(可能是写后尚未生效的陈旧值), 继续读到上限
+	//     ③ 读到 null(不可用/形状未知) → 继续读到上限
+	//   合并顺序不可颠倒: 任意一次 true → true; 否则**最后一次** false → false; 否则 null(无法确认)。
+	//   注意这仍是「只认服务端状态」, 既不是「code=0 就算成功」, 也不是「多读几次就放过」。
+	async readBackTodaySigned() {
+		// 上限 3 次读(2 次等待 × 1.5~2.5s ≈ 总等待 ≤5s): 足够覆盖**秒级**读侧延迟, 又绝不无限等(cron 不能挂)。
+		// 措辞精度: 覆盖窗口只到 ~5s —— 读侧延迟若超过 5s, 3 次读都会读到陈旧「未签」而仍误报一次。
+		// 这不是「按见过的最长延迟拍」: 本步实测证据是「隔几秒复核已签」; 若日后真的观测到更长延迟,
+		// 应把 SIGNIN_READBACK_MAX 调大, **并同步**改下面锁次数的两条断言(读次数 / 等待次数)。
+		const SIGNIN_READBACK_MAX = 3;
+		let last = null;
+		for (let attempt = 1; attempt <= SIGNIN_READBACK_MAX; attempt += 1) {
+			if (last = await this.readBackTodaySignedOnce(), !0 === last) return this.log(attempt > 1 ? `🔁 回读 infoV3: 确认今日已签到(已轮询 ${attempt} 次)` : "🔁 回读 infoV3: 确认今日已签到"), !0;
+			attempt < SIGNIN_READBACK_MAX && await this.signinReadbackDelay()
+		}
+		return this.log(!1 === last ? "🔁 回读 infoV3: 显示今日未签到(已轮询到上限)" : "⚠️ 回读 infoV3 不可用或形状未知, 无法确认(已轮询到上限)"), last
+	}
+	// 单次回读的三态真正的判定: true=确认已签 / false=明确未签 / null=无法确认。
+	async readBackTodaySignedOnce() {
+		try {
+			const e = await this.api.getSignInfoV3();
+			if (0 !== Number(e?.code) && "success" !== e?.msg) return this.log(`⚠️ 签到回读不可用(code=${e?.code??"?"})`), null;
+			return this.todaySigned(e?.result || {})
+		} catch (e) {
+			// 回读本身失败(网络/超时)属外部故障: 只记日志, 由调用方按「无法确认」处理, 不得归成凭证类失败(R4)
+			return this.log(`⚠️ 签到回读失败(${redactLog(e?.message||String(e))})`), null
+		}
+	}
+	// 回读轮询间隔: 复用已有的 at(min,max)(与 522 的 progressPollDelay 同款模式)。
+	// 单独成方法只为让离线自检注入桩, 避免自检真的睡满 ~5 秒。
+	async signinReadbackDelay() {
+		await at(1500, 2500)
 	}
 	todaySigned(e) {
 		// 优先看 infoV3 的签到日历: 今天那一格 t=true / currentMonth=1, s 表示是否已签
@@ -5414,6 +5462,8 @@ async function runSelfCheck() {
 			u.sleep = async () => {};
 			// 522 after 快照轮询间隔也注入掉: 自检不得真的睡满 10~15 秒
 			u.progressPollDelay = async () => {};
+			// 签到回读轮询间隔同理: 自检不得真的睡满 ~5 秒(次数本身由断言锁)
+			u.signinReadbackDelay = async () => {};
 			return { u, rep }
 		},
 		drive = async fn => {
@@ -6054,6 +6104,147 @@ async function runSelfCheck() {
 		["C3 换票成功后 userDomainId 落到实例", [rDomain, wDomain.u.userDomainId, wDomain.u.cookies.jwtToken], [!0, "FAKE_DOMAIN_ID", "FAKE_JWT_TOKEN"]],
 		["C3 未取到 userDomainId 不阻断(仍返回成功)", [rNoDomain, wNoDomain.u.userDomainId], [!0, ""]],
 		["C3 未取到 userDomainId 有告警", wNoDomain.rep.lines.some(l => String(l).includes("未取到 userDomainId")), !0]
+	);
+	// ——— 签到回读确认(R1–R5): startSignIn 回 code=0 但缺 result.todaySignIn 时不得把成功报成失败 ———
+	// 实测 2026-11-01(新月首日): code=0 且签到**真的落了**(隔几秒纯读取复核: signCount 未变、今日已签到),
+	// 但响应里没有 result.todaySignIn, 旧守卫 fail-closed 抛错 → 每天第一次运行都误报「签到失败」。
+	// 夹具值全部虚构; 回读计数用来证明快路径**没多打一次请求**(不是「多打一次也能过」)。
+	const mkSigninV3 = (signResp, readBack) => {
+			const { u, rep } = mkUnit();
+			let infoCalls = 0,
+				waits = 0;
+			// 等待次数单独计数(覆盖 mkUnit 里的空桩): 「首读即已签 → 零等待」与
+			// 「N 次读只有 N-1 次等待」都必须是可证伪的断言, 否则改坏成「先睡再读」也全绿。
+			u.signinReadbackDelay = async () => {
+				waits += 1;
+			};
+			u.api.initTaskStatus = async () => ({
+				code: 0,
+				msg: "success"
+			});
+			// 首次 getSignInfoV3 是 signinStatus() 开头的状态读 → 给「明确未签」形态, 保证会走到 doSignInV3
+			// (若给「已签」就会命中 ✅ 今日已签到 快路径, 本次要修的代码就测不到了)。之后每次调用都是回读。
+			u.api.getSignInfoV3 = async () => {
+				if (infoCalls += 1, 1 === infoCalls) return {
+					code: 0,
+					result: {
+						cal: [{ t: 1, s: 0 }],
+						signCount: 1
+					}
+				};
+				if ("function" == typeof readBack) return readBack();
+				if (readBack instanceof Error) throw readBack;
+				return readBack
+			};
+			return u.api.doSignInV3 = async () => signResp, { u, rep, infoCalls: () => infoCalls, readCalls: () => infoCalls - 1, waits: () => waits }
+		},
+		signFast = mkSigninV3({
+			code: 0,
+			result: {
+				todaySignIn: !0
+			}
+		}, new Error("FAKE_READBACK_SHOULD_NOT_BE_CALLED")),
+		signFastThrown = await drive(() => signFast.u.signinStatus()),
+		signReadOk = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, {
+			code: 0,
+			result: {
+				cal: [{ t: 1, s: 1 }]
+			}
+		}),
+		signReadOkThrown = await drive(() => signReadOk.u.signinStatus()),
+		signReadNo = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, {
+			code: 0,
+			result: {
+				cal: [{ t: 1, s: 0 }]
+			}
+		}),
+		signReadNoThrown = await drive(() => signReadNo.u.signinStatus()),
+		signReadErr = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, new Error("FAKE_READBACK_NETWORK_DOWN")),
+		signReadErrThrown = await drive(() => signReadErr.u.signinStatus()),
+		signReadUnknown = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, {
+			code: 0,
+			result: {}
+		}),
+		signReadUnknownThrown = await drive(() => signReadUnknown.u.signinStatus()),
+		signReadCodeErr = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, {
+			code: 401,
+			msg: "FAKE_OFFLINE_INFO_V3"
+		}),
+		signReadCodeErrThrown = await drive(() => signReadCodeErr.u.signinStatus());
+	// 回读是**有限轮询**(不是单次读): 用序列桩验证「先读到陈旧未签、后读到已签」能被救回。
+	// 序列耗尽后重复最后一个值, 这样「恒未签」也能用同一套桩表达。
+	const SIG_NO = {
+			code: 0,
+			result: {
+				cal: [{ t: 1, s: 0 }]
+			}
+		},
+		SIG_OK = {
+			code: 0,
+			result: {
+				cal: [{ t: 1, s: 1 }]
+			}
+		},
+		seqReadBack = seq => {
+			let i = 0;
+			return () => seq[Math.min(i++, seq.length - 1)]
+		},
+		// N1: 第 1 次回读仍报「未签」(写后尚未生效的陈旧值), 第 2 次才读到「已签」
+		signStale = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, seqReadBack([SIG_NO, SIG_OK])),
+		signStaleThrown = await drive(() => signStale.u.signinStatus()),
+		// N2: 连续 3 次都报未签 → 仍必须抛错(没变成「多读几次就放过」)
+		signAlwaysNo = mkSigninV3({
+			code: 0,
+			msg: "success"
+		}, seqReadBack([SIG_NO])),
+		signAlwaysNoThrown = await drive(() => signAlwaysNo.u.signinStatus());
+	eqCases.push(
+		// R5-1: 快路径命中 → 成功, 且**不触发回读**(回读桩是必抛的, 被调一次就转红)
+		["R5-1 todaySignIn:true 快路径 → 成功且零回读", [signFastThrown, signFast.readCalls(), signFast.rep.errors.length], ["", 0, 0]],
+		["R5-1 快路径日志不说「未确认」", signFast.rep.lines.some(l => String(l).includes("未确认")), !1],
+		// R5-2: 无 todaySignIn + 回读确认已签 → 成功, 不抛; 首读即已签 → **只读 1 次**(不多打请求)
+		["R5-2 回读确认已签 → 不抛错", [signReadOkThrown, signReadOk.readCalls()], ["", 1]],
+		["R5-2 回读确认已签 → 日志标明来自回读", signReadOk.rep.lines.some(l => String(l).includes("回读确认")), !0],
+		// 首读即已签 → **零等待**(读到 true 立刻返回, 不在循环末尾白等一轮)
+		["R5-2 首读即已签 → 零等待", signReadOk.waits(), 0],
+		// R5-3: 无 todaySignIn + 回读明确未签 → 必须仍抛错(证明守卫没被删成「code=0 就成功」)
+		// 未签**不能首读就下结论**(可能是写后尚未生效的陈旧值): 必须读满上限 3 次 → 这条锁次数,
+		// 把 SIGNIN_READBACK_MAX 改成 999 或去掉次数上限都会转红。
+		["R5-3 回读明确未签 → 抛错", signReadNoThrown.startsWith("Error: ") && signReadNoThrown.includes("未被确认"), !0],
+		["R5-3 未签要读满上限才下结论(3 次读)", signReadNo.readCalls(), 3],
+		// 3 次读只有 2 次等待(最后一次读完不再等), 别按「3×3s」写进注释去误导下一个人
+		["R5-3 3 次读只有 2 次等待", signReadNo.waits(), 2],
+		// N1(陈旧读修复): 先未签后已签 → 成功不抛；且第二次读到 true 就停(readCalls=2, 不多读)
+		//   把上限改成 1、或改成「读到 false 就立刻返回」→ 本条必须转红
+		["N1 陈旧读(先未签后已签) → 成功不抛", [signStaleThrown, signStale.readCalls(), signStale.waits()], ["", 2, 1]],
+		// N2(不许放宽): 连续 3 次都未签 → 仍抛错, 且确实读满 3 次
+		["N2 连续 3 次未签 → 仍抛错", [signAlwaysNoThrown.startsWith("Error: "), signAlwaysNoThrown.includes("未被确认"), signAlwaysNo.readCalls()], [!0, !0, 3]],
+		// R5-4: 回读抛错 / 形状未知 / 业务码非成功 → 抛错, 且文案是「无法确认」类(不得说成「今日未签到」)
+		["R5-4 回读抛错 → 抛错且文案为无法确认", [signReadErrThrown.includes("无法确认"), signReadErrThrown.includes("未签到")], [!0, !1]],
+		["R5-4 回读形状未知 → 抛错且文案为无法确认", [signReadUnknownThrown.includes("无法确认"), signReadUnknownThrown.includes("未签到")], [!0, !1]],
+		["R5-4 回读业务码非成功 → 抛错且文案为无法确认", [signReadCodeErrThrown.includes("无法确认"), signReadCodeErrThrown.includes("未签到")], [!0, !1]],
+		// R7: 这些失败属非凭证类, 文案都不得命中失效分流(不得引用户去重抓 Cookie)
+		["R7 签到未确认文案不命中失效分流", [signReadNoThrown, signReadErrThrown, signReadUnknownThrown, signReadCodeErrThrown].map(matchesAlertRouting), [!1, !1, !1, !1]],
+		// R4: 回读本身失败不得落成凭证类(只能进 errors/抛出, 不得进 invalid)
+		["R4 回读失败不进 invalid 通道", [signReadErr.rep.invalid.length, signReadUnknown.rep.invalid.length, signReadCodeErr.rep.invalid.length], [0, 0, 0]]
 	);
 	// ——— 离线闸门回归网: 「全程离线」这个承诺必须可证伪(去掉入口桩必须转红) ———
 	// ① 到这里为止的**计划外**网络尝试必须为 0, 且闸门必须真的在位。
