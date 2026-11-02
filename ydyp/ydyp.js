@@ -19,6 +19,7 @@
  *   CLOUD139_DIR_ID              上传目录 ID(空=根目录); 522 上传与大文件上传共用
  *   CLOUD139_UPLOAD              大文件上传开关(默认关闭)
  *   CLOUD139_AUTH_SALT           换票接口(tyrzLogin)签名盐值(默认内置; 移动轮换盐值导致签名被拒时在此覆盖)
+ *   CLOUD139_DEVICE_ID           领取云朵气泡(receiveV3)时附带的设备号(可选; 缺省**不带**该字段 —— 脚本不带 deviceId 也能签到/查任务(实测), 真被风控回 614/615 时再配)
  *
  * 宿主说明: 本脚本同时兼容 Surge / Loon / Stash / Egern / Shadowrocket / Quantumult X / Node.js，
  *   但实际部署宿主 = 青龙面板(Node ≥18，无 npm 依赖)。
@@ -671,7 +672,10 @@ const u = {
 			uploadTimes: 25,
 			uploadDirId: "",
 			// 换票签名盐值(可被 CLOUD139_AUTH_SALT 覆盖; 见 AUTH_SALT_DEFAULT 注释: 字面量只允许出现一处)
-			authSalt: AUTH_SALT_DEFAULT
+			authSalt: AUTH_SALT_DEFAULT,
+			// 设备号(可选): App 端领云朵时会带 deviceId(header isdeviceid: true), 但脚本全程不带也能签到/查任务(实测),
+			// 故缺省为空 → 请求体里不出现该键, 不改变既有请求形状; 真因缺它被风控拒(614/615)时再配 CLOUD139_DEVICE_ID
+			deviceId: ""
 		}
 	};
 var f = "undefined" != typeof globalThis ? globalThis : "undefined" != typeof window ? window : "undefined" != typeof global ? global : "undefined" != typeof self ? self : {};
@@ -3138,7 +3142,9 @@ function ct() {
 		requestTimeout: tt(ut(e, ["timeout"], lt([`${r}_TIMEOUT`, "cloud139_timeout"], t.timeout)), t.timeout),
 		// 换票签名盐值: 与其余键同构的三段式($argument 键 → 环境变量 → 默认值)。
 		// 移动轮换盐值导致签名被拒时, 用户只需在面板改 CLOUD139_AUTH_SALT, 不必改代码(R3.1)
-		authSalt: String(ut(e, ["authSalt"], lt([`${r}_AUTH_SALT`, "cloud139_auth_salt"], t.authSalt)) || t.authSalt)
+		authSalt: String(ut(e, ["authSalt"], lt([`${r}_AUTH_SALT`, "cloud139_auth_salt"], t.authSalt)) || t.authSalt),
+		// 可选设备号: 缺省空串 → receiveV3 的 body 里不含 deviceId(见 d.defaults.deviceId 注释)
+		deviceId: String(ut(e, ["deviceId"], lt([`${r}_DEVICE_ID`, "cloud139_device_id"], t.deviceId)) || "")
 	}
 }
 
@@ -3858,6 +3864,17 @@ const STEP_CREDENTIAL_CODES = [90001],
 		500: "TaskNotFound(任务 id 不在当前任务表, 需更新任务表)",
 		501: "参数校验异常(请求构造错)"
 	};
+// ——— receiveV3(云朵气泡领取)的业务码语义 —————————————————————————————
+// 来源: 2026-11-02 抓包 + **同一份** H5 bundle(img.mcloud.139.com/portal/mobilecloud/public/js/
+// 139newsignin.*.js 的 receiveCloudCom)的反向映射, 不是推断:
+//   0       → 成功, result.receive = 本次豆数
+//   614/615 → 「领取失败，请稍后再试」 ← 旧代码把这两个码注释成「活动太火爆, 属正常业务响应」,
+//             于是真失败被静默吞掉(「看起来跑了但没领到」, 且永远不会有人去修)
+//   11029   → 「活动太火爆了，请稍后再试」
+// 两者都归 external(不进退出码: 服务端瞬时拒绝, 用户唯一能做的是等), 但**文案必须区分**;
+// 任何一条都**不得**再表述成「正常业务响应」—— 那是把失败正常化。
+const CLAIM_FAILED_CODES = [614, 615],
+	CLAIM_BUSY_CODES = [11029];
 // 下游步骤失败四态分类(design §2)。与另两个 classify* 的差别(故意不合并):
 //  · classifyAuthFailure(换票): 失败也回 HTTP 200 → HTTP 码在那里没有任何分类价值;
 //  · classifySsoFailure(sso 两跳): 用 HTTP 码判「端点死没死」;
@@ -4198,7 +4215,11 @@ function Yt(e) {
 				throwHttpErrors: !1
 			})
 		},
-		receiveV3: async function() {
+		// 云朵气泡领取(2026-11-02 抓包): body 必带 client/cloudId/cloudType ——
+		// 旧实现发的是空 body `data: {}`, 服务端无从知道要领哪一项, 必然领不到(根因 1)。
+		// payload = {client:"app", cloudId:String(recordId), cloudType:Number, [deviceId]}; 成败交 receiveClouds 按业务码判。
+		// 写接口: throwHttpErrors:!1 + retry=1(单次空转即可, 重试无意义)
+		receiveV3: async function(r) {
 			return e.requestJson({
 				url: `${MCLOUD_BASE}/signin/page/receiveV3`,
 				method: "post",
@@ -4207,9 +4228,9 @@ function Yt(e) {
 					...t,
 					"Content-Type": "application/json;charset=UTF-8"
 				},
-				data: {},
+				data: r ?? {},
 				throwHttpErrors: !1
-			})
+			}, 1)
 		},
 		initTaskStatus: async function() {
 			return e.requestJson({
@@ -4666,6 +4687,8 @@ class Ut {
 				["邮箱任务", () => this.processTaskList("newsign_139mail", "email_app")],
 				["上传任务", () => this.uploadForTask()],
 				["备份奖励", () => this.backupCloud()],
+				// 云朵气泡领取: 放「备份奖励」之后(先产生新气泡再领)、「云朵统计」之前(统计读领取后的 total)
+				["云朵领取", () => this.receiveClouds()],
 				["云朵统计", () => this.reportCloudNum()]
 			];
 			this.config.uploadEnabled && e.push(["大文件上传", () => this.uploadLargeFile()]);
@@ -5100,16 +5123,16 @@ class Ut {
 			this.log(`抽奖成功: ${d.data?.result?.prizeName||"(未返回奖品名)"}`)
 		}
 	}
-	// 云朵统计改走新网关 getCloudNum(旧的签到页领取接口已 404, 相关常量与方法已删除);
-	// receiveV3 的 615/614(「活动太火爆」)属正常业务响应, 记为提示而非失败
+	// 云朵统计改走新网关 getCloudNum(旧的签到页领取接口已 404, 相关常量与方法已删除)。
+	// 「领取」已**移出**本步: 旧实现在这里发了一个 body 为空的 receiveV3(服务端无从知道领哪一项, 必然领不到),
+	// 且把 614/615 写成「活动太火爆, 属正常业务响应」——真失败被静默吞掉。
+	// 现在领取由 receiveClouds() 步骤负责(逐项带 cloudId/cloudType + 回读复核); 本步只做云朵总数统计。
 	async reportCloudNum() {
 		await this.sleep();
 		const e = await this.api.getCloudNumV3(),
 			t = e?.result,
 			r = Number(t && "object" == typeof t ? t.total ?? t.cloudNum ?? t.num ?? t.cloudNumV3 : t);
-		Number.isFinite(r) ? (this.reporter.amounts.push(`${this.maskedAccount}: 云朵 ${r}`), this.log(`☁️ 云朵总数: ${r}`)) : (this.reporter.amounts.push(`${this.maskedAccount}: 云朵 未知`), this.log(`⚠️ 云朵总数解析失败: ${redactLog(JSON.stringify(t)).slice(0,80)}`));
-		const o = await this.api.receiveV3();
-		0 === Number(o?.code) ? this.log(`✅ 云朵领取成功${void 0===o?.result?"":`: ${"string"==typeof o.result?o.result:redactLog(JSON.stringify(o.result)).slice(0,60)}`}`) : [614, 615].includes(Number(o?.code)) ? this.log(`ℹ️ 云朵领取提示: ${o?.msg||"活动太火爆"}, 属正常业务响应`) : this.log(`⚠️ 云朵领取未完成: code=${o?.code??"?"} ${o?.msg||""}`)
+		Number.isFinite(r) ? (this.reporter.amounts.push(`${this.maskedAccount}: 云朵 ${r}`), this.log(`☁️ 云朵总数: ${r}`)) : (this.reporter.amounts.push(`${this.maskedAccount}: 云朵 未知`), this.log(`⚠️ 云朵总数解析失败: ${redactLog(JSON.stringify(t)).slice(0,80)}`))
 	}
 	async backupCloud() {
 		// B3: 四个调用点各自按业务码分类。receiveBackupReward / receiveTaskExpansion 是**写操作**,
@@ -5129,6 +5152,117 @@ class Ut {
 			const g = await this.stepResult(() => this.api.receiveTaskExpansion(r.data.result.acceptDate));
 			if (!this.acceptStepVerdict("备份膨胀", g.verdict)) return;
 			this.log(`膨胀云朵领取: ${g.data?.result?.cloudCount||g.data?.msg||""}`)
+		}
+	}
+	// 云朵气泡自动领取。步骤边界: 「备份奖励」之后(备份/膨胀可能产生新气泡, 先产生后领取)、
+	// 「云朵统计」之前(统计要读到领取后的 total, 否则 beforeTotal/total 与日志不自洽)。
+	// 数据契约全部来自 2026-11-02 抓包 + H5 bundle 的 receiveCloudCom, 不是推断:
+	//   读侧 infoV3.result.receiveList = 待领取气泡列表, 元素 {cloudType, cloudNum, recordId?}
+	//   写侧 POST signin/page/receiveV3 body {client:"app", cloudId:String(recordId), cloudType:Number, deviceId?}
+	// 🔴 分流顺序不可颠倒: cloudType:2 的项**没有 recordId**(实测样本 [{"cloudType":2,"cloudNum":6}]),
+	//   先读 id 再判类型就是 TypeError。
+	async receiveClouds() {
+		await this.sleep();
+		const info = await this.stepResult(() => this.api.getSignInfoV3());
+		if (!this.acceptStepVerdict("云朵领取", info.verdict)) return;
+		const result = info.data?.result, list = result?.receiveList;
+		// R1: 「不知道」不等于「没有」。形状异常时如实说读不到, 不得静默跳过(否则漏领永远查不出来)
+		if (!Array.isArray(list)) {
+			const line = "无法读取待领取列表(infoV3 未返回 receiveList)";
+			return this.log(`⚠️ ${line}, 本步跳过`), void this.reporter.tasks.push(`${this.maskedAccount} ${line}`)
+		}
+		// R5 幂等: 已清空时零写请求
+		if (0 === list.length) return void this.log("✅ 无待领取奖励");
+		const totalBefore = Number(result?.total), lenBefore = list.length;
+		let okCount = 0, beanSum = 0, extCount = 0;
+		const extReasons = [];
+		for (const item of list) {
+			const cloudType = Number(item?.cloudType);
+			// 形状兜底: cloudType 不是有限数字时不发请求 —— 发出去只会得到 {"cloudType":null} 的坏请求,
+			// 而且这类项多半也缺 recordId, 属于「形状变了」而不是「领不到」, 必须如实说无法领取
+			if (!Number.isFinite(cloudType)) {
+				this.log(`⚠️ 待领取项 cloudType 异常(${JSON.stringify(item?.cloudType)}), 无法领取`);
+				continue
+			}
+			// ① cloudType:2 = 下月可领取: 前端只弹提示, **不发请求**(没有 recordId, 也无需 id)
+			if (2 === cloudType) {
+				this.log(`下月可领取: +${Number(item?.cloudNum) || 0}`);
+				continue
+			}
+			let res;
+			if (1 === cloudType) {
+				// ② cloudType:1 = 任务膨胀奖励, 走既有 receiveTaskExpansion({acceptDate})
+				const acceptDate = item?.acceptDate;
+				if (null == acceptDate) {
+					this.log("⚠️ 待领取项缺少 acceptDate, 无法领取");
+					continue
+				}
+				res = await this.stepResult(() => this.api.receiveTaskExpansion(acceptDate))
+			} else {
+				// ③ 其余类型必须带 recordId; 不得编造 id(空 body 正是旧实现领不到的根因)
+				const recordId = item?.recordId;
+				if (null == recordId) {
+					this.log("⚠️ 待领取项缺少 recordId, 无法领取");
+					continue
+				}
+				const payload = {
+					client: "app",
+					cloudId: String(recordId),
+					cloudType
+				};
+				// deviceId 只在配置了 CLOUD139_DEVICE_ID 时附上: 不改变既有请求形状(脚本不带也能签到/查任务)
+				this.config.deviceId && (payload.deviceId = this.config.deviceId);
+				res = await this.stepResult(() => this.api.receiveV3(payload))
+			}
+			const v = res.verdict;
+			// 凭证态: 立即终止本步(后续请求注定同样失败), 且必须落 invalid 而非 errors(见 acceptStepVerdict 坑 1)
+			if ("credential" === v.kind) return void this.acceptStepVerdict("云朵领取", v);
+			// 脚本该修: 抛 YdypError → 步骤 catch → errors → 退出码非 0。
+			// `return void` 是**结构性**保证: 不依赖「acceptStepVerdict 一定会抛」这一隐含前提,
+			// 否则它哪天改成只记日志, 501 之类的失败就会掉到下面的 okCount += 1 被计成成功
+			if ("script" === v.kind) return void this.acceptStepVerdict("云朵领取", v);
+			if ("external" === v.kind) {
+				const code = Number(v.code),
+					reason = CLAIM_FAILED_CODES.includes(code) ? "领取失败(614/615)" : CLAIM_BUSY_CODES.includes(code) ? "活动太火爆" : v.msg;
+				extCount += 1, extReasons.push(reason);
+				continue
+			}
+			okCount += 1;
+			const rawReceive = res.data?.result?.receive,
+				beans = "number" == typeof rawReceive || "string" == typeof rawReceive && /^\d+(\.\d+)?$/.test(rawReceive.trim()) ? Number(rawReceive) : NaN;
+			Number.isFinite(beans) ? beanSum += beans : this.log(`ℹ️ 本次领取未返回豆数(${typeof rawReceive}), 仅计次数`)
+		}
+		// 聚合日志只打一行, 逐项细节不刷屏(单个气泡时上面的逐项行已足够)
+		// cloudType:1 走 receiveTaskExpansion, 回的是 cloudCount 而不是 receive → 没有豆数时不要打「+0 豆」
+		if (okCount) this.log(beanSum > 0 ? `云朵领取: 成功 ${okCount} 项 +${beanSum} 豆` : `云朵领取: 成功 ${okCount} 项(接口未返回豆数)`);
+		if (extCount) {
+			const reason = [...new Set(extReasons)].join("/");
+			this.log(`⚠️ 云朵领取: 失败 ${extCount} 项(${reason})`);
+			// 外部故障只进 tasks(进度), 不进 errors(退出码保持 0), 且绝不写成「已领取」
+			this.reporter.tasks.push(`${this.maskedAccount} 云朵领取失败 ${extCount} 项(${reason})`)
+		}
+		// R4/R8: 写接口成功必须可被服务端状态复核, 不拿自己的文案当凭证。
+		// 只在**有项按业务码成功**时才回读: 全军覆没时没有「成功的领取」需要复核, 多打一个请求
+		// 只会多出一条「未确认」噪声(失败项自己已经记过 tasks 了)。
+		if (!okCount) return;
+		await this.sleep();
+		const info2 = await this.stepResult(() => this.api.getSignInfoV3());
+		if ("ok" !== info2.verdict.kind) {
+			const line = "云朵领取回读失败, 无法确认";
+			return this.log(`⚠️ ${line}`), void this.reporter.tasks.push(`${this.maskedAccount} ${line}`)
+		}
+		const re = info2.data?.result,
+			totalAfter = Number(re?.total),
+			lenAfter = Array.isArray(re?.receiveList) ? re.receiveList.length : NaN,
+			fmt = v => Number.isFinite(v) ? String(v) : "未知";
+		if (Number.isFinite(totalBefore) && Number.isFinite(totalAfter) && totalAfter > totalBefore)
+			this.log(`✅ 云朵领取成功(+${totalAfter - totalBefore}): 云朵 total: ${totalBefore}→${totalAfter}`);
+		else if (Number.isFinite(lenAfter) && lenAfter < lenBefore)
+			// total 未变但待领取项变少 → 以服务端列表收敛为准
+			this.log(`✅ 云朵领取成功(待领取列表已收敛): 待领取项 ${lenBefore}→${lenAfter}`);
+		else {
+			const line = `云朵领取未确认: total 未增长(${fmt(totalBefore)}→${fmt(totalAfter)}), 待领取项 ${lenBefore}→${fmt(lenAfter)}`;
+			this.log(`⚠️ ${line}`), this.reporter.tasks.push(`${this.maskedAccount} ${line}`)
 		}
 	}
 	async uploadLargeFile() {
@@ -5676,16 +5810,23 @@ async function runSelfCheck() {
 		tlExtThrown = await drive(() => tlExt.u.processTaskList("sign_in_3", "cloud_app")),
 		tlCredThrown = await drive(() => tlCred.u.processTaskList("sign_in_3", "cloud_app")),
 		tlOkThrown = await drive(() => tlOk.u.processTaskList("sign_in_3", "cloud_app"));
-	// API 容错开关: 用桩 requestJson 驱动**真实** API 工厂, 记录 (url, throwHttpErrors, retry)
+	// API 容错开关: 用桩 requestJson 驱动**真实** API 工厂, 记录 (url, throwHttpErrors, retry, data)
 	const apiCfg = [],
 		apiSpy = {
 			jwtHeaders: {},
-			requestJson: async (cfg, retry) => (apiCfg.push([cfg.url, cfg.throwHttpErrors, retry]), {})
+			requestJson: async (cfg, retry) => (apiCfg.push([cfg.url, cfg.throwHttpErrors, retry, cfg.data]), {})
 		},
 		spyEt = Et(apiSpy),
-		spyFt = Ft(apiSpy);
+		spyFt = Ft(apiSpy),
+		spySign = Yt(apiSpy);
 	await spyEt.getDrawInfo(), await spyEt.doDraw(), await spyEt.getBackupInfo(), await spyEt.receiveBackupReward();
 	await spyFt.doSignin(), await spyFt.getTaskList("sign_in_3"), await spyFt.getTaskExpansion(), await spyFt.receiveTaskExpansion("FAKE_DATE"), await spyFt.clickTask(319);
+	// 云朵领取的写接口: 必须把 payload 原样放进 data(旧实现在这里硬编码 data:{}, 是「跑了但没领到」的根因)
+	await spySign.receiveV3({
+		client: "app",
+		cloudId: "123456789012345",
+		cloudType: 0
+	});
 	eqCases.push(
 		// AC2: 抽奖端点下线 → 只提示 + 进度, 不进 errors, 正常路径不变
 		["B3 抽奖端点 HTML 404 → 不进 errors", drawExt.rep.errors.length, 0],
@@ -5709,11 +5850,154 @@ async function runSelfCheck() {
 		["B3 V2 任务列表 HTML 404 → 不进 errors 只记进度", [tlExtThrown, tlExt.rep.errors.length, tlExt.rep.tasks.length], ["", 0, 1]],
 		["B3 V2 任务列表 90001 → 进 invalid", [tlCredThrown, tlCred.rep.invalid.length, tlCred.rep.errors.length], ["", 1, 0]],
 		["B3 V2 任务列表 code:0 → 正常执行不记异常", [tlOkThrown, tlOk.rep.errors.length, tlOk.rep.tasks.length], ["", 0, 0]],
-		// AC1: 8 处 P1 调用点 + clickTask 全部具备 throwHttpErrors:!1 ∧ retry=1
-		["B3 9 个下游 API 调用点全部走分类", apiCfg.length, 9],
+		// AC1: 8 处 P1 调用点 + clickTask + receiveV3 全部具备 throwHttpErrors:!1 ∧ retry=1
+		["B3+B4 10 个下游 API 调用点全部走分类", apiCfg.length, 10],
 		["B3 下游 API 全部关掉 throwHttpErrors", apiCfg.every(c => !1 === c[1]), !0],
 		["B3 下游 API 全部单次调用(不做无效重试)", apiCfg.every(c => 1 === c[2]), !0],
+		// 🔴 空 body 回归网: receiveV3 改回 `data: {}`(或漏传 payload)时本条必转红
+		["B4 receiveV3 把 payload 原样转发到 data", JSON.stringify(apiCfg.find(c => String(c[0]).includes("/signin/page/receiveV3"))?.[3]), JSON.stringify({
+			client: "app",
+			cloudId: "123456789012345",
+			cloudType: 0
+		})],
 		["B3 下游 API 覆盖面(抽奖/备份/膨胀/旧签到/V2 任务列表/戳一下)", [apiCfg.some(c => String(c[0]).includes("/playoffic/drawInfo")), apiCfg.some(c => String(c[0]).includes("/backupgift/receive")), apiCfg.some(c => String(c[0]).includes("/taskExpansion")), apiCfg.some(c => String(c[0]).includes("/getByMarketRuleName")), apiCfg.some(c => String(c[0]).includes("/signin/task/taskList")), apiCfg.some(c => String(c[0]).includes("/signin/task/click"))], [!0, !0, !0, !0, !0, !0]]
+	);
+	// ——— B4 云朵气泡领取(receiveClouds)回归网 ——————————————————————————————
+	// 契约全部来自 2026-11-02 抓包 + H5 bundle 的 receiveCloudCom(见 design.md §1)。
+	// 全部桩住 api.* 并驱动**真实** receiveClouds(), 因此断言的是可观测结果(请求体/日志/通知通道),
+	// 不是把实现表达式抄一遍(quality-guidelines.md「断言必须有牙齿」)。
+	const mkReceive = (listData, opts = {}) => {
+			const { u, rep } = mkUnit(opts.cfg);
+			const claimCalls = [], expCalls = [];
+			let reads = 0;
+			u.api.getSignInfoV3 = async () => {
+				reads += 1;
+				// 第 2 次读是「回读复核」: 用 opts.after 覆盖; 未给则回同一份数据(模拟服务端状态未变)
+				if (reads > 1 && opts.after) return opts.after;
+				return {
+					code: 0,
+					msg: "success",
+					result: {
+						total: opts.total ?? 100,
+						receiveList: listData
+					}
+				}
+			}, u.api.receiveV3 = async payload => (claimCalls.push(payload), opts.claim ? opts.claim(payload) : {
+				code: 0,
+				msg: "success",
+				result: {
+					receive: 6
+				}
+			}), u.api.receiveTaskExpansion = async d => (expCalls.push(d), {
+				code: 0,
+				msg: "success",
+				result: {
+					cloudCount: 6
+				}
+			});
+			return { u, rep, claimCalls, expCalls, reads: () => reads }
+		},
+		// 夹具里的 recordId/账号全为**虚构值**(仅形状与实测样本一致)
+		rcEmpty = mkReceive([]),
+		rcNextMonth = mkReceive([{ cloudType: 2, cloudNum: 6 }]),
+		rcClaim = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { after: { code: 0, msg: "success", result: { total: 106, receiveList: [] } } }),
+		rcClaimDev = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { cfg: { deviceId: "FAKE_DEVICE_ID" } }),
+		rcFailed = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { claim: () => ({ code: 614, msg: "领取失败, 请稍后再试" }) }),
+		rcBusy = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { claim: () => ({ code: 11029, msg: "活动太火爆了, 请稍后再试" }) }),
+		rcCred = mkReceive([{ cloudType: 0, recordId: 1111111111 }, { cloudType: 0, recordId: 2222222222 }], { claim: () => ({ code: 90001, msg: "未登录" }) }),
+		rcScript = mkReceive([{ cloudType: 0, recordId: 123456789012345 }], { claim: () => ({ code: 501, msg: "参数校验异常" }) }),
+		rcShapeStr = mkReceive("not-an-array"),
+		rcShapeMissing = mkReceive(void 0),
+		rcShrink = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { after: { code: 0, msg: "success", result: { total: 100, receiveList: [] } } }),
+		rcUnconfirmed = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { after: { code: 0, msg: "success", result: { total: 100, receiveList: [{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }] } } }),
+		rcExpansion = mkReceive([{ cloudType: 1, acceptDate: "FAKE_ACCEPT_DATE", cloudNum: 6 }]),
+		// R2 的两条「不得编造」守卫: 缺字段就是缺, 夹具不替实现补值(删掉守卫会发 cloudId:"undefined" 的写请求)
+		rcNoId = mkReceive([{ cloudType: 0, cloudNum: 6 }]),
+		rcNoDate = mkReceive([{ cloudType: 1, cloudNum: 6 }]),
+		// cloudType 非数字但带 recordId: 发出去只会得到 {"cloudType":null} 的坏请求 → 应当跳过
+		rcBadType = mkReceive([{ cloudType: "NOT_A_NUMBER", recordId: 123456789012345, cloudNum: 6 }]),
+		// 旧的空 body 领取必须已从 reportCloudNum 里移走(否则同一个 bug 会被重新加回来)
+		rcReport = (() => {
+			const { u, rep } = mkUnit(),
+				calls = [];
+			return u.api.getCloudNumV3 = async () => ({
+				code: 0,
+				result: {
+					total: 100
+				}
+			}), u.api.receiveV3 = async p => (calls.push(p), {
+				code: 0
+			}), { u, rep, calls }
+		})(),
+		rcEmptyThrown = await drive(() => rcEmpty.u.receiveClouds()),
+		rcNextMonthThrown = await drive(() => rcNextMonth.u.receiveClouds()),
+		rcClaimThrown = await drive(() => rcClaim.u.receiveClouds()),
+		rcClaimDevThrown = await drive(() => rcClaimDev.u.receiveClouds()),
+		rcFailedThrown = await drive(() => rcFailed.u.receiveClouds()),
+		rcBusyThrown = await drive(() => rcBusy.u.receiveClouds()),
+		rcCredThrown = await drive(() => rcCred.u.receiveClouds()),
+		rcScriptThrown = await drive(() => rcScript.u.receiveClouds()),
+		rcShapeStrThrown = await drive(() => rcShapeStr.u.receiveClouds()),
+		rcShapeMissingThrown = await drive(() => rcShapeMissing.u.receiveClouds()),
+		rcShrinkThrown = await drive(() => rcShrink.u.receiveClouds()),
+		rcUnconfirmedThrown = await drive(() => rcUnconfirmed.u.receiveClouds()),
+		rcExpansionThrown = await drive(() => rcExpansion.u.receiveClouds()),
+		rcNoIdThrown = await drive(() => rcNoId.u.receiveClouds()),
+		rcNoDateThrown = await drive(() => rcNoDate.u.receiveClouds()),
+		rcBadTypeThrown = await drive(() => rcBadType.u.receiveClouds()),
+		rcReportThrown = await drive(() => rcReport.u.reportCloudNum()), rcText = u => u.rep.lines.map(String).join("\n");
+	eqCases.push(
+		// AC1 / R5 幂等: 列表已清空 → 零写请求, 且不记异常/进度(不刷「跑了一次」的噪声)
+		["B4 空 receiveList → 零写请求", [rcEmptyThrown, rcEmpty.claimCalls.length, rcEmpty.expCalls.length], ["", 0, 0]],
+		["B4 空 receiveList → 不进 errors/tasks", [rcEmpty.rep.errors.length, rcEmpty.rep.tasks.length], [0, 0]],
+		["B4 空 receiveList → 日志「无待领取奖励」", rcText(rcEmpty).includes("无待领取奖励"), !0],
+		// AC2: cloudType:2 无 recordId → 先判类型(顺序颠倒会 TypeError): 不发请求、不抛异常、文案「下月可领取」
+		["B4 cloudType:2 → 零写请求且不抛异常", [rcNextMonthThrown, rcNextMonth.claimCalls.length, rcNextMonth.expCalls.length], ["", 0, 0]],
+		["B4 cloudType:2 → 日志「下月可领取」", rcText(rcNextMonth).includes("下月可领取"), !0],
+		["B4 cloudType:2 → 不谎称领取成功", /领取成功/.test(rcText(rcNextMonth)), !1],
+		// AC3: 请求体逐字段锁死(改回 `data:{}` 必转红); deviceId 缺省不得出现
+		["B4 receiveV3 body 精确等于抓包形状", JSON.stringify(rcClaim.claimCalls[0]), JSON.stringify({ client: "app", cloudId: "123456789012345", cloudType: 0 })],
+		["B4 未配 deviceId 时 body 不含 deviceId", "deviceId" in (rcClaim.claimCalls[0] || {}), !1],
+		["B4 配了 CLOUD139_DEVICE_ID 才带 deviceId", [rcClaimDevThrown, rcClaimDev.claimCalls[0]?.deviceId], ["", "FAKE_DEVICE_ID"]],
+		["B4 领取成功日志含 +6", rcClaim.rep.lines.some(l => String(l).includes("+6")), !0],
+		// R4 回读复核: total 增长 → 打 before→after; 只认服务端状态, 不认自己的文案
+		["B4 回读 total 增长 → 日志给 before→after", rcText(rcClaim).includes("云朵 total: 100→106"), !0],
+		// R4 第二支: total 未变但待领取列表收敛 → 也计成功
+		["B4 回读列表收敛 → 仍计成功", [rcShrinkThrown, /领取成功\(待领取列表已收敛\)/.test(rcText(rcShrink))], ["", !0]],
+		// AC4: 614 是「领取失败」(不是「正常业务响应」), 只进 tasks 不进 errors
+		["B4 614 → 文案为领取失败", rcText(rcFailed).includes("领取失败"), !0],
+		["B4 614 → 不写「正常业务响应/已领取」", /正常业务响应|已领取/.test(rcText(rcFailed)), !1],
+		["B4 614 → 只进 tasks 不进 errors", [rcFailedThrown, rcFailed.rep.errors.length, rcFailed.rep.tasks.length], ["", 0, 1]],
+		// AC5: 11029 才是「活动太火爆」, 同样只进 tasks
+		["B4 11029 → 文案「活动太火爆」且只进 tasks", [rcBusyThrown, rcText(rcBusy).includes("活动太火爆"), rcBusy.rep.errors.length, rcBusy.rep.tasks.length], ["", !0, 0, 1]],
+		// 全失败时不回读: 没有「成功的领取」需要复核, 多读一次只会多一条「未确认」噪声
+		["B4 全部失败 → 只读 1 次 infoV3(不回读)", rcFailed.reads(), 1],
+		// AC6: 90001 → invalid 通道且立即终止(后续待领取项不再发请求)
+		["B4 90001 → 进 invalid 且立即终止", [rcCredThrown, rcCred.rep.invalid.length, rcCred.rep.errors.length, rcCred.claimCalls.length], ["", 1, 0, 1]],
+		// 500/501 属「脚本该修」: 抛 YdypError → 步骤 catch → errors(退出码非 0)
+		["B4 501 → 抛 YdypError 交给步骤 catch 记 errors", rcScriptThrown.startsWith("YdypError: "), !0],
+		// AC7: 形状异常 = 「读不到」, 不是「没有待领取项」
+		["B4 receiveList 非数组 → 日志「无法读取待领取列表」", [rcShapeStrThrown, rcText(rcShapeStr).includes("无法读取待领取列表")], ["", !0]],
+		["B4 receiveList 缺失 → 同样如实报告", rcText(rcShapeMissing).includes("无法读取待领取列表"), !0],
+		["B4 形状异常 → 零写请求且不进 errors", [rcShapeStr.claimCalls.length, rcShapeStr.rep.errors.length], [0, 0]],
+		// AC8: 回读 total 未变且列表未缩短 → 「领取未确认」, 不得出现任何成功文案
+		["B4 回读无变化 → 日志「领取未确认」", [rcUnconfirmedThrown, rcText(rcUnconfirmed).includes("领取未确认")], ["", !0]],
+		["B4 回读无变化 → 不出现「领取成功」", /领取成功/.test(rcText(rcUnconfirmed)), !1],
+		["B4 回读无变化 → 记一条进度(tasks)", rcUnconfirmed.rep.tasks.length, 1],
+		// R2: 缺 recordId / acceptDate 时**不得编造 id 发写请求**(变异测试 E 证明: 删掉守卫曾让自检全绿)
+		["B4 缺 recordId → 零写请求且提示无法领取", [rcNoIdThrown, rcNoId.claimCalls.length, rcText(rcNoId).includes("缺少 recordId")], ["", 0, !0]],
+		["B4 缺 acceptDate → 不发 receiveTaskExpansion 且提示", [rcNoDateThrown, rcNoDate.expCalls.length, rcText(rcNoDate).includes("缺少 acceptDate")], ["", 0, !0]],
+		["B4 cloudType 非数字 → 零写请求且提示形状异常", [rcBadTypeThrown, rcBadType.claimCalls.length, rcText(rcBadType).includes("cloudType 异常")], ["", 0, !0]],
+		// cloudType:1 → 走既有 receiveTaskExpansion({acceptDate}), 不发 receiveV3
+		["B4 cloudType:1 → 走 receiveTaskExpansion", [rcExpansionThrown, rcExpansion.expCalls.length, rcExpansion.claimCalls.length, rcExpansion.expCalls[0]], ["", 1, 0, "FAKE_ACCEPT_DATE"]],
+		// R7: 领取类失败属**非凭证类**, 通知正文不得命中失效分流(否则服务端瞬时拒绝会灌进失效 Bot、
+		// 引导用户去重抓 Cookie —— 一个完全无效的动作)
+		["B4 领取失败文案不命中失效分流", [rcFailed, rcBusy, rcUnconfirmed, rcShapeStr].map(f => matchesAlertRouting(f.rep.renderSummary())), [!1, !1, !1, !1]],
+		// 凭证态相反: 必须命中(文案由**真** Ye.renderSummary 生成, 不拄模板)
+		["B4 凭证态经 renderSummary 命中失效分流", matchesAlertRouting(rcCred.rep.renderSummary()), !0],
+		// 云朵统计步骤不得再发空 body 领取(旧实现就在那里空转), 但仍要报云朵总数
+		["B4 reportCloudNum 不再发空 body 领取", [rcReportThrown, rcReport.calls.length], ["", 0]],
+		["B4 reportCloudNum 仍统计云朵总数", rcReport.rep.amounts.length, 1]
 	);
 	// ——— 聚合回归: 驱动真实 run(), 所有下游端点同时回 HTML 404 → exit 码必须保持 0 ———
 	// 这是父任务 X2 / AC2 的离线等价物: 不属于「脚本该修」的外部故障不得污染退出码,
