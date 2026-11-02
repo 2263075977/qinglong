@@ -18,6 +18,9 @@
 //   * 唯一硬判据是 GET /api/log/self 里「北京时间今天」的签到记录（type=4 或含「签到成功」），
 //     且 created_at*1000 >= 本次运行开始 - 300s 才算「本次新签」，否则算「今日已签到」；
 //     今天完全没有签到记录 → 判失败（登录成功但签到未落库）。
+//   * 日志接口支持 type / start_timestamp 过滤（前端 bundle 实证：`p&page_size&type&start_timestamp`）。
+//     在用账号每天有数百条 type=2 消费日志，今天那条 type=4 签到记录早就被挤出第 1 页 ——
+//     只取第 1 页会让「判定结果与账号使用强度耦合」。取数策略见 fetchLogs()（带过滤 + 有界翻页 + 三级兜底）。
 //   * 系统访问令牌（Authorization: Bearer …）与 Session Cookie 都不会触发签到（已实测），
 //     所以本脚本只走账密登录。签到按北京时间自然日重置。
 //
@@ -751,15 +754,42 @@ async function fetchSelf(config, session, userId) {
   throw new AgentRouterError('network', '⚠️ 余额接口返回异常（详情见面板日志）');
 }
 
-async function fetchLogs(config, session, userId) {
-  const { data } = await requestJson(config, '/api/log/self?p=1&page_size=20', {
+// 取数策略常量（改之前先读 prd：11-02-agentrouter-log-paging）
+const LOG_PAGE_SIZE = 100;          // 带过滤时的页大小
+const LOG_MAX_PAGES = 3;            // 每级最多翻几页（有界，避免挂死 cron）
+const LOG_LEGACY_PAGE_SIZE = 20;    // 原行为页大小，最后一级兜底沿用
+// start_timestamp 回看窗口：30 小时。北京时间今天 00:00 起最多 24h，多留 6h 吸收
+// 本机时钟偏差 / 跨日边界 / 请求耗时，多出来的昨日记录不影响判定（仍按北京时间今天过滤）。
+const LOG_LOOKBACK_SEC = 30 * 3600;
+
+// 拼日志列表请求路径。不带 type / start_timestamp 时与改前的 `/api/log/self?p=1&page_size=20` 完全一致
+function buildLogPath({ page, pageSize, type, startTimestamp }) {
+  const params = [`p=${page}`, `page_size=${pageSize}`];
+  if (Number.isFinite(type)) params.push(`type=${Number(type)}`);
+  if (Number.isFinite(startTimestamp) && startTimestamp > 0) params.push(`start_timestamp=${Math.floor(startTimestamp)}`);
+  return `/api/log/self?${params.join('&')}`;
+}
+
+// 跨级去重用的键：同一页在不同兜底级里重复取到时只算一条（N 必须是「实际翻查过多少条」）
+function logItemKey(item) {
+  // New-API 的日志条目带自增 id，优先用它做去重键（字节完全相同但 id 不同的两条不该被折叠）
+  if (item && typeof item === 'object' && item.id !== undefined && item.id !== null) {
+    return `id:${item.id}`;
+  }
+  try {
+    return JSON.stringify(item);
+  } catch {
+    return String(item);
+  }
+}
+
+async function fetchLogPage(config, session, userId, apiPath) {
+  const { data } = await requestJson(config, apiPath, {
     headers: buildHeaders({ config, cookie: `session=${session}`, userId }),
   });
 
   const items = data?.data?.items;
-  if (data.success === true && Array.isArray(items)) {
-    return items;
-  }
+  if (data.success === true && Array.isArray(items)) return items;
 
   const message = extractMessage(data);
   if (isAuthMessage(message)) {
@@ -767,6 +797,117 @@ async function fetchLogs(config, session, userId) {
   }
 
   console.error(`${LOG_PREFIX} ⚠️ 日志接口结构未识别（schema_changed）：${noticeSafe(message) || '无 message'}`);
+  throw new AgentRouterError('network', '⚠️ 日志接口结构未识别（schema_changed），请维护');
+}
+
+/**
+ * 取签到日志：带过滤 + 有界翻页 + 三级兜底。
+ *
+ * 为什么不能只取第 1 页：在用账号每天有数百条 type=2 消费日志（每次 API 请求落一条），
+ * 今天的 type=4 签到记录落在第 20 条之后 → 第 1 页看不到 → 误判 no_log。
+ * 站点日志接口支持 type / start_timestamp（前端 bundle 实证），据此把消费日志整类过滤掉、
+ * 用时间戳砍掉历史，让「今天的签到记录」稳定落在第 1 页。
+ *
+ * 三级兜底（任一级发现「北京时间今天」的签到记录即停止，不为凑页数多发请求）：
+ *   ① type=4 + start_timestamp（主力）
+ *   ② 去掉 type + start_timestamp（防 type 语义变化 / 服务端不认 type）
+ *   ③ p=1&page_size=20 起（改前的原行为）+ 有界翻页，最后兜底
+ * 每级最多翻 LOG_MAX_PAGES 页；某级请求失败只记录并进入下一级，
+ * 三级都拿不到任何响应才向上抛（401/403 → auth_failed，其余 → network）。
+ *
+ * 返回 { items, total, tier, pages }；total = 实际翻查到的条目数（跨级已去重）。
+ */
+async function fetchLogs(config, session, userId, options = {}) {
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const runStartMs = Number.isFinite(Number(options.runStartMs)) ? Number(options.runStartMs) : nowMs;
+  const startTimestamp = Math.floor((nowMs - LOG_LOOKBACK_SEC * 1000) / 1000);
+
+  const tiers = [
+    { name: 'type=4+start_timestamp', pageSize: LOG_PAGE_SIZE, type: CHECKIN_LOG_TYPE, startTimestamp },
+    { name: 'start_timestamp', pageSize: LOG_PAGE_SIZE, type: null, startTimestamp },
+    { name: 'legacy', pageSize: LOG_LEGACY_PAGE_SIZE, type: null, startTimestamp: null },
+  ];
+
+  const collected = [];
+  const seen = new Set();
+  const failures = [];
+  const tiersWithItems = [];
+  let pages = 0;
+  let successfulPages = 0;
+  // 最后一页取满页 = 可能还有更多没翻到，文案要能告知「已达翻页上限」
+  let truncated = false;
+
+  const merge = (items) => {
+    for (const item of items) {
+      const key = logItemKey(item);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      collected.push(item);
+    }
+  };
+
+  for (const tier of tiers) {
+    let tierFetched = 0;
+    for (let page = 1; page <= LOG_MAX_PAGES; page += 1) {
+      const apiPath = buildLogPath({
+        page,
+        pageSize: tier.pageSize,
+        type: tier.type,
+        startTimestamp: tier.startTimestamp,
+      });
+
+      let items;
+      try {
+        items = await fetchLogPage(config, session, userId, apiPath);
+      } catch (error) {
+        // 单级失败不直接判失败（可能只是这一个过滤参数不被接受），记录后走下一级兜底；
+        // 但凭证类失败换了参数也救不回来，直接短路，省得三级各发一遍
+        failures.push(error);
+        console.warn(`${LOG_PREFIX} ⚠️ 日志取数失败（${tier.name} p=${page}）：${describeFailureType(error)}`);
+        if (error instanceof AgentRouterError && error.type === 'auth_failed') throw error;
+        break;
+      }
+
+      pages += 1;
+      successfulPages += 1;
+      tierFetched += items.length;
+      truncated = items.length >= tier.pageSize;
+      merge(items);
+
+      // 任一级发现今天的签到记录即停止（复用 pickTodayCheckin，不另造判据）
+      if (pickTodayCheckin(collected, runStartMs, nowMs).level !== 'none') {
+        return {
+          items: collected,
+          total: collected.length,
+          tier: tier.name,
+          pages,
+          truncated,
+        };
+      }
+
+      // 不足一页说明没有下一页了，别为凑页数白打请求
+      if (items.length < tier.pageSize) break;
+    }
+    if (tierFetched > 0) tiersWithItems.push(tier.name);
+  }
+
+  // 只要有一级真的返回了数据（哪怕是空数组）就算「日志拿到了」：
+  // 空日志是「今天确实没记录」而不是「接口拿不到」，绝不能把两者混成同一个 no_log。
+  if (successfulPages > 0) {
+    return {
+      items: collected,
+      total: collected.length,
+      tier: tiersWithItems.join(' → ') || '无条目',
+      pages,
+      truncated,
+    };
+  }
+
+  // 三级都拿不到任何 items：沿用原有错误类型语义（401/403 → auth_failed，其余 → network）
+  const authError = failures.find(error => error instanceof AgentRouterError && error.type === 'auth_failed');
+  if (authError) throw authError;
+  const last = failures[failures.length - 1];
+  if (last instanceof AgentRouterError) throw last;
   throw new AgentRouterError('network', '⚠️ 日志接口结构未识别（schema_changed），请维护');
 }
 
@@ -800,7 +941,7 @@ async function runAccount(config, account) {
 
   let selfData = null;
   let selfFailed = false;
-  let logItems = null;
+  let logResult = null;
   let logFailed = false;
   const sessionMissing = !login.session;
 
@@ -816,15 +957,20 @@ async function runAccount(config, account) {
       console.warn(`${LOG_PREFIX} ⚠️ ${base.label}：余额接口失败（${describeFailureType(error)}）`);
     }
 
-    // ③ 签到日志 —— 唯一硬判据
+    // ③ 签到日志 —— 唯一硬判据（带过滤 + 有界翻页 + 三级兜底，见 fetchLogs）
     try {
-      logItems = await fetchLogs(config, login.session, login.id);
+      logResult = await fetchLogs(config, login.session, login.id, { runStartMs: startedAt });
+      console.log(
+        `${LOG_PREFIX} ✅ ${base.label}：日志取数成功（层级 ${logResult.tier}，翻 ${logResult.pages} 页，共 ${logResult.total} 条${logResult.truncated ? '，已达翻页上限' : ''}）`,
+      );
     } catch (error) {
       logFailed = true;
       console.warn(`${LOG_PREFIX} ⚠️ ${base.label}：签到日志接口失败（${describeFailureType(error)}）`);
     }
   }
 
+  const logItems = logResult ? logResult.items : null;
+  const logTotal = logResult ? logResult.total : 0;
   const checkin = logItems ? pickTodayCheckin(logItems, startedAt) : { level: 'none', at: null, rewardUsd: null };
   base.checkinAt = checkin.at || null;
   base.rewardUsd = checkin.rewardUsd || null;
@@ -832,11 +978,15 @@ async function runAccount(config, account) {
   // ④ verdict 定稿：①②③ 全部跑完才判，任一步失败都不提前置成功
   if (logFailed || sessionMissing) {
     base.type = 'no_log';
-    base.detail = '⚠️ 登录成功但日志接口查询失败，无法确认今日签到（详情见面板日志）';
+    base.detail = '⚠️ 登录成功但日志查询失败，无法确认今日签到（详情见面板日志）';
   } else {
     base.type = decide({ loginData, selfData, logLevel: checkin.level });
     if (base.type === 'no_log') {
-      base.detail = '⚠️ 登录成功但未查到今日签到记录（详情见面板日志）';
+      // 区分两种 no_log：日志接口拿不到（上面那一条） vs 日志拿到了但没有今天的签到记录。
+      // N 是实际翻查到的条数（跨级已去重）；若最后一页取满页，标出「已达翻页上限」，
+      // 用来判断下次是否需要扩大翻页（见 fetchLogs 的 truncated）。
+      const truncatedHint = logResult && logResult.truncated ? '，已达翻页上限' : '';
+      base.detail = `⚠️ 今日日志中无签到记录（已翻查 ${logTotal} 条${truncatedHint}）`;
     }
   }
 
@@ -987,7 +1137,9 @@ async function runSelfCheck() {
   const benignTexts = [
     '✅ 成功 1 / 共 1\n✅ 签到成功（+$25.00）\n   余额：$275.00',
     '⏭️ 今日已签到',
-    '⚠️ 登录成功但未查到今日签到记录（详情见面板日志）',
+    '⚠️ 登录成功但日志查询失败，无法确认今日签到（详情见面板日志）',
+    '⚠️ 今日日志中无签到记录（已翻查 251 条）',
+    '⚠️ 今日日志中无签到记录（已翻查 300 条，已达翻页上限）',
     '⚠️ 网络请求失败：请求超时（20000ms）',
     '⚠️ 网络请求失败：服务端返回 HTTP 502',
     '⚠️ 登录未成功，详情见面板日志',
@@ -1165,7 +1317,7 @@ async function runSelfCheck() {
       masked: 'u2***@example.com',
       baseUrl: 'https://example.com',
       type: 'no_log',
-      detail: '⚠️ 登录成功但未查到今日签到记录（详情见面板日志）',
+      detail: '⚠️ 今日日志中无签到记录（已翻查 251 条）',
     },
   ];
   const mixedNotice = buildNotification(mixedResults);
@@ -1274,6 +1426,187 @@ async function runSelfCheck() {
   );
   check('端到端：登录路由 404（Invalid URL）→ network 而非凭证失效', notFoundType, 'network');
 
+  // 11.2) 日志取数兜底链夹具 A~E（全部虚构数据、零网络）——锁住「重账号不再误判签到未确认」
+  //   typeMode: 'honor' = 按 type 过滤（真实站点）；'ignore' = 忽略 type 照旧返回全量；
+  //            'unsupported' = 带 type 的请求一律回空（服务端不认 / 已改 type 语义）
+  const fakeNowSec = Math.floor(Date.now() / 1000);
+  const mkConsume = (offsetSec) => ({ created_at: fakeNowSec - offsetSec, type: 2, content: '模型调用扣费' });
+  const mkCheckin = (offsetSec) => ({ created_at: fakeNowSec - offsetSec, type: 4, content: '每日签到成功，增加额度 ＄25.000000 额度' });
+  // 在用账号的典型日志量：250 条 type=2 消费日志把今天的 type=4 签到记录挤到视野之外
+  const heavyConsumeLogs = Array.from({ length: 250 }, (_, i) => mkConsume(10 + i));
+
+  const makeLogStub = ({ allItems, typeMode = 'honor', logStatus = 0 }) => {
+    const urls = [];
+    const handler = (url) => {
+      const parsed = new URL(String(url));
+      urls.push(`${parsed.pathname}${parsed.search}`);
+      if (parsed.pathname === '/api/user/login') {
+        return Promise.resolve(jsonResponse(
+          { success: true, message: '', data: { id: 4242, checked_in: true, quota: 0 } },
+          { 'set-cookie': 'session=FAKE_SELFCHECK_SESSION; Path=/; HttpOnly' },
+        ));
+      }
+      if (parsed.pathname === '/api/user/self') {
+        return Promise.resolve(jsonResponse({ success: true, message: '', data: { id: 4242, quota: 137500000 } }));
+      }
+      if (parsed.pathname !== '/api/log/self') {
+        return Promise.reject(new Error(`UNEXPECTED_STUB_URL ${parsed.pathname}`));
+      }
+      if (logStatus) {
+        return Promise.resolve(new Response('{"success":false,"message":"boom"}', {
+          status: logStatus,
+          headers: { 'content-type': 'application/json' },
+        }));
+      }
+
+      const page = Number(parsed.searchParams.get('p') || '1');
+      const pageSize = Number(parsed.searchParams.get('page_size') || '20');
+      const typeRaw = parsed.searchParams.get('type');
+      const startRaw = parsed.searchParams.get('start_timestamp');
+
+      let list = allItems;
+      if (startRaw !== null) list = list.filter(item => Number(item.created_at) >= Number(startRaw));
+      if (typeRaw !== null && typeMode === 'honor') list = list.filter(item => Number(item.type) === Number(typeRaw));
+      if (typeRaw !== null && typeMode === 'unsupported') list = [];
+
+      const start = (page - 1) * pageSize;
+      return Promise.resolve(jsonResponse({ success: true, message: '', data: { items: list.slice(start, start + pageSize) } }));
+    };
+    return { handler, urls };
+  };
+  const logUrlsOf = (stub) => stub.urls.filter(url => url.startsWith('/api/log/self'));
+  const queryOf = (url) => new URL(`http://x${url}`).searchParams;
+  const pageOf = (url) => Number(queryOf(url).get('p'));
+
+  // 夹具 A：250 条 type=2 消费日志 + 末尾 1 条今天的 type=4 签到（真实站点形态：type 过滤生效）
+  //   修前复现：原行为（p=1&page_size=20 无过滤）的第 1 页里根本没这条签到记录
+  check(
+    '夹具A：根因复现——原行为第 1 页（p=1&page_size=20 无过滤）里没有今日签到记录',
+    pickTodayCheckin([...heavyConsumeLogs, mkCheckin(5)].slice(0, 20), Date.now()).level,
+    'none',
+  );
+  const caseAStub = makeLogStub({ allItems: [...heavyConsumeLogs, mkCheckin(5)] });
+  const caseA = await withFetchStub(caseAStub.handler, () => runAccount(fakeConfig, fakeAccount));
+  check('夹具A：修复后带 type=4 过滤 → 判定成功（不再是 no_log）', caseA.type, 'success');
+  check('夹具A：签到记录识别为本次新签并解析出 $25', [caseA.rewardUsd, caseA.checkinAt !== null], [25, true]);
+  const caseALogUrls = logUrlsOf(caseAStub);
+  check(
+    '夹具A：首个日志请求形如 p=1&page_size=100&type=4&start_timestamp=…',
+    [
+      caseALogUrls.length,
+      pageOf(caseALogUrls[0]),
+      queryOf(caseALogUrls[0]).get('page_size'),
+      queryOf(caseALogUrls[0]).get('type'),
+      Number(queryOf(caseALogUrls[0]).get('start_timestamp')) > 0,
+    ],
+    [1, 1, '100', '4', true],
+  );
+
+  // 夹具 B：服务端不认 type 过滤（带 type 的请求一律回空）→ 必须由第②级（无 type）接住
+  const caseBStub = makeLogStub({ allItems: [...heavyConsumeLogs, mkCheckin(5)], typeMode: 'unsupported' });
+  const caseB = await withFetchStub(caseBStub.handler, () => runAccount(fakeConfig, fakeAccount));
+  check('夹具B：服务端不认 type（带 type 回空）→ 兜底链仍找到今日签到并判成功', caseB.type, 'success');
+  check(
+    '夹具B：确实由第②级（无 type + page_size=100）接住',
+    logUrlsOf(caseBStub).some(url => !url.includes('type=') && url.includes('page_size=100')),
+    true,
+  );
+  // 夹具 B2：服务端完全忽略 type 参数（照旧返回全量）→ 靠 page_size=100 的分页在 3 页内找到
+  const caseB2Stub = makeLogStub({ allItems: [...heavyConsumeLogs, mkCheckin(5)], typeMode: 'ignore' });
+  const caseB2 = await withFetchStub(caseB2Stub.handler, () => runAccount(fakeConfig, fakeAccount));
+  const caseB2TypedUrls = logUrlsOf(caseB2Stub).filter(url => url.includes('type=4'));
+  check(
+    '夹具B2：服务端忽略 type 照旧回全量 → 第①级内 p 递增到 3 仍能找到',
+    [caseB2.type, caseB2TypedUrls.map(pageOf)],
+    ['success', [1, 2, 3]],
+  );
+
+  // 夹具 C：今天的签到记录完全不存在、checked_in=true → 必须仍判 no_log（fail-closed 不退化）
+  const yesterdayCheckin = mkCheckin(26 * 3600); // 在 30h 回看窗口内，但属北京时间昨天
+  const caseCStub = makeLogStub({ allItems: [...heavyConsumeLogs, yesterdayCheckin] });
+  const caseC = await withFetchStub(caseCStub.handler, () => runAccount(fakeConfig, fakeAccount));
+  check('夹具C：checked_in=true 但今天无签到记录 → 仍判 no_log', caseC.type, 'no_log');
+  check(
+    '夹具C：明细文案为「今日日志中无签到记录（已翻查 N 条）」且 N 为实际取到的条数',
+    [caseC.detail, isSuccessType(caseC.type)],
+    ['⚠️ 今日日志中无签到记录（已翻查 251 条，已达翻页上限）', false],
+  );
+
+  // 夹具 C2：三级都成功返回「空日志」（新号/无任何日志）→ 算「日志拿到了」，判 no_log(0 条)
+  //           而不是「日志查询失败」（两者不能混）。
+  const caseC2Stub = makeLogStub({ allItems: [] });
+  const caseC2 = await withFetchStub(caseC2Stub.handler, () => runAccount(fakeConfig, fakeAccount));
+  check(
+    '夹具C2：三级都回空日志 → no_log 且文案为「已翻查 0 条」而不是「查询失败」',
+    [caseC2.type, caseC2.detail],
+    ['no_log', '⚠️ 今日日志中无签到记录（已翻查 0 条）'],
+  );
+
+  // 夹具 D：日志接口一直 500 → 判 no_log，且文案必须是「日志查询失败」那一条
+  const caseDStub = makeLogStub({ allItems: [...heavyConsumeLogs, mkCheckin(5)], logStatus: 500 });
+  const caseD = await withFetchStub(caseDStub.handler, () => runAccount(fakeConfig, fakeAccount));
+  check(
+    '夹具D：日志接口 500 → no_log 且文案为「日志查询失败」',
+    [caseD.type, caseD.detail],
+    ['no_log', '⚠️ 登录成功但日志查询失败，无法确认今日签到（详情见面板日志）'],
+  );
+  check(
+    '夹具D：日志查询失败时不得出现「已翻查 N 条」（两种 no_log 不混）',
+    [inc(caseD.detail, '已翻查'), matchesAlertRouting(caseD.detail)],
+    [false, false],
+  );
+  const logFailureType = async (logStatus) => withFetchStub(
+    makeLogStub({ allItems: [], logStatus }).handler,
+    async () => {
+      try {
+        await fetchLogs(fakeConfig, 'FAKE_SESSION', 4242);
+        return 'NO_THROW';
+      } catch (error) {
+        return error instanceof AgentRouterError ? error.type : 'OTHER';
+      }
+    },
+  );
+  check(
+    '夹具D2：三级日志请求全 500 → 向上抛 network；全 401 → 向上抛 auth_failed（否则兜底会被误当成「今天没签到」）',
+    [await logFailureType(500), await logFailureType(401)],
+    ['network', 'auth_failed'],
+  );
+
+  // 夹具 E：三级兜底的 URL 形状（含 type=4 / start_timestamp / page_size / p 递增）
+  const caseCLogUrls = logUrlsOf(caseCStub);
+  const typedUrlsC = caseCLogUrls.filter(url => url.includes('type=4'));
+  const untypedUrlsC = caseCLogUrls.filter(url => !url.includes('type=') && url.includes('page_size=100'));
+  const legacyUrlsC = caseCLogUrls.filter(url => url.includes('page_size=20'));
+  const expectStartSec = Math.floor((Date.now() - LOG_LOOKBACK_SEC * 1000) / 1000);
+  check(
+    '夹具E：第①级 = type=4 + start_timestamp(≈now-30h) + page_size=100',
+    [
+      typedUrlsC.length,
+      queryOf(typedUrlsC[0]).get('page_size'),
+      Math.abs(Number(queryOf(typedUrlsC[0]).get('start_timestamp')) - expectStartSec) <= 120,
+    ],
+    [1, '100', true],
+  );
+  check(
+    '夹具E：第②级 = 去掉 type 但保留 start_timestamp + page_size=100，且 p 递增',
+    [
+      untypedUrlsC.length,
+      untypedUrlsC.every(url => Number(queryOf(url).get('start_timestamp')) > 0),
+      untypedUrlsC.map(pageOf),
+    ],
+    [3, true, [1, 2, 3]],
+  );
+  check(
+    '夹具E：第③级 = 原行为（无 type / 无 start_timestamp / page_size=20），p 从 1 递增',
+    [
+      legacyUrlsC.length,
+      legacyUrlsC.every(url => !url.includes('type=') && !url.includes('start_timestamp=')),
+      legacyUrlsC.map(pageOf),
+    ],
+    [3, true, [1, 2, 3]],
+  );
+  check('夹具E：翻页有界——三级合计请求数 ≤ 3×3', caseCLogUrls.length <= 9, true);
+
   // 12) 离线闸门：本自检全程不得发起任何网络请求
   check('离线自检：全程零网络请求（fetch 桩已安装且计数为 0）', [networkCalls, gateInstalled], [0, true]);
 
@@ -1341,6 +1674,8 @@ module.exports = {
   pickTodayCheckin,
   decide,
   isSuccessType,
+  buildLogPath,
+  fetchLogs,
   buildNotification,
   buildConfigMissingText,
   credentialNotice,
