@@ -8,7 +8,7 @@
  *   获取方式: 开抓包进 App, 搜 refresh, 找到 authTokenRefresh.do 请求, 取请求头中的 Authorization 与响应体 <token> 中的值
  *
  * 环境变量(可选, 前缀 CLOUD139_, 亦可用 $argument 同名键覆盖):
- *   CLOUD139_CLICK_NUM=15        戳一下次数(「摇一摇」已于 2026-10-27 实测下线并移除, 详见下方常量区注释)
+ *   已移除: CLOUD139_CLICK_NUM(原为「戳一下」次数, 默认 15)。实测点已完成任务零收益, 见 api.clickTask 的注释
  *   CLOUD139_DRAW_TIMES=1        抽奖次数
  *   CLOUD139_TASKLIST_V3=1       1=走 taskListV3(默认), 0=强制走旧 V2 任务列表(排障用)
  *   CLOUD139_TIMEOUT=5000        单请求超时(毫秒)
@@ -659,7 +659,6 @@ const u = {
 		defaults: {
 			upload: !1,
 			push: !0,
-			clickNum: 15,
 			drawTimes: 1,
 			delayMin: 1e3,
 			delayMax: 1500,
@@ -3135,7 +3134,6 @@ function ct() {
 		uploadTimes: ptimes(ut(e, ["uploadTimes"], lt([`${r}_UPLOAD_TIMES`, "cloud139_upload_times"], t.uploadTimes)), t.uploadTimes),
 		push: et(ut(e, ["push"], lt([`${r}_PUSH`, "cloud139_push"], t.push))),
 		tasklistV3: et(ut(e, ["tasklistV3", "taskListV3"], lt([`${r}_TASKLIST_V3`, "cloud139_tasklist_v3"], t.tasklistV3))),
-		clickNum: tt(ut(e, ["clickNum"], lt([`${r}_CLICK_NUM`, "cloud139_click_num"], t.clickNum)), t.clickNum),
 		drawTimes: tt(ut(e, ["drawTimes"], lt([`${r}_DRAW_TIMES`, "cloud139_draw_times"], t.drawTimes)), t.drawTimes),
 		delayMin: tt(ut(e, ["delayMin"], lt([`${r}_DELAY_MIN`, "cloud139_delay_min"], t.delayMin)), t.delayMin),
 		delayMax: tt(ut(e, ["delayMax"], lt([`${r}_DELAY_MAX`, "cloud139_delay_max"], t.delayMax)), t.delayMax),
@@ -3859,6 +3857,11 @@ function aggregateSsoOutcome(primary, backup) {
 // ⚠ 90001 是**下游**码, 与换票用的 AUTH_CREDENTIAL_CODES(200050409) 是两套, 故意不共用常量。
 const STEP_CREDENTIAL_CODES = [90001],
 	STEP_SCRIPT_CODES = [500, 501],
+	// 已结束类业务码: 实测 2026-11-02 GET /market/playoffic/draw → {"code":602,"msg":"活动已结束"}。
+	// 它是**服务端明确的「活动结束」**, 不是「接口不可用」, 也不属脚本该修: 只记 ⚠️ 提示 + 进度,
+	// 不进 errors、不影响退出码(见 error-handling.md「外部服务故障不该污染退出码」)。
+	// 未列入本表的其它码仍 fail-closed 归「未知业务码」。
+	STEP_ENDED_CODES = [602],
 	// 归类为「脚本该修」的码必须带可行动含义: 500 是任务表过期, 501 是请求构造错 —— 两者都在用户能改的范围
 	STEP_SCRIPT_HINTS = {
 		500: "TaskNotFound(任务 id 不在当前任务表, 需更新任务表)",
@@ -3918,7 +3921,16 @@ function classifyStepFailure(data, httpStatus) {
 		httpStatus: status,
 		msg: `code=${n} ${STEP_SCRIPT_HINTS[n]}`
 	};
-	// 5) 其余码一律 fail-closed 归外部故障: 不把上游变更误报成脚本 bug(否则每次 cron 都误报失败)
+	// 5) 已结束类码 → external + 可读文案(实测 /market/playoffic/draw 回 602「活动已结束」)。
+	//    必须放在最后的 fail-closed **之前**: 否则 602 会被描述成「接口不可用(未知业务码 code=602)」——
+	//    把「活动真的结束了」说成「接口坏了」, 会引用户去做无效的等待/上报(2026-11-02 现网日志实例)。
+	if (STEP_ENDED_CODES.includes(n)) return {
+		kind: "external",
+		code: n,
+		httpStatus: status,
+		msg: "活动已结束"
+	};
+	// 6) 其余码一律 fail-closed 归外部故障: 不把上游变更误报成脚本 bug(否则每次 cron 都误报失败)
 	return {
 		kind: "external",
 		code,
@@ -4252,6 +4264,11 @@ function Yt(e) {
 const $t = "https://caiyun.feixin.10086.cn/market/signin/page/info?client=app",
 	Rt = "https://caiyun.feixin.10086.cn/market/manager/commonMarketconfig/getByMarketRuleName?marketName=sign_in_3",
 	zt = e => `https://caiyun.feixin.10086.cn/market/signin/task/taskList?marketname=${e}`,
+	// ⚠ 本渠道 `receiveTask?taskId=` **故意不引入**(2026-11-02 取证): 本版前端 bundle
+	// (139newsignin.*.js 的 taskModules) 里定义了 `ot()` 但**无任何调用点** —— 任务奖励一律走
+	// buttonInfo.canReceive 为真时的 receivePoints({recordId, cloudType}) → receiveV3。
+	// 因此「按 taskId 领奖」在本版是死代码, 加进来只会多一条无法验证的死路径;
+	// 待领项统一由 receiveClouds() 读 infoV3.result.receiveList 领取。
 	Dt = e => `https://caiyun.feixin.10086.cn/market/signin/task/click?key=task&id=${e}`,
 	jt = "https://caiyun.feixin.10086.cn/market/signin/page/taskExpansion",
 	It = e => `https://caiyun.feixin.10086.cn/market/signin/page/receiveTaskExpansion?acceptDate=${e}`;
@@ -4268,7 +4285,7 @@ function Ft(e) {
 				throwHttpErrors: !1
 			})
 		},
-		// 旧签到降级 / V2 任务列表 / 膨胀 / 戳一下(B3): 同样加 throwHttpErrors:!1 + retry=1,
+		// 旧签到降级 / V2 任务列表 / 膨胀 / 做任务点击(B3): 同样加 throwHttpErrors:!1 + retry=1,
 		// 判活只看 body 业务码(classifyStepFailure)。这些端点实测全部存活(probe-findings §5.2/§5.3),
 		// 改动只为「将来下线时不污染退出码」(R3.1), 正常路径行为不变。
 		doSignin: async function() {
@@ -4287,6 +4304,11 @@ function Ft(e) {
 				throwHttpErrors: !1
 			}, 1)
 		},
+		// ⚠ 本方法**只**供 doTask()(做任务)使用, 绝不要拿它做「盲点已完成任务若干次」的步骤:
+		// 实测(2026-11-02) GET /market/signin/task/click?key=task&id=319(小云互动礼, FINISH)
+		// 与 id=609(和AI助手对话, FINISH) 都回 {"code":0,"msg":"success"} 而云朵 1612→1612 不变,
+		// 即 code:0 只代表「服务端受理了这次点击」, 不代表发奖。原来的 15 次「戳一下」步骤因此
+		// 是纯空转流量, 已于 2026-11-02 删除(步骤表条目 + Ut.clickTask 步骤函数), 方法本身保留。
 		clickTask: async function(t, r = {}) {
 			// 默认容错, ...r 在展开末尾 → 调用方仍可覆盖(与 doTask 的既有写法一致)
 			return e.requestJson({
@@ -4589,7 +4611,7 @@ class Ut {
 			"User-Agent": ft,
 			Accept: "*/*",
 			Host: "caiyun.feixin.10086.cn:7071"
-		}, this.clickNum = t.clickNum, this.drawTimes = t.drawTimes, this.parseCookie(), this.requester = function(e, t) {
+		}, this.drawTimes = t.drawTimes, this.parseCookie(), this.requester = function(e, t) {
 			return {
 				request: r,
 				requestJson: async function(e, t = 3) {
@@ -4681,7 +4703,7 @@ class Ut {
 			if (!await this.jwt()) return void(this.authInterfaceFailure || this.reporter.invalid.push(this.maskedAccount));
 			const e = [
 				["签到", () => this.signinStatus()],
-				["戳一下", () => this.clickTask()],
+				// 「戳一下」(盲点 task/click?id=319 十五次)已删除: 实测 319/609 均为 code:0 且云朵不变 → 零收益空转
 				["云盘任务", () => this.processTaskList("sign_in_3", "cloud_app")],
 				["抽奖", () => this.surplusNum()],
 				["邮箱任务", () => this.processTaskList("newsign_139mail", "email_app")],
@@ -4845,7 +4867,10 @@ class Ut {
 			return this.log(`⚠️ infoV3 不可用(${redactLog(e.message||String(e))}), 降级为旧签到接口`), await this.signinStatusLegacy()
 		}
 		const t = e?.result || {};
-		this.log(`📊 累计签到 ${t.signCount??"-"} 天, 本月备份 ${t.curMonthBackup??"-"} 次`);
+		// R4: curMonthBackup 实测是**布尔**(2026-11-02 infoV3 回 true), 旧文案把布尔当次数打印成
+		// 「本月备份 true 次」。三态处理: true=已备份 / false=未备份 / 缺失或其它=不打印该片段
+		const backupText = !0 === t.curMonthBackup ? ", 本月已备份" : !1 === t.curMonthBackup ? ", 本月未备份" : "";
+		this.log(`📊 累计签到 ${t.signCount??"-"} 天${backupText}`);
 		const r = this.todaySigned(t);
 		if (!0 === r) return void this.log("✅ 今日已签到");
 		// B2: infoV3 形状未知时无法判定, 交由 startSignIn 幂等确认
@@ -4864,8 +4889,15 @@ class Ut {
 			if (!1 === after) throw new Error("签到未被确认: startSignIn 回 code=0, 但回读 infoV3 明确显示今日未签到");
 			throw new Error("签到未确认(无法确认): startSignIn 回 code=0 但响应缺 todaySignIn, 回读 infoV3 也不可用")
 		}
-		if ([614, 615].includes(n)) return void this.log(`ℹ️ 签到提示: ${o?.msg||"活动太火爆"}, 属正常业务响应`);
-		throw new Error(`签到未成功: code=${o?.code??"?"} msg=${redactLog(o?.msg||"未知响应")}`)
+		// 🔴 2026-11-02 现网取证: 614/615 **不是**「今日已签」的幂等码, 不得再说成「属正常业务响应」。
+		//   证据 1: 今天已签到后再次调 GET signin/page/startSignIn?client=app, 服务端回
+		//           {"code":0,"result":{"todaySignIn":true,...}} —— 「重复签到」用 code:0 表达, 不用 614/615;
+		//   证据 2: 本版前端 bundle(139newsignin.*.js) 对 startSignIn 的 614/615 文案是
+		//           「签到失败，请稍后再试」, 不是「已签到」。
+		//   调用面: 已签走上面的快路径; infoV3 形状未知(null)时也会进来交由 startSignIn 幂等确认 ——
+		//   而幂等确认实测回 code:0 + todaySignIn:true(证据 1), 所以两种入口下 614/615 都只能是真失败。
+		//   按仓库纪律 fail-closed: 抛错 → 步骤 catch → errors(退出码非 0), 让失败被看见。
+		throw new Error(`签到失败: code=${o?.code??"?"} msg=${redactLog(o?.msg||"未知响应")}`)
 	}
 	// R2/R3: startSignIn 回 code=0 但响应缺 result.todaySignIn 时, 回读 infoV3 判今日**真实**状态。
 	// 返回值三态: true=确认已签 / false=明确未签 / null=无法确认(回读抛错、业务码非成功、或 todaySigned 形状未知)。
@@ -4928,45 +4960,6 @@ class Ut {
 		if (!this.acceptStepVerdict("旧签到", r.verdict)) return;
 		this.log(stOk ? "✅ 签到成功" : "✅ 签到完成(未经状态校验)")
 	}
-	// 🔴 B3 首要交付物: 戳一下判据重写。
-	// 实测(2026-10-27, probe-findings §5.3): 成功响应是 {"code":0,"msg":"success"}, **没有 result 字段**;
-	//   旧判据 `t?.result && (e += 1)` 因此成功也 falsy → 接口 15 次全成功时也照样打印
-	//   「戳一下未获得奖励 x 15」, 而 click 真失败(500/501/90001)时日志一模一样, 真故障永久无法发现。
-	// 但 code:0 **不代表发了奖**(§5.4: 319 已 FINISH 时点击仍回 code:0, 云朵 910→910 不变)
-	//   → 文案只能用中性表述「接口接受 N/M」, **禁止**「成功 N 次」「获得 N 次奖励」。
-	// 四态计数 + 按 credential > script > external > ok 的优先级出结论, 保证三种失败互不相同。
-	async clickTask() {
-		const n = this.clickNum,
-			stat = {
-				ok: 0,
-				credential: 0,
-				script: 0,
-				external: 0
-			};
-		let scriptVerdict = null,
-			externalVerdict = null;
-		for (let t = 0; t < n; t += 1) {
-			const r = await this.stepResult(() => this.api.clickTask(319, {
-				throwHttpErrors: !1
-			}));
-			const k = r.verdict.kind;
-			stat[k] = (stat[k] || 0) + 1, "script" === k ? scriptVerdict = r.verdict : "external" === k && (externalVerdict = r.verdict), await i(200)
-		}
-		// 全部成功: 只说「接口接受」, 不说「成功/获得奖励」(code:0 不代表发奖, §5.4)
-		if (stat.ok === n) return void this.log(`戳一下接口接受 ${stat.ok}/${n}(code=0, 是否发奖以任务态为准)`);
-		// 混合情形: 各态计数如实打印, 使 ok/未登录/脚本/外部互可区分(R2.2)
-		if (stat.ok > 0) {
-			const detail = [`接口接受 ${stat.ok}/${n}`];
-			stat.credential && detail.push(`未登录 ${stat.credential} 次`), stat.script && detail.push(`任务/参数错误 ${stat.script} 次`), stat.external && detail.push(`接口不可用 ${stat.external} 次`), this.log(`戳一下: ${detail.join(", ")}`)
-		}
-		if (stat.credential) return void this.acceptStepVerdict("戳一下", {
-			kind: "credential",
-			code: STEP_CREDENTIAL_CODES[0],
-			msg: `code=${STEP_CREDENTIAL_CODES[0]} 未登录`
-		});
-		if (stat.script) return void this.acceptStepVerdict("戳一下", scriptVerdict);
-		if (stat.external) return void this.acceptStepVerdict("戳一下", externalVerdict)
-	}
 	async processTaskList(e, t) {
 		await this.sleep();
 		let r = [];
@@ -4988,6 +4981,12 @@ class Ut {
 			if (!this.acceptStepVerdict("任务列表", v2.verdict)) return;
 			r = normalizeTasksV2(v2.data?.result || {})
 		}
+		// 🔴 反直觉事实(2026-11-02 实测互证): 此处跳过 FINISH **不会漏领**。
+		//   待领取奖励的权威来源是 infoV3.result.receiveList(元素 {cloudType, cloudNum, recordId/acceptDate}),
+		//   已由 receiveClouds() 步骤逐项领取(它读列表, 不读任务态)。本轮实测:
+		//   receiveList=[{cloudType:2}] 且 toReceive=0, 而任务侧 8 WAIT / 7 FINISH —— 两个维度本来就不是一回事。
+		//   本版前端 bundle 也只在 buttonInfo.canReceive 为真时调 receivePoints → receiveV3, 与「点任务」无关。
+		//   ⇒ **不要**在这个 FINISH 分支里加领取逻辑: 那会与 receiveClouds 重复请求同一项。
 		for (const o of r) {
 			if (ot(t, o.group, o.id)) continue;
 			const n = formatProgress(o.id, o.progress);
@@ -5529,7 +5528,7 @@ async function runSelfCheck() {
 	const wireJwt = (primary, backup) => {
 		const rep = mkReporter();
 		const u = new Ut("Basic ZGVmYXVsdDoxMjM0NTY=#13800138000", {
-			clickNum: 0, drawTimes: 0, requestTimeout: 1e3, uploadEnabled: !1
+			drawTimes: 0, requestTimeout: 1e3, uploadEnabled: !1
 		}, rep);
 		u.api.ssoForMCloud = async () => primary;
 		u.api.ssoForPortal = async () => backup;
@@ -5562,7 +5561,9 @@ async function runSelfCheck() {
 		["sso credential 通知日志不含 detail 原文", wCred.rep.lines.some(l => String(l).includes("FAKE_RAW")), !1]
 	);
 	// B2 回归网: 驱动真实的 API 工厂与 URL 常量表(不是抄一份实现), 锁住「已下线的摇一摇/死代码不得被重新引入」
-	// 与「抽奖/戳一下必须仍在」。任一删除或复活都会让下列断言转红。
+	// 与「抽奖/做任务点击 API 必须仍在」。任一删除或复活都会让下列断言转红。
+	// ⚠ 2026-11-02: 「戳一下」**步骤**已删除(实测点已完成任务零收益), 但其 API 方法必须保留 ——
+	//   doTask(做任务)靠它, 删了会让做任务静默失效。下面两条一正一反同时锁住。
 	const apiProbe = {
 			requestJson: async () => ({}),
 			jwtHeaders: {}
@@ -5574,13 +5575,13 @@ async function runSelfCheck() {
 		["B2 摇一摇已移除: 无 shake() 步骤函数", typeof Ut.prototype.shake, "undefined"],
 		["B2 抽奖必须保留: Bt 仍含 drawInfo 与 draw", [Object.values(Bt).some(u => u.endsWith("/playoffic/drawInfo")), Object.values(Bt).some(u => u.endsWith("/playoffic/draw"))], [!0, !0]],
 		["B2 死代码 getPrizeLog 已删除", "getPrizeLog" in probeSign, !1],
-		["B2 戳一下必须保留: clickTask 仍是方法", typeof probeSign.clickTask, "function"],
-		// ⚠ 同时锁 API 方法与 Ut.prototype 上的**步骤函数**: 只锁其中一个时,
-		//   重命名另一个自检仍全绿(实测漏网) —— 两者是不同对象, 不可互相代表
-		["B2 戳一下必须保留: clickTask 步骤函数仍在", typeof Ut.prototype.clickTask, "function"],
+		["B2 做任务点击 API 必须保留(doTask 依赖): clickTask 仍是方法", typeof probeSign.clickTask, "function"],
+		// 「戳一下」步骤函数必须**不存在**(2026-11-02 删除)。另: 步骤表本身的断言在下方 deadRun 块
+		// (驱动真 run() 看 stepResults 的步骤名), 本条只锁类方法。
+		["B2 戳一下步骤已移除: Ut 无 clickTask 步骤函数", typeof Ut.prototype.clickTask, "undefined"],
 		["B2 备份接口必须保留: Tt 仍有 info/receive", [Object.values(Tt).some(u => u.endsWith("/backupgift/info")), Object.values(Tt).some(u => u.endsWith("/backupgift/receive"))], [!0, !0]]
 	);
-	// ——— B3 步骤级四态分类与戳一下判据回归网(implement.md 步骤 2.1–2.7) ———
+	// ——— B3 步骤级四态分类回归网(implement.md 步骤 2.1–2.4) ———
 	// 夹具形态取自 probe-findings §5.3/§5.5 的真实响应结构, **值全部虚构**(不含任何真凭证/手机号)。
 	// 全部驱动**真实**实现(真分类函数、真步骤函数、真 Ye 记者), 不抄表达式
 	// (quality-guidelines.md:把正确表达式抄一遍当断言 = 同义反复, 没牙齿)。
@@ -5588,7 +5589,6 @@ async function runSelfCheck() {
 	const mkUnit = (cfg = {}) => {
 			const rep = mkReporter();
 			const u = new Ut(FAKE_COOKIE, Object.assign({
-				clickNum: 0,
 				drawTimes: 0,
 				requestTimeout: 1e3,
 				uploadEnabled: !1
@@ -5606,12 +5606,6 @@ async function runSelfCheck() {
 			} catch (e) {
 				return `${e.name}: ${e.message}`
 			}
-		},
-		mkClick = (handler, clickNum = 3) => {
-			const { u, rep } = mkUnit({ clickNum }),
-				calls = [];
-			u.api.clickTask = async (id, opt) => (calls.push([id, opt?.throwHttpErrors]), handler());
-			return { u, rep, calls, run: () => drive(() => u.clickTask()) }
 		};
 	eqCases.push(
 		// 2.1 🔑 锁死反直觉事实: click 成功响应 {"code":0,"msg":"success"} **没有 result 字段**
@@ -5656,64 +5650,52 @@ async function runSelfCheck() {
 			code: "ERR_NETWORK"
 		})), !0]
 	);
-	const okClick = mkClick(async () => ({
-			code: 0,
-			msg: "success"
-		})),
-		credClick = mkClick(async () => ({
-			code: 90001,
-			msg: "未登录"
-		})),
-		scriptClick = mkClick(async () => ({
-			code: 500,
-			msg: "TaskNotFound"
-		})),
-		paramClick = mkClick(async () => ({
-			code: 501,
-			msg: "参数校验异常"
-		})),
-		extClick = mkClick(async () => {
-			throw Object.assign(new Error("getaddrinfo ENOTFOUND fake-host"), {
-				code: "ERR_NETWORK",
-				isAxiosError: !0
-			})
-		}),
-		okThrown = await okClick.run(),
-		credThrown = await credClick.run(),
-		scriptThrown = await scriptClick.run(),
-		paramThrown = await paramClick.run(),
-		extThrown = await extClick.run(),
-		okText = okClick.rep.lines.join("\n"),
-		credText = credClick.rep.lines.join("\n"),
-		extText = extClick.rep.lines.join("\n");
+	// ——— 做任务点击(doTask)回归网 ——————————————————————————————————————
+	// 「戳一下」步骤函数已删除(2026-11-02), 但 api.clickTask 必须仍在: doTask(做任务)靠它,
+	// 删掉会让每个 WAIT 任务点击都 TypeError 并静默失效。以下全部驱动**真实** doTask(),
+	// 断言四条通道的可观测结果(不抄实现表达式)。
+	const mkDoTask = data => {
+			const { u, rep } = mkUnit(),
+				calls = [];
+			u.api.clickTask = async (id, opt) => (calls.push([id, opt?.throwHttpErrors]), data);
+			return { u, rep, calls, run: id => drive(() => u.doTask(id, "cloud_app", "cloud_app")) };
+		},
+		dtOk = mkDoTask({ code: 0, msg: "success" }),
+		dtCred = mkDoTask({ code: 90001, msg: "未登录" }),
+		dtScript = mkDoTask({ code: 500, msg: "TaskNotFound" }),
+		dtParam = mkDoTask({ code: 501, msg: "参数校验异常" }),
+		dtExt = mkDoTask("<html><body>404 Not Found</body></html>"),
+		// 用**互不相同**的任务 id 驱动: 「doTask 把 id 原样传给 click」这条契约必须有断言,
+		// 否则把 api.clickTask(e, …) 写死成 319(正是被删掉的那个旧步骤的形状)会静默回归
+		dtOkThrown = await dtOk.run(522),
+		dtCredThrown = await dtCred.run(607),
+		dtScriptThrown = await dtScript.run(106),
+		dtParamThrown = await dtParam.run(118),
+		dtExtThrown = await dtExt.run(585),
+		dtOkText = dtOk.rep.lines.join("\n"),
+		dtCredText = dtCred.rep.lines.join("\n"),
+		dtExtText = dtExt.rep.lines.join("\n");
 	eqCases.push(
-		// 2.5 全 code:0 → 中性文案: 不报失败, 也不暗示发奖(坑 2 + 坑 3)
-		["B3 戳一下全 code:0 不报「未获得奖励」", okText.includes("未获得奖励"), !1],
-		["B3 戳一下全 code:0 不写「成功 N 次/获得 N」", /成功\s*\d|获得\s*\d/.test(okText), !1],
-		["B3 戳一下全 code:0 报「接口接受 N/M」", okText.includes("接口接受 3/3"), !0],
-		["B3 戳一下全 code:0 不抛异常", okThrown, ""],
-		["B3 戳一下全 code:0 不进 errors", okClick.rep.errors.length, 0],
-		["B3 戳一下全 code:0 不进 tasks", okClick.rep.tasks.length, 0],
-		// 戳一下必须传 throwHttpErrors:!1(与 doTask 同款, 否则 404 会抛穿)
-		["B3 戳一下调用传 throwHttpErrors:!1", okClick.calls.every(c => 319 === c[0] && !1 === c[1]), !0],
-		// 2.6 全 90001 → invalid 通道(不过 noticeSafe), 且与全成功可区分
-		["B3 戳一下全 90001 → 进 invalid", credClick.rep.invalid, [credClick.u.maskedAccount]],
-		["B3 戳一下全 90001 → 不进 errors", [credClick.rep.errors.length, credThrown], [0, ""]],
-		["B3 戳一下全 90001 与全成功可区分", credText !== okText && !credText.includes("接口接受"), !0],
-		["B3 戳一下 90001 日志不命中失效分流", matchesAlertRouting(credText), !1],
-		// 但凭证类的**通知**必须命中失效分流(由真 Ye.renderSummary 生成, 不能回归)
-		["B3 credential 经 renderSummary 命中失效分流", matchesAlertRouting(credClick.rep.renderSummary()), !0],
-		// AC4b ④: 500 / 501 / 90001 三者互不相同且与成功可区分
-		["B3 戳一下 500 抛错进 errors", scriptThrown.startsWith("YdypError") && scriptThrown.includes("500"), !0],
-		["B3 戳一下 501 抛错且文案带 501", paramThrown.startsWith("YdypError") && paramThrown.includes("501"), !0],
-		["B3 成功/未登录/500/501/不可用 五种输出互不相同", new Set([okText, credText, scriptThrown, paramThrown, extText]).size, 5],
-		// AC4: 接口不可用 → 只记提示 + 进度, 不进 errors, 不污染退出码
-		["B3 戳一下网络异常 → 不进 errors", extClick.rep.errors.length, 0],
-		["B3 戳一下网络异常 → 进 tasks(进度)", extClick.rep.tasks.length, 1],
-		["B3 戳一下网络异常 → 文案是「接口不可用」", extText.includes("接口不可用"), !0],
-		["B3 戳一下网络异常 → 不说「未获得奖励」", extText.includes("未获得奖励"), !1],
-		["B3 戳一下网络异常不抛异常(退出码保持 0)", extThrown, ""],
-		["B3 external 进度文案不命中失效分流", matchesAlertRouting(extClick.rep.tasks[0] || ""), !1]
+		// 正常路径: 不抛错、不记异常/进度, 且 click 仍是容错调用(throwHttpErrors:!1)
+		["B3 做任务 code:0 → 不抛异常", dtOkThrown, ""],
+		["B3 做任务 code:0 → 不进 errors/tasks", [dtOk.rep.errors.length, dtOk.rep.tasks.length], [0, 0]],
+		["B3 做任务调用传 throwHttpErrors:!1", dtOk.calls.every(c => !1 === c[1]), !0],
+		// 任务 id 必须原样透传(不得写死成某个 id): 三个夹具用三个不同的 id 驱动
+		["B3 做任务把任务 id 原样传给 click", [dtOk.calls[0][0], dtScript.calls[0][0], dtExt.calls[0][0]], [522, 106, 585]],
+		// 90001 凭证态 → invalid 通道(不过 noticeSafe), 与成功路径可区分
+		["B3 做任务 90001 → 进 invalid 且不抛", [dtCredThrown, dtCred.rep.invalid, dtCred.rep.errors.length], ["", [dtCred.u.maskedAccount], 0]],
+		["B3 做任务 90001 日志不命中失效分流", matchesAlertRouting(dtCredText), !1],
+		// 凭证类的**通知**必须命中失效分流(由真 Ye.renderSummary 生成, 不抄模板)
+		["B3 做任务 90001 经 renderSummary 命中失效分流", matchesAlertRouting(dtCred.rep.renderSummary()), !0],
+		// 500/501 属脚本该修 → 抛 YdypError → 步骤 catch → errors(退出码非 0)
+		["B3 做任务 500 抛错且文案带 500", dtScriptThrown.startsWith("YdypError") && dtScriptThrown.includes("500"), !0],
+		["B3 做任务 501 抛错且文案带 501", dtParamThrown.startsWith("YdypError") && dtParamThrown.includes("501"), !0],
+		// 端点不可用: 只记提示 + 进度(tasks), 不进 errors, 退出码保持 0
+		["B3 做任务 404 → 不进 errors / 进 tasks / 不抛", [dtExt.rep.errors.length, dtExt.rep.tasks.length, dtExtThrown], [0, 1, ""]],
+		["B3 做任务 404 → 文案是「接口不可用」", dtExtText.includes("接口不可用"), !0],
+		// 四态互不相同: 把任一类误归成另一类(如 90001 也当 script)都会让本条转红
+		["B3 做任务成功/未登录/500/501/不可用 五种输出互不相同", new Set([dtOkText, dtCredText, dtScriptThrown, dtParamThrown, dtExtText]).size, 5],
+		["B3 做任务 404 进度文案不命中失效分流", matchesAlertRouting(dtExt.rep.tasks[0] || ""), !1]
 	);
 	// ——— B3 接线回归网: 抽奖 / 备份(含写操作不谎称已领取) / 旧签到 / V2 任务列表 / API 容错开关 ———
 	const mkDraw = data => {
@@ -5735,6 +5717,9 @@ async function runSelfCheck() {
 		}),
 		drawExtThrown = await drive(() => drawExt.u.surplusNum()),
 		drawOkThrown = await drive(() => drawOk.u.surplusNum()),
+		// R3: 602 = 活动已结束(2026-11-02 实测 GET /market/playoffic/draw → {"code":602,"msg":"活动已结束"})
+		drawEnded = mkDraw({ code: 602, msg: "活动已结束" }),
+		drawEndedThrown = await drive(() => drawEnded.u.surplusNum()),
 		mkBackup = (infoData, expData) => {
 			const { u, rep } = mkUnit();
 			return u.api.getBackupInfo = async () => infoData, u.api.receiveBackupReward = async () => ({
@@ -5820,7 +5805,9 @@ async function runSelfCheck() {
 		spyFt = Ft(apiSpy),
 		spySign = Yt(apiSpy);
 	await spyEt.getDrawInfo(), await spyEt.doDraw(), await spyEt.getBackupInfo(), await spyEt.receiveBackupReward();
-	await spyFt.doSignin(), await spyFt.getTaskList("sign_in_3"), await spyFt.getTaskExpansion(), await spyFt.receiveTaskExpansion("FAKE_DATE"), await spyFt.clickTask(319);
+	await spyFt.doSignin(), await spyFt.getTaskList("sign_in_3"), await spyFt.getTaskExpansion(), await spyFt.receiveTaskExpansion("FAKE_DATE");
+	// ⚠ 这里**不要**再驱动 spyFt.clickTask(): 「戳一下」步骤已删除, 本回归网只统计"步骤会发起"的调用点。
+	//   api.clickTask 的存在由 B2 的 typeof 断言 + doTask 驱动回归网锁住, 不靠这里的计数。
 	// 云朵领取的写接口: 必须把 payload 原样放进 data(旧实现在这里硬编码 data:{}, 是「跑了但没领到」的根因)
 	await spySign.receiveV3({
 		client: "app",
@@ -5834,6 +5821,24 @@ async function runSelfCheck() {
 		["B3 抽奖端点 HTML 404 → 不抛异常(exit 保持 0)", drawExtThrown, ""],
 		["B3 抽奖端点 HTML 404 → 不谎报抽奖成功", drawExt.rep.lines.some(l => String(l).includes("抽奖成功")), !1],
 		["B3 抽奖正常路径不变(code:0 → 继续抽奖)", [drawOkThrown, drawOk.rep.lines.some(l => String(l).includes("FAKE_PRIZE"))], ["", !0]],
+		// R3: 602 = 活动已结束。旧行为把 602 当「未知业务码」→「接口不可用」: 把「真结束」说成「接口坏了」
+		["R3 classifyStepFailure 602 → external", classifyStepFailure({
+			code: 602,
+			msg: "活动已结束"
+		}).kind, "external"],
+		["R3 602 文案含「活动已结束」且不含「接口不可用」", (() => {
+			const v = classifyStepFailure({
+				code: 602,
+				msg: "活动已结束"
+			});
+			return [v.msg.includes("活动已结束"), v.msg.includes("接口不可用")]
+		})(), [!0, !1]],
+		["R3 抽奖遇 602 → 不进 errors", drawEnded.rep.errors.length, 0],
+		["R3 抽奖遇 602 → 进 tasks(进度)", drawEnded.rep.tasks.length, 1],
+		["R3 抽奖遇 602 → 不抛异常(exit 保持 0)", drawEndedThrown, ""],
+		["R3 抽奖遇 602 日志含「活动已结束」/不含「接口不可用」", [drawEnded.rep.lines.some(l => String(l).includes("活动已结束")), drawEnded.rep.lines.some(l => String(l).includes("接口不可用"))], [!0, !1]],
+		["R3 抽奖遇 602 不谎报抽奖成功", drawEnded.rep.lines.some(l => String(l).includes("抽奖成功")), !1],
+		["R3 抽奖遇 602 进度文案不命中失效分流", matchesAlertRouting(drawEnded.rep.tasks[0] || ""), !1],
 		// AC3: 备份端点下线 → 同上
 		["B3 备份端点 HTML 404 → 不进 errors", backupExt.rep.errors.length, 0],
 		["B3 备份端点 HTML 404 → 进 tasks(进度)", backupExt.rep.tasks.length, 1],
@@ -5850,8 +5855,9 @@ async function runSelfCheck() {
 		["B3 V2 任务列表 HTML 404 → 不进 errors 只记进度", [tlExtThrown, tlExt.rep.errors.length, tlExt.rep.tasks.length], ["", 0, 1]],
 		["B3 V2 任务列表 90001 → 进 invalid", [tlCredThrown, tlCred.rep.invalid.length, tlCred.rep.errors.length], ["", 1, 0]],
 		["B3 V2 任务列表 code:0 → 正常执行不记异常", [tlOkThrown, tlOk.rep.errors.length, tlOk.rep.tasks.length], ["", 0, 0]],
-		// AC1: 8 处 P1 调用点 + clickTask + receiveV3 全部具备 throwHttpErrors:!1 ∧ retry=1
-		["B3+B4 10 个下游 API 调用点全部走分类", apiCfg.length, 10],
+		// AC1: 8 处 P1 调用点 + receiveV3 全部具备 throwHttpErrors:!1 ∧ retry=1
+		// 计数从 10 降回 9: 「戳一下」步骤删除后 task/click 不再由任何步骤发起(doTask 只在 WAIT 任务时发)
+		["B3+B4 9 个下游 API 调用点全部走分类", apiCfg.length, 9],
 		["B3 下游 API 全部关掉 throwHttpErrors", apiCfg.every(c => !1 === c[1]), !0],
 		["B3 下游 API 全部单次调用(不做无效重试)", apiCfg.every(c => 1 === c[2]), !0],
 		// 🔴 空 body 回归网: receiveV3 改回 `data: {}`(或漏传 payload)时本条必转红
@@ -5860,7 +5866,10 @@ async function runSelfCheck() {
 			cloudId: "123456789012345",
 			cloudType: 0
 		})],
-		["B3 下游 API 覆盖面(抽奖/备份/膨胀/旧签到/V2 任务列表/戳一下)", [apiCfg.some(c => String(c[0]).includes("/playoffic/drawInfo")), apiCfg.some(c => String(c[0]).includes("/backupgift/receive")), apiCfg.some(c => String(c[0]).includes("/taskExpansion")), apiCfg.some(c => String(c[0]).includes("/getByMarketRuleName")), apiCfg.some(c => String(c[0]).includes("/signin/task/taskList")), apiCfg.some(c => String(c[0]).includes("/signin/task/click"))], [!0, !0, !0, !0, !0, !0]]
+		["B3 下游 API 覆盖面(抽奖/备份/膨胀/旧签到/V2 任务列表)", [apiCfg.some(c => String(c[0]).includes("/playoffic/drawInfo")), apiCfg.some(c => String(c[0]).includes("/backupgift/receive")), apiCfg.some(c => String(c[0]).includes("/taskExpansion")), apiCfg.some(c => String(c[0]).includes("/getByMarketRuleName")), apiCfg.some(c => String(c[0]).includes("/signin/task/taskList"))], [!0, !0, !0, !0, !0]],
+		// 反向锁: 步骤层面再也**不得**出现 task/click(戳一下已删); doTask 只在 WAIT 任务时调它,
+		// 而它走的是步骤内的 api.clickTask, 不经过本回归网。把戳一下步骤加回去 → 本条转红。
+		["B3 步骤层面不再有 task/click 调用点", apiCfg.some(c => String(c[0]).includes("/signin/task/click")), !1]
 	);
 	// ——— B4 云朵气泡领取(receiveClouds)回归网 ——————————————————————————————
 	// 契约全部来自 2026-11-02 抓包 + H5 bundle 的 receiveCloudCom(见 design.md §1)。
@@ -6002,7 +6011,7 @@ async function runSelfCheck() {
 	// ——— 聚合回归: 驱动真实 run(), 所有下游端点同时回 HTML 404 → exit 码必须保持 0 ———
 	// 这是父任务 X2 / AC2 的离线等价物: 不属于「脚本该修」的外部故障不得污染退出码,
 	// 且不得把「接口不可用」写成「真的没奖励/未领取」。
-	const deadRun = mkUnit({ clickNum: 0 }),
+	const deadRun = mkUnit(),
 		DEAD_BODY = "<html><body>404 Not Found</body></html>",
 		deadMethods = ["initTaskStatus", "getSignInfoV3", "getSigninStatus", "doSignin", "clickTask", "getTaskListV3", "getTaskList", "getDrawInfo", "getCloudNumV3", "receiveV3", "getBackupInfo", "getTaskExpansion"];
 	deadRun.u.jwt = async () => !0;
@@ -6011,6 +6020,10 @@ async function runSelfCheck() {
 	const deadText = deadRun.rep.lines.join("\n"),
 		deadTasks = deadRun.rep.tasks.join("\n");
 	eqCases.push(
+		// 步骤表回归: 「戳一下」(盲点 task/click?id=319 十五次)已于 2026-11-02 删除。
+		// 驱动的是**真实** run()(下面刚跑过), 看它实际执行了哪些步骤 —— 把这一行加回去必让两条都转红。
+		["B3 步骤表里没有「戳一下」", deadRun.u.stepResults.some(s => "戳一下" === s.name), !1],
+		["B3 步骤表条目数 = 8(戳一下已删除)", deadRun.u.stepResults.length, 8],
 		["B3 全端点 404 → 不进 errors(exit 保持 0)", deadRun.rep.errors.length, 0],
 		["B3 全端点 404 → 不归 invalid(不误报凭证失效)", deadRun.rep.invalid.length, 0],
 		["B3 全端点 404 → 每步都未抛异常", deadRun.u.stepResults.every(s => s.ok), !0],
@@ -6529,6 +6542,66 @@ async function runSelfCheck() {
 		["R7 签到未确认文案不命中失效分流", [signReadNoThrown, signReadErrThrown, signReadUnknownThrown, signReadCodeErrThrown].map(matchesAlertRouting), [!1, !1, !1, !1]],
 		// R4: 回读本身失败不得落成凭证类(只能进 errors/抛出, 不得进 invalid)
 		["R4 回读失败不进 invalid 通道", [signReadErr.rep.invalid.length, signReadUnknown.rep.invalid.length, signReadCodeErr.rep.invalid.length], [0, 0, 0]]
+	);
+	// ——— R1 签到 614/615 诚实化 + R4 curMonthBackup 文案 ——————————————————————
+	// 实测(2026-11-02): 今日已签后重复调 startSignIn 回 {"code":0,"result":{"todaySignIn":true}} ——
+	// 614/615 **不是**「已签」的幂等码(前端 bundle 也把它映射成「签到失败，请稍后再试」)。
+	// 夹具用虚构值 FAKE_BUSY; 驱动**真实** signinStatus() 与 run(), 断言可观测结果(日志/通道)。
+	const mkSignEnd = signResp => {
+			const { u, rep } = mkUnit();
+			u.api.initTaskStatus = async () => ({ code: 0, msg: "success" });
+			// infoV3 明确报「今日未签」→ 才会走到 doSignInV3(已签会走快路径, 本用例就测不到了)
+			u.api.getSignInfoV3 = async () => ({ code: 0, result: { signCount: 2, cal: [{ t: 1, s: 0 }] } });
+			u.api.doSignInV3 = async () => signResp;
+			return { u, rep };
+		},
+		sign614 = mkSignEnd({ code: 614, msg: "FAKE_BUSY" }),
+		sign615 = mkSignEnd({ code: 615, msg: "FAKE_BUSY" }),
+		sign614Thrown = await drive(() => sign614.u.signinStatus()),
+		sign615Thrown = await drive(() => sign615.u.signinStatus());
+	// 「进 errors」必须由真实 run() 的**步骤 catch** 证明(不是在 signinStatus 里手工 push):
+	// 若 614/615 又被写回「ℹ️ 提示」分支, run() 就不会产生 errors, 下面这条转红。
+	const mkSignRun = signResp => {
+			const { u, rep } = mkUnit();
+			u.jwt = async () => !0;
+			for (const m of deadMethods) u.api[m] = async () => DEAD_BODY;
+			u.api.initTaskStatus = async () => ({ code: 0, msg: "success" });
+			u.api.getSignInfoV3 = async () => ({ code: 0, result: { signCount: 2, cal: [{ t: 1, s: 0 }] } });
+			u.api.doSignInV3 = async () => signResp;
+			return { u, rep };
+		},
+		signRun614 = mkSignRun({ code: 614, msg: "FAKE_BUSY" }),
+		signRunOk = mkSignRun({ code: 0, result: { todaySignIn: !0 } });
+	await drive(() => signRun614.u.run());
+	await drive(() => signRunOk.u.run());
+	// R4: curMonthBackup 实测是**布尔**(infoV3 回 true)。三态: true / false / 缺失
+	const mkBackupFlag = flag => {
+			const { u, rep } = mkUnit();
+			u.api.initTaskStatus = async () => ({ code: 0, msg: "success" });
+			u.api.getSignInfoV3 = async () => ({
+				code: 0,
+				result: Object.assign({ signCount: 2, todaySignIn: !0 }, null == flag ? null : { curMonthBackup: flag })
+			});
+			return { u, rep };
+		},
+		bfTrue = mkBackupFlag(!0),
+		bfFalse = mkBackupFlag(!1),
+		bfMissing = mkBackupFlag(null),
+		bfThrown = [await drive(() => bfTrue.u.signinStatus()), await drive(() => bfFalse.u.signinStatus()), await drive(() => bfMissing.u.signinStatus())];
+	eqCases.push(
+		["R1 签到 614 → 抛错且文案为签到失败", [sign614Thrown.startsWith("Error: "), sign614Thrown.includes("签到失败")], [!0, !0]],
+		["R1 签到 614 → 不再写「正常业务响应」", sign614.rep.lines.some(l => /正常业务响应/.test(String(l))), !1],
+		["R1 签到 615 → 抛错且文案为签到失败", [sign615Thrown.startsWith("Error: "), sign615Thrown.includes("签到失败")], [!0, !0]],
+		["R1 签到 615 → 不再写「正常业务响应」", sign615.rep.lines.some(l => /正常业务响应/.test(String(l))), !1],
+		// 失败文案属非凭证类, 不得命中失效分流(否则会把用户引去重抓 Cookie —— 一个无效动作)
+		["R1 签到失败文案不命中失效分流", [sign614Thrown, sign615Thrown].map(matchesAlertRouting), [!1, !1]],
+		["R1 签到 614 经 run() → 进 errors(退出码非 0)", [signRun614.rep.errors.length, String(signRun614.rep.errors[0] || "").includes("签到失败")], [1, !0]],
+		["R1 签到 614 经 run() → 日志无「正常业务响应」", signRun614.rep.lines.some(l => /正常业务响应/.test(String(l))), !1],
+		// 对照: code:0 + todaySignIn:true(实测的「重复签到」形态)必须仍是成功, 不得被连带改成失败
+		["R1 签到 code:0 + todaySignIn:true 仍为成功", [signRunOk.rep.errors.length, signRunOk.rep.lines.some(l => String(l).includes("签到成功"))], [0, !0]],
+		["R4 curMonthBackup:true → 「本月已备份」", bfTrue.rep.lines.some(l => String(l).includes("本月已备份")), !0],
+		["R4 curMonthBackup:false → 「本月未备份」", bfFalse.rep.lines.some(l => String(l).includes("本月未备份")), !0],
+		["R4 curMonthBackup 缺失 → 不打印「本月」", [bfMissing.rep.lines.some(l => String(l).includes("本月")), bfThrown.every(t => "" === t)], [!1, !0]]
 	);
 	// ——— 离线闸门回归网: 「全程离线」这个承诺必须可证伪(去掉入口桩必须转红) ———
 	// ① 到这里为止的**计划外**网络尝试必须为 0, 且闸门必须真的在位。
