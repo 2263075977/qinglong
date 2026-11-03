@@ -541,28 +541,35 @@ def _stats_line(snapshot):
 
 
 def build_notification(results, include_details=True):
-    """组装 (标题, 正文)。标题的成功计数必须与各账号 verdict 一致。
+    """组装 (标题, 正文)。正文**不再重复标题**，也不带「成功 x / 共 y」汇总行。
 
     ⚠️ 服务端 `skipped[].reason` 是**自由文本**（站点自己的枚举里就有「大量节点失效」），
        只进 console 日志，**任何模式下都不进通知**，否则一个正常运行的通知会被
        Node-RED 分流进失效提醒 Bot。
     ⚠️ include_details=False 用于「通知自检回落」：连来源名（同样属于用户侧自由文本）
        也一并省略，保证静态模板不被自由文本带偏。
+
+    版式：**每个账号一块、不缩进、不重复标题** —— `【账号】` 单独一行，其后依次是判定文案、
+    统计行、到期行；账号块之间也不插空行。理由：两处冗余（正文首行再写一遍标题、
+    行首 4 空格）都会让推送预览变成「标题 + 空白 + 同一句话」，而缩进在部分渠道
+    （Markdown/TG）会被吃掉或渲染成代码块，明细行反而与账号行错位。
+    总数/成功数从各账号的 ✅/❌ 直接读出，不另设汇总行；如需一眼看总数，
+    请把它加进标题（标题是发送方单独渲染的那一行）。
     """
-    ok_count = sum(1 for item in results if item.get("ok"))
-    lines = ["%s：成功 %d / 共 %d" % (TASK_TITLE, ok_count, len(results)), ""]
+    lines = []
     for index, item in enumerate(results, 1):
-        lines.append("【%s】%s" % (safe_label(item.get("name"), index), item.get("message")))
+        lines.append("【%s】" % safe_label(item.get("name"), index))
+        lines.append("%s" % item.get("message"))
         snapshot = item.get("snapshot") or {}
         stats = _stats_line(snapshot)
         if stats:
-            lines.append("    %s" % stats)
+            lines.append(stats)
         if snapshot.get("expires"):
-            lines.append("    订阅有效至 %s" % format_expires_at(snapshot["expires"]))
+            lines.append("订阅有效至 %s" % format_expires_at(snapshot["expires"]))
         if include_details:
             sources = [str(name) for name in (item.get("sources") or []) if name]
             if sources:
-                lines.append("    未能激活的来源：%s" % "、".join(sources[:5]))
+                lines.append("未能激活的来源：%s" % "、".join(sources[:5]))
     return TASK_TITLE, "\n".join(lines)
 
 
@@ -577,7 +584,9 @@ def build_minimal_notification(results):
     ok_count = sum(1 for item in results if item.get("ok"))
     lines = ["%s：成功 %d / 共 %d" % (TASK_TITLE, ok_count, len(results)), ""]
     for index, item in enumerate(results, 1):
-        lines.append("【账号%d】%s" % (index, "✅ 成功" if item.get("ok") else "❌ 失败"))
+        # 与 build_notification 同版式：账号行单独一行，成/败另起一行（不缩进）
+        lines.append("【账号%d】" % index)
+        lines.append("✅ 成功" if item.get("ok") else "❌ 失败")
     lines.append("")
     lines.append("（通知正文混入了可控性未覆盖的动态文本，已降级为最小化通知；详情见面板日志）")
     return TASK_TITLE, "\n".join(lines)
@@ -1204,7 +1213,7 @@ def run_selfcheck():
     lean_title, lean_content = build_and_check_notification([leaky])
     check("兜底：未收口动态文本时降级后的通知不命中", lean_title + "\n" + lean_content, False)
     check_bool("兜底：降级通知保留计数与成败",
-               "成功 0 / 共 1" in lean_content and "【账号1】❌ 失败" in lean_content)
+               "成功 0 / 共 1" in lean_content and "【账号1】\n❌ 失败" in lean_content)
 
     # —— 通知回落：自由文本注入 → 命中 → 剔除明细 → 不命中 ——
     risky = [result("milktea", True, None, ok_message, _snapshot(sample_user),
