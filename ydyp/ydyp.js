@@ -19,7 +19,11 @@
  *   CLOUD139_DIR_ID              上传目录 ID(空=根目录); 522 上传与大文件上传共用
  *   CLOUD139_UPLOAD              大文件上传开关(默认关闭)
  *   CLOUD139_AUTH_SALT           换票接口(tyrzLogin)签名盐值(默认内置; 移动轮换盐值导致签名被拒时在此覆盖)
- *   CLOUD139_DEVICE_ID           领取云朵气泡(receiveV3)body 里 deviceId 的**覆盖值**(可选; 缺省自动派生 base64(sha256("ydyp-device:"+账号)), 见 resolveDeviceId。2026-11-03 消元实测: body.deviceId 是领取成功的唯一必要字段, 不带恒定 code=615; 若派生值被服务端拒(仍 615)再填抓包值)
+ *   CLOUD139_DEVICE_ID           **必需**(仅「云朵气泡领取」依赖它; 未配置时该步跳过并发一条带获取步骤的 ⚠️, 一个写请求都不发)
+ *     2026-11-03~11-04 实测(同一账号同一接口): 不带 body.deviceId → code=615「兑换失败」; 任何派生/随机值 → code=614「锁定失败」;
+ *     只有 App 抓到的真实值 → code=0 且豆数到账。它是 App 原生层回填到 sessionStorage 的加密设备指纹(密钥在 App 内), 脚本算不出来,
+ *     只能采集一次长期复用(11-03 采到的值 11-04 仍成功 ⇒ 每次安装稳定, 不是会话级)。
+ *     获取方式: 移动云盘 App → 云朵中心 → 点一个「可领取」气泡, 抓包工具对该 receiveV3 请求「复制为 cURL」, 取 body 里的 deviceId 填入本变量
  *
  * 宿主说明: 本脚本同时兼容 Surge / Loon / Stash / Egern / Shadowrocket / Quantumult X / Node.js，
  *   但实际部署宿主 = 青龙面板(Node ≥18，无 npm 依赖)。
@@ -675,10 +679,9 @@ const u = {
 			uploadDirId: "",
 			// 换票签名盐值(可被 CLOUD139_AUTH_SALT 覆盖; 见 AUTH_SALT_DEFAULT 注释: 字面量只允许出现一处)
 			authSalt: AUTH_SALT_DEFAULT,
-			// deviceId 的**覆盖值**(可选): 2026-11-03 消元实测(同一 jwt 逐变体打一次 receiveV3) ——
-			// 只补 body.deviceId 就从 code=615 变 code=0/result.receive=80(total 1621→1701), 其余字段与头都不是必要条件。
-			// 而 deviceId 本身只是 H5 侧生成后落到 cookie 的标识(同一账号 11-02/11-03 抓到的值不同), 不是服务端绑定的设备凭证,
-			// 所以缺省不要求用户配置: 由 deriveDeviceId(账号) 确定性派生(见 resolveDeviceId)。此项仅用于覆盖派生值
+			// deviceId 默认空串 = **未配置**, 不代表「一个可用的默认值」。
+			// 2026-11-03~11-04 实测: 不带 → code=615「兑换失败」; 派生/随机值 → code=614「锁定失败」(服务端校验其内容);
+			// 只有 App 抓包值 → code=0 且豆数到账。故此处**不得**填任何默认/派生值 —— 空即未配置(见 Ut.claimDeviceId)。
 			deviceId: ""
 		}
 	};
@@ -3146,7 +3149,8 @@ function ct() {
 		// 换票签名盐值: 与其余键同构的三段式($argument 键 → 环境变量 → 默认值)。
 		// 移动轮换盐值导致签名被拒时, 用户只需在面板改 CLOUD139_AUTH_SALT, 不必改代码(R3.1)
 		authSalt: String(ut(e, ["authSalt"], lt([`${r}_AUTH_SALT`, "cloud139_auth_salt"], t.authSalt)) || t.authSalt),
-		// deviceId 覆盖值: 缺省空串 → receiveV3 的 body 用确定性派生值(见 Ut.resolveDeviceId 与 d.defaults.deviceId 注释)
+		// deviceId: 必需项, 空串即未配置(receiveClouds 据此跳过本步, 不发写请求)。
+		// 只做原样取值 + trim(见 Ut.claimDeviceId) —— 不再派生: 派生值实测必被服务端拒(614「锁定失败」)
 		deviceId: String(ut(e, ["deviceId"], lt([`${r}_DEVICE_ID`, "cloud139_device_id"], t.deviceId)) || "")
 	}
 }
@@ -3673,17 +3677,11 @@ function md5Lower(e) {
 function buildAuthSignature(salt, rid, ts, nonce) {
 	return md5Lower(String(salt) + rid + ts + nonce + salt)
 }
-// 领取云朵气泡时的 deviceId(离网纯函数, 供 --selfcheck 直接断言)。
-// 2026-11-03 消元实测: 用 App 抓包的 jwt 逐变体打 receiveV3 —— 只加 body.deviceId 就从 code=615 变 code=0/result.receive=80。
-// deviceId 是 H5 侧生成并落 cookie 的标识(同一账号 11-02 与 11-03 抓到的值**完全不同**, 都是 44 字符 base64;
-// 同时出现在 startSignIn?deviceId= 与 cookie .thumbcache_<32hex> 里), 天天变 ⇒ 不是服务端绑定的设备凭证, 可以由脚本派生。
-// (具体抓包值不写进源码: 与夹具纪律一致, 且它每天变、无处可复用)
-// 形态必须与 App 同形: 32 字节 → base64 44 字符(43 字符 + 一个 '=' 填充)。
-// 派生必须**确定性**(同一账号每次运行同值): 随机值等于每轮换一台设备, 既不像真实客户端, 也让「偶发失败」无法归因。
-// 选已内联的 CryptoJS(Ze.SHA256)而不是 node:crypto, 与 sha256Hex 的既有取舍一致(宿主无关)。
-function deriveDeviceId(seed) {
-	return Ze.enc.Base64.stringify(Ze.SHA256("ydyp-device:" + String(null == seed ? "" : seed)))
-}
+// ⚠️ 这里曾有派生函数 deriveDeviceId(seed) = sha256(固定前缀+seed) → base64, 已于 2026-11-04 **删除**, 不要加回来:
+//   实测(同一账号同一接口)派生值 → code=614「活动太火爆啦，锁定失败」, 比不带 deviceId 的 615 还早一个阶段失败,
+//   说明服务端会校验 deviceId 的**内容**。该值是 App 原生层回填到 sessionStorage 的加密设备指纹(密钥在 App 内),
+//   脚本无法计算, 只能「采集一次、配置复用」(跨天稳定: 11-03 的值 11-04 仍 code=0)。
+//   (旧前缀字面量从源码消失是有意为之: 它出现的地方就说明派生又回来了, 检索时可以一眼定位。)
 // uuid v4 形态。服务端只做唯一性判定(防重放按 x-request-id), 不强校验版本位; 补成 v4 只为贴近真实客户端
 function authUuid() {
 	let e = "";
@@ -4246,7 +4244,8 @@ function Yt(e) {
 		// 云朵气泡领取(2026-11-02 抓包): body 必带 client/cloudId/cloudType ——
 		// 旧实现发的是空 body `data: {}`, 服务端无从知道要领哪一项, 必然领不到(根因 1)。
 		// payload = {client:"app", cloudId:String(recordId), cloudType:Number, deviceId}; 成败交 receiveClouds 按业务码判。
-		// deviceId 现在是**必带**项(2026-11-03 消元实测: 不带恒定 code=615, 只补它就 code=0/result.receive=80)
+		// deviceId 现在是**必带**项(2026-11-03~11-04 实测: 不带恒定 code=615; 派生值恒定 614「锁定失败」; 只有 App 抓包值 code=0)
+		// ⇒ 调用方(receiveClouds)必先在配置层确认非空, 未配置时不会调到这里
 		// 写接口: throwHttpErrors:!1 + retry=1(单次空转即可, 重试无意义)
 		receiveV3: async function(r) {
 			return e.requestJson({
@@ -4709,16 +4708,17 @@ class Ut {
 			return t.length >= 7 ? `${t.slice(0,3)}****${t.slice(7)}` : t
 		}(this.account), this.cookies.sensors_stay_time = String(Date.now())
 	}
-	// deviceId 取值, 返回 { value, source }: 环境变量 CLOUD139_DEVICE_ID(抓包值)优先, 否则确定性派生(R1)。
-	// 缓存到 this._deviceId: 一个实例一轮运行内恒定, 且避免派生逻辑被重复执行出「同轮两个值」的假象。
-	// seed 取 rawCookie(含 Authorization 与账号) —— 天然按账号区分: 同账号恒定同值, 换账号自动换值。
-	// source 只描述来源(供日志), 调用方**不得**把 value 打进日志/通知(等于长期泄漏设备标识)。
-	resolveDeviceId() {
-		if (this._deviceId) return this._deviceId;
-		const configured = String(this.config?.deviceId || "").trim();
-		return this._deviceId = configured
-			? { value: configured, source: "环境变量 CLOUD139_DEVICE_ID" }
-			: { value: deriveDeviceId(this.rawCookie), source: "脚本派生" }
+	// 领取写接口 body.deviceId 的取值: **只取**配置值并去首尾空白, 不派生、不缓存、不给默认值。
+	// 2026-11-04 实测(同一账号同一接口):
+	//   不带 deviceId             → code=615「活动太火爆啦，兑换失败」
+	//   派生/随机值(44 字符 b64) → code=614「活动太火爆啦，锁定失败」  ← 比不带更早失败, 证明服务端校验其内容
+	//   App 抓包值                → code=0, 豆数到账(1704→1710)
+	// 它是 App 原生层回填到 sessionStorage 的加密设备指纹, JWT 里的 sub.deviceId 是 32 hex、body 里是 44 字符 base64,
+	// 密钥在原生层 ⇒ 脚本无法计算, 只能采集一次配置复用(11-03 采到的值 11-04 仍成功, 跨天稳定)。
+	// 空/纯空白一律视为**未配置**: 调用方据此跳过本步、不发写请求(明知必败的空转只会每天制造假失败)。
+	// 返回值**不得**进日志/通知(等同设备标识); 调用方只打结论与获取步骤。
+	claimDeviceId() {
+		return String(this.config?.deviceId || "").trim()
 	}
 	log(e) {
 		this.reporter.line(`[${this.maskedAccount}] ${e}`)
@@ -5186,8 +5186,9 @@ class Ut {
 	// 数据契约全部来自 2026-11-02 抓包 + H5 bundle 的 receiveCloudCom, 不是推断:
 	//   读侧 infoV3.result.receiveList = 待领取气泡列表, 元素 {cloudType, cloudNum, recordId?}
 	//   写侧 POST signin/page/receiveV3 body {client:"app", cloudId:String(recordId), cloudType:Number, deviceId}
-	//     ——— deviceId 是**必带**项(2026-11-03 消元实测): 不带恒定 code=615「活动太火爆啦，兑换失败…」,
-	//     只补这一个字段即 code=0/result.receive=80。activityid / isdeviceid / appversion 等头实测**不需要**, 不加。
+	//     ——— deviceId 是**必带且必有效**项(2026-11-03~11-04 实测): 不带恒定 code=615「兑换失败」,
+	//     派生/随机值恒定 code=614「锁定失败」, 只有 App 抓包值才 code=0。activityid / isdeviceid / appversion 等头实测**不需要**, 不加。
+	//     ⇒ 未配置 CLOUD139_DEVICE_ID 时本步直接跳过、零写请求(见下方 R1 分支), 不再用派生值硬凑。
 	// 🔴 分流顺序不可颠倒: cloudType:2 的项**没有 recordId**(实测样本 [{"cloudType":2,"cloudNum":6}]),
 	//   先读 id 再判类型就是 TypeError。
 	async receiveClouds() {
@@ -5202,13 +5203,26 @@ class Ut {
 		}
 		// R5 幂等: 已清空时零写请求
 		if (0 === list.length) return void this.log("✅ 无待领取奖励");
-		// R1: 本步只要真的有待领取项就会发写请求, 所以在这里一次性取定 deviceId(下面每项都带)。
-		// 只打**来源**, 绝不打印值 —— 值等同于设备标识, 进日志/通知等于长期泄漏(AC4)
-		const deviceId = this.resolveDeviceId();
-		this.log(`ℹ️ deviceId 来源: ${deviceId.source}(值不打印)`);
+		// R1: 只有**真正需要 deviceId 的项**才要求配置 —— cloudType 1(膨胀)走 receiveTaskExpansion、
+		// cloudType 2(下月可领取)根本不发请求, 这两类没配 deviceId 也应照常处理:
+		// 否则会白白少领一次膨胀奖励, 并把「下月可领取」提示也一起吞掉(信息退化)。
+		// 需要 deviceId 的项一律不发必败请求: deviceId 是领取成功的**必要条件**(2026-11-03~11-04 实测),
+		// 只能由 App 原生层提供、脚本算不出来(派生值必被服务端拒: 614「锁定失败」),
+		// 明知必败的空转只会每天制造一条假失败通知, 用户会学会忽略它。
+		const needsDeviceId = list.some(i => {
+				const t = Number(i?.cloudType);
+				return Number.isFinite(t) && 1 !== t && 2 !== t
+			}),
+			deviceId = needsDeviceId ? this.claimDeviceId() : "";
+		if (needsDeviceId && !deviceId) return this.log("⚠️ 未配置 CLOUD139_DEVICE_ID, 云朵领取已跳过(领取接口要求 App 设备号)"),
+			this.log("ℹ️ 获取方式: 移动云盘 App → 云朵中心 → 点一个「可领取」气泡, 抓包工具对该 receiveV3 请求「复制为 cURL」, 取 body 里的 deviceId 填入环境变量 CLOUD139_DEVICE_ID"),
+			void this.reporter.tasks.push(`${this.maskedAccount} 未配置 CLOUD139_DEVICE_ID, 云朵领取已跳过`);
 		const totalBefore = Number(result?.total), lenBefore = list.length;
 		let okCount = 0, beanSum = 0, extCount = 0;
 		const extReasons = [];
+		// R4: 已配置但 614/615 仍失败 ⇒ deviceId 可能真过期了(它是「采集一次、长期复用」的值)。
+		// 只提示**一次**(同一轮多个失败项不刷屏), 且只走日志 + tasks(外部因素, 不进 errors、不改退出码)。
+		let staleHintDone = !1;
 		for (const item of list) {
 			const cloudType = Number(item?.cloudType);
 			// 形状兜底: cloudType 不是有限数字时不发请求 —— 发出去只会得到 {"cloudType":null} 的坏请求,
@@ -5244,8 +5258,8 @@ class Ut {
 					client: "app",
 					cloudId: String(recordId),
 					cloudType,
-					// 恒带 deviceId(2026-11-03 消元实测: 只补它就从 615 → code=0); cloudId 保持字符串形状(实测字符串/数字都接受)
-					deviceId: deviceId.value
+					// 恒带 deviceId(此时必非空, 2026-11-03 实测: 只补它就从 615 → code=0); cloudId 保持字符串形状(字符串/数字都接受)
+					deviceId
 				};
 				res = await this.stepResult(() => this.api.receiveV3(payload))
 			}
@@ -5264,6 +5278,13 @@ class Ut {
 				// 原文是自由文本(实测 615 就是「活动太火爆啦，兑换失败，试试其他奖品吧」), 拼进 reporter.tasks
 				// 会进通知正文、可能误路由到凭证 Bot, 所以聚合文案保持现状, 明细走 this.log(rep.lines, 不进 renderSummary)。
 				this.log(`⚠️ 领取失败明细: cloudType=${cloudType} cloudNum=${Number.isFinite(cloudNum) ? cloudNum : "未知"} hasRecordId=${null != recordId} → code=${v.code} ${redactLog(String(res.data?.msg || v.log || v.msg || "")).slice(0,60)}`);
+				// R4: 614/615 = 服务端拒了这个 deviceId 的内容。若已配置仍持续如此, 唯一可行动作是重抓一次。
+				// 注意措辞: 不得用「已失效/重新登录」(会被路由到凭证 Bot), 也不进 errors(不是脚本 bug)。
+				if (!staleHintDone && CLAIM_FAILED_CODES.includes(code)) {
+					staleHintDone = !0;
+					const hint = "若持续失败, 说明 CLOUD139_DEVICE_ID 可能已过期, 请重新抓包更新";
+					this.log(`ℹ️ ${hint}`), this.reporter.tasks.push(`${this.maskedAccount} ${hint}`)
+				}
 				extCount += 1, extReasons.push(reason);
 				continue
 			}
@@ -5631,11 +5652,6 @@ async function runSelfCheck() {
 	// 全部驱动**真实**实现(真分类函数、真步骤函数、真 Ye 记者), 不抄表达式
 	// (quality-guidelines.md:把正确表达式抄一遍当断言 = 同义反复, 没牙齿)。
 	const FAKE_COOKIE = "Basic ZGVmYXVsdDoxMjM0NTY=#13800138000";
-	// 另一个账号的假 Cookie(手机号虚构): 只用于验证「派生值按账号区分」(AC3)
-	const FAKE_COOKIE_OTHER = "Basic ZGVmYXVsdDoxMjM0NTY=#13900139000";
-	// deriveDeviceId(FAKE_COOKIE) 的期望值: 用 node:crypto 独立算出的 base64(sha256("ydyp-device:"+FAKE_COOKIE)),
-	// 不是把实现表达式抄一遍 —— 派生式(算法/前缀/编码)一改本条立刻转红。值对应的是虚构 Cookie, 不涉真实凭证。
-	const FAKE_DEVICE_ID_DERIVED = "x7gcaB/Sj1Dy4OwXdIu23I5dUa4VeQrQkPtPvOYZDPg=";
 	const mkUnit = (cfg = {}, cookie = FAKE_COOKIE) => {
 			const rep = mkReporter();
 			const u = new Ut(cookie, Object.assign({
@@ -5929,7 +5945,9 @@ async function runSelfCheck() {
 	// 全部桩住 api.* 并驱动**真实** receiveClouds(), 因此断言的是可观测结果(请求体/日志/通知通道),
 	// 不是把实现表达式抄一遍(quality-guidelines.md「断言必须有牙齿」)。
 	const mkReceive = (listData, opts = {}) => {
-			const { u, rep } = mkUnit(opts.cfg);
+			// 默认带 deviceId: 云朵领取的**所有既有用例**都依赖它(未配置时本步会直接跳过, 不产生任何写请求)。
+			// 跳过路径的用例显式传 cfg: { deviceId: "" } / { deviceId: "   " } 覆盖这一默认值。
+			const { u, rep } = mkUnit(Object.assign({ deviceId: "FAKE_DEVICE_ID" }, opts.cfg));
 			const claimCalls = [], expCalls = [];
 			let reads = 0;
 			u.api.getSignInfoV3 = async () => {
@@ -5963,10 +5981,17 @@ async function runSelfCheck() {
 		rcEmpty = mkReceive([]),
 		rcNextMonth = mkReceive([{ cloudType: 2, cloudNum: 6 }]),
 		rcClaim = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { after: { code: 0, msg: "success", result: { total: 106, receiveList: [] } } }),
-		rcClaimDev = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { cfg: { deviceId: "FAKE_DEVICE_ID" } }),
-		// 只含空白的配置值必须回落到派生值: 否则真会发一个 "   " 上去(服务端照样回 615, 而用户以为"配了")
+		rcClaimDev = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { cfg: { deviceId: "  FAKE_DEVICE_ID  " } }),
+		// 未配置(空串) / 纯空白: 两种均视为未配置 → 跳过本步、零写请求(AC1/AC3)
+		rcNoDev = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { cfg: { deviceId: "" } }),
 		rcBlankDev = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { cfg: { deviceId: "   " } }),
+		// 不需要 deviceId 的项不得被整体卡住(否则少领一次膨胀奖励 / 吞掉「下月可领取」提示)
+		rcNextMonthNoDev = mkReceive([{ cloudType: 2, cloudNum: 92 }], { cfg: { deviceId: "" } }),
+		// 膨胀项不需要 deviceId: 给它一份「回读后 total 增长」的 after, 免得把「领取未确认」也算进 tasks 干扰断言
+		rcExpansionNoDev = mkReceive([{ cloudType: 1, acceptDate: "FAKE_ACCEPT_DATE", cloudNum: 6 }], { cfg: { deviceId: "" }, after: { code: 0, msg: "success", result: { total: 106, receiveList: [] } } }),
 		rcFailed = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { claim: () => ({ code: 614, msg: "领取失败, 请稍后再试" }) }),
+		// 两个待领取项都 614: 用于验证「过期提示只打一次」(逐项打就会刷屏, 用户很快学会忽略它)
+		rcFailedMulti = mkReceive([{ cloudType: 0, recordId: 1111111111, cloudNum: 6 }, { cloudType: 0, recordId: 2222222222, cloudNum: 6 }], { claim: () => ({ code: 614, msg: "领取失败, 请稍后再试" }) }),
 		// 2026-11-03 真跑形态: 615 + 服务端文案「活动太火爆啦，兑换失败，试试其他奖品吧」(错在于 body 缺 deviceId)
 		rcFailed615 = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { claim: () => ({ code: 615, msg: "活动太火爆啦，兑换失败，试试其他奖品吧" }) }),
 		rcBusy = mkReceive([{ cloudType: 0, recordId: 123456789012345, cloudNum: 6 }], { claim: () => ({ code: 11029, msg: "活动太火爆了, 请稍后再试" }) }),
@@ -5999,8 +6024,12 @@ async function runSelfCheck() {
 		rcNextMonthThrown = await drive(() => rcNextMonth.u.receiveClouds()),
 		rcClaimThrown = await drive(() => rcClaim.u.receiveClouds()),
 		rcClaimDevThrown = await drive(() => rcClaimDev.u.receiveClouds()),
+		rcNoDevThrown = await drive(() => rcNoDev.u.receiveClouds()),
 		rcBlankDevThrown = await drive(() => rcBlankDev.u.receiveClouds()),
+		rcNextMonthNoDevThrown = await drive(() => rcNextMonthNoDev.u.receiveClouds()),
+		rcExpansionNoDevThrown = await drive(() => rcExpansionNoDev.u.receiveClouds()),
 		rcFailedThrown = await drive(() => rcFailed.u.receiveClouds()),
+		rcFailedMultiThrown = await drive(() => rcFailedMulti.u.receiveClouds()),
 		rcFailed615Thrown = await drive(() => rcFailed615.u.receiveClouds()),
 		rcBusyThrown = await drive(() => rcBusy.u.receiveClouds()),
 		rcCredThrown = await drive(() => rcCred.u.receiveClouds()),
@@ -6014,10 +6043,6 @@ async function runSelfCheck() {
 		rcNoDateThrown = await drive(() => rcNoDate.u.receiveClouds()),
 		rcBadTypeThrown = await drive(() => rcBadType.u.receiveClouds()),
 		rcReportThrown = await drive(() => rcReport.u.reportCloudNum()), rcText = u => u.rep.lines.map(String).join("\n");
-	// AC3: 派生确定性 —— 同 cookie 的两个**独立实例**必须同值(改随机就转红), 异 cookie 必须异值
-	const devSameA = mkUnit().u.resolveDeviceId(),
-		devSameB = mkUnit().u.resolveDeviceId(),
-		devOther = mkUnit({}, FAKE_COOKIE_OTHER).u.resolveDeviceId();
 	// AC4: 一次性查全「面板日志 + 通知正文(renderSummary) + 进度/异常/金额明细」是否含某个字面值
 	const noDeviceIdLeak = (fixture, value) => [
 		rcText(fixture),
@@ -6035,39 +6060,57 @@ async function runSelfCheck() {
 		["B4 cloudType:2 → 零写请求且不抛异常", [rcNextMonthThrown, rcNextMonth.claimCalls.length, rcNextMonth.expCalls.length], ["", 0, 0]],
 		["B4 cloudType:2 → 日志「下月可领取」", rcText(rcNextMonth).includes("下月可领取"), !0],
 		["B4 cloudType:2 → 不谎称领取成功", /领取成功/.test(rcText(rcNextMonth)), !1],
-		// AC3: 请求体逐字段锁死(改回 `data:{}` 必转红)。deviceId **恒带** —— 2026-11-03 A/B/C 消元实测:
-		// 只补 body.deviceId 就 code=0/result.receive=80; 不带则恒定 615。旧契约「缺省不带」已作废。
-		["B4 receiveV3 body 除 deviceId 外逐字段锁死(deviceId 值已抹去, 避免自检输出回显设备标识)", JSON.stringify(Object.assign({}, rcClaim.claimCalls[0], { deviceId: "<derived>" })), JSON.stringify({ client: "app", cloudId: "123456789012345", cloudType: 0, deviceId: "<derived>" })],
-		// AC1: 形状必须与 App 同形(32 字节 → 43 字符 + '='), 且未配环境变量时用派生值。
-		// 只能用布尔输出: 设备标识不进自检输出(该值本身由 deriveDeviceId 派生, 不打印)
-		["B4 未配 CLOUD139_DEVICE_ID → 用派生值且形状为 32 字节 base64", [/^[A-Za-z0-9+/]{43}={0,2}$/.test(rcClaim.claimCalls[0]?.deviceId || ""), rcClaim.claimCalls[0]?.deviceId === FAKE_DEVICE_ID_DERIVED], [!0, !0]],
-		// AC2: 配置值**覆盖**派生值(不是「配了才有、不配就不带」)。只输出布尔, 不回显任何 deviceId 值
-		["B4 deviceId 只含空白 → 回落派生值(不得发出空白值)", [rcBlankDevThrown, rcBlankDev.claimCalls[0]?.deviceId === FAKE_DEVICE_ID_DERIVED, rcBlankDev.u.resolveDeviceId().source], ["", !0, "脚本派生"]],
-		["B4 配了 CLOUD139_DEVICE_ID → 覆盖派生值", [rcClaimDevThrown, rcClaimDev.claimCalls[0]?.deviceId === "FAKE_DEVICE_ID", rcClaimDev.claimCalls[0]?.deviceId === FAKE_DEVICE_ID_DERIVED], ["", !0, !1]],
-		// 派生式本体: 与 node:crypto 独立算出的向量逐字节对齐; 改算法/前缀/编码 → 转红。
-		// 断言用布尔而非实际值, 避免自检输出回显 deviceId(期望值就在下面这行源码里)
-		["B4 deviceId 派生式对齐独立向量(sha256+base64)", deriveDeviceId("abc") === "OnkcrI/JaeMJLfCgOhr8/CZm/5Uj5BIDIa8z2IhaTwo=", !0],
-		// AC3: 确定性(同账号同值)与区分度(异账号异值)。派生改 Math.random → 首条转红
-		["B4 派生确定性: 同 cookie 两实例同值", [devSameA.value === FAKE_DEVICE_ID_DERIVED, devSameA.value === devSameB.value, devSameA.source], [!0, !0, "脚本派生"]],
-		["B4 派生区分账号: 异 cookie 异值且形状合法", [devOther.value === FAKE_DEVICE_ID_DERIVED, /^[A-Za-z0-9+/]{43}=$/.test(devOther.value)], [!1, !0]],
-		// AC4: 日志只打**来源**不打值; 派生值与配置值都不得出现在面板日志/通知正文/明细
-		["B4 来源日志只打「脚本派生」(派生分支)", rcText(rcClaim).includes("deviceId 来源: 脚本派生"), !0],
-		["B4 来源日志只打「环境变量 CLOUD139_DEVICE_ID」(覆盖分支)", rcText(rcClaimDev).includes("deviceId 来源: 环境变量 CLOUD139_DEVICE_ID"), !0],
-		["B4 派生值不进日志/通知正文", [noDeviceIdLeak(rcClaim, FAKE_DEVICE_ID_DERIVED), noDeviceIdLeak(rcClaim, "ydyp-device:")], [!0, !0]],
-		["B4 配置值不进日志/通知正文", noDeviceIdLeak(rcClaimDev, "FAKE_DEVICE_ID"), !0],
+		// AC3: 请求体逐字段锁死(改回 `data:{}` 必转红)。deviceId **恒带**且取自配置 —— 2026-11-03~11-04 实测:
+		// 不带 → 615; 派生/随机值 → 614「锁定失败」; 只有 App 抓包值 → code=0。旧实现「缺省派生」已删除。
+		["B4 receiveV3 body 逐字段锁死", JSON.stringify(rcClaim.claimCalls[0]), JSON.stringify({
+			client: "app",
+			cloudId: "123456789012345",
+			cloudType: 0,
+			deviceId: "FAKE_DEVICE_ID"
+		})],
+		// AC2: 配置值必须**先去首尾空白再用**(不 trim 的话会把 "  X  " 原样发上去, 服务端照样拒)
+		["B4 deviceId 首尾空白被 trim 后使用", [rcClaimDevThrown, rcClaimDev.claimCalls.length, rcClaimDev.claimCalls[0]?.deviceId], ["", 1, "FAKE_DEVICE_ID"]],
+		// AC1: 未配置 → **零写请求** + 结论与获取步骤进日志 + 一条进度, 且不得谎称领取成功
+		["B4 未配置 deviceId → 零写请求/零异常/只读 1 次列表(不回头回读)", [rcNoDevThrown, rcNoDev.claimCalls.length, rcNoDev.expCalls.length, rcNoDev.rep.errors.length, rcNoDev.reads()], ["", 0, 0, 0, 1]],
+		["B4 未配置 deviceId → 日志含结论与获取步骤(复制为 cURL)", [rcText(rcNoDev).includes("未配置 CLOUD139_DEVICE_ID"), rcText(rcNoDev).includes("复制为 cURL")], [!0, !0]],
+		["B4 未配置 deviceId → 不谎称领取成功", /领取成功/.test(rcText(rcNoDev)), !1],
+		["B4 未配置 deviceId → 进度只记 1 条且说明已跳过", [rcNoDev.rep.tasks.length, String(rcNoDev.rep.tasks[0] || "").includes("未配置 CLOUD139_DEVICE_ID"), String(rcNoDev.rep.tasks[0] || "").includes("云朵领取已跳过"), String(rcNoDev.rep.tasks[0] || "").startsWith(`${rcNoDev.u.maskedAccount} `)], [1, !0, !0, !0]],
+		// R5: 跳过文案属**非凭证类**, 不得命中失效分流(否则用户会被引去重抓 Cookie —— 一个完全无效的动作)
+		["B4 跳过文案不命中失效分流", [matchesAlertRouting(rcNoDev.rep.tasks.join("\n")), matchesAlertRouting(rcNoDev.rep.renderSummary())], [!1, !1]],
+		// AC3: 纯空白 == 未配置(不得发出一个 "   "，也不得回落派生值)
+		["B4 deviceId 纯空白 → 等同未配置(零写请求+已跳过)", [rcBlankDevThrown, rcBlankDev.claimCalls.length, rcBlankDev.rep.errors.length, rcText(rcBlankDev).includes("未配置 CLOUD139_DEVICE_ID")], ["", 0, 0, !0]],
+		// R1 收窄: cloudType 2(下月可领取)与 cloudType 1(膨胀)都不需要 deviceId, 未配置也照常处理
+		["B4 未配置 deviceId 但只有 cloudType:2 → 照常提示「下月可领取」", [rcNextMonthNoDevThrown, rcNextMonthNoDev.claimCalls.length, rcText(rcNextMonthNoDev).includes("下月可领取")], ["", 0, !0]],
+		["B4 未配置 deviceId 但只有 cloudType:1 → 照常走 receiveTaskExpansion", [rcExpansionNoDevThrown, rcExpansionNoDev.expCalls.length, rcExpansionNoDev.rep.tasks.length], ["", 1, 0]],
+		// AC6: 派生已删除且不得复活。四层锁(**均为运行期可判**, 不是人工 grep):
+		//  ① 模块级 deriveDeviceId 必须不存在 —— 本文件同处一个模块作用域, typeof 未声明标识符返回 "undefined";
+		//     实测(2026-11-04 变异⑨): 只把函数声明加回、不调用, 若缺这一条则自检全绿 → 必须锁;
+		//  ② 旧入口 resolveDeviceId 必须消失(有人把派生加回它 → 转红);
+		//  ③ claimDeviceId 必须真实存在;
+		//  ④ claimDeviceId 自身的源码不得出现 SHA256 / 旧派生前缀 / derive(把派生拌回它 → 转红)。
+		//     旧前缀故意**不写成本地字面量**(用数组 join 拼出来): 源码里搜得到它就说明派生又回来了。
+		["B4 派生已删除: 无 deriveDeviceId/resolveDeviceId, claimDeviceId 只做 trim", [typeof deriveDeviceId, typeof Ut.prototype.resolveDeviceId, typeof Ut.prototype.claimDeviceId, new RegExp(["SHA256", ["ydyp", "device"].join("-") + ":", "derive"].join("|"), "i").test(Function.prototype.toString.call(Ut.prototype.claimDeviceId))], ["undefined", "undefined", "function", !1]],
+		// AC4: 设备标识(配置值)**不得**出现在面板日志/通知正文/进度/异常/金额明细任何一处
+		["B4 deviceId 值不进日志/通知正文", [noDeviceIdLeak(rcClaim, "FAKE_DEVICE_ID"), noDeviceIdLeak(rcClaimDev, "FAKE_DEVICE_ID")], [!0, !0]],
 		// AC5: 615 的逐项明细**只进面板日志**, 含 cloudType/cloudNum/hasRecordId/code 与服务端 msg 片段
 		["B4 615 失败明细含 cloudType= / hasRecordId= / 服务端 msg", [rcFailed615Thrown, rcFailed615.rep.lines.some(l => String(l).includes("cloudType=0")), rcFailed615.rep.lines.some(l => String(l).includes("cloudNum=6")), rcFailed615.rep.lines.some(l => String(l).includes("hasRecordId=true")), rcFailed615.rep.lines.some(l => String(l).includes("code=615")), rcFailed615.rep.lines.some(l => String(l).includes("兑换失败"))], ["", !0, !0, !0, !0, !0]],
 		// R2: 服务端自由文本不得进通知正文(否则会误路由到凭证 Bot); 聚合文案保持原样
 		["B4 615 服务端 msg 不进通知正文/进度明细", [rcFailed615.rep.renderSummary().includes("兑换失败"), rcFailed615.rep.tasks.some(t => String(t).includes("兑换失败")), matchesAlertRouting(rcFailed615.rep.renderSummary())], [!1, !1, !1]],
-		["B4 领取成功日志含 +6", rcClaim.rep.lines.some(l => String(l).includes("+6")), !0],
+		["B4 领取成功日志为整句「成功 1 项 +6 豆」", rcClaim.rep.lines.some(l => String(l).includes("云朵领取: 成功 1 项 +6 豆")), !0],
 		// R4 回读复核: total 增长 → 打 before→after; 只认服务端状态, 不认自己的文案
 		["B4 回读 total 增长 → 日志给 before→after", rcText(rcClaim).includes("云朵 total: 100→106"), !0],
 		// R4 第二支: total 未变但待领取列表收敛 → 也计成功
 		["B4 回读列表收敛 → 仍计成功", [rcShrinkThrown, /领取成功\(待领取列表已收敛\)/.test(rcText(rcShrink))], ["", !0]],
-		// AC4: 614 是「领取失败」(不是「正常业务响应」), 只进 tasks 不进 errors
+		// AC5: 已配置但 614/615 仍失败 → 追加一条可行动提示(deviceId 是「采集一次长期复用」的值, 真过期时唯一可做的是重抓)。
+		// 只进日志 + tasks(不进 errors、不改退出码), 且同一轮只提示**一次**
+		["B4 614 → 日志/tasks 含「可能已过期」且只一次", [rcFailedMultiThrown, rcText(rcFailedMulti).includes("可能已过期"), rcFailedMulti.rep.tasks.filter(t => String(t).includes("可能已过期")).length], ["", !0, 1]],
+		// 驱动**真实** reporter 输出, 不是抄一份提示字面量(抄字面量的断言改代码也不会红)
+		["B4 614 过期提示不命中失效分流", [matchesAlertRouting(rcFailedMulti.rep.tasks.join(String.fromCharCode(10))), matchesAlertRouting(rcFailedMulti.rep.renderSummary())], [!1, !1]],
+		// AC4: 614 是「领取失败」(不是「正常业务响应」), 只进 tasks 不进 errors。
+		// tasks 现在共 2 条: ①「可能已过期, 请重新抓包更新」 ②聚合「云朵领取失败 N 项(领取失败(614/615))」
+		["B4 614 → 不进 errors; tasks = 过期提示 + 聚合失败", [rcFailedThrown, rcFailed.rep.errors.length, rcFailed.rep.tasks.length], ["", 0, 2]],
 		["B4 614 → 文案为领取失败", rcText(rcFailed).includes("领取失败"), !0],
 		["B4 614 → 不写「正常业务响应/已领取」", /正常业务响应|已领取/.test(rcText(rcFailed)), !1],
-		["B4 614 → 只进 tasks 不进 errors", [rcFailedThrown, rcFailed.rep.errors.length, rcFailed.rep.tasks.length], ["", 0, 1]],
 		// AC5: 11029 才是「活动太火爆」, 同样只进 tasks
 		["B4 11029 → 文案「活动太火爆」且只进 tasks", [rcBusyThrown, rcText(rcBusy).includes("活动太火爆"), rcBusy.rep.errors.length, rcBusy.rep.tasks.length], ["", !0, 0, 1]],
 		// 全失败时不回读: 没有「成功的领取」需要复核, 多读一次只会多一条「未确认」噪声
