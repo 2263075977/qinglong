@@ -4,8 +4,11 @@
 // description: 中国移动云盘(139)每日签到 + 云朵任务;已迁移到 m.mcloud.139.com/ycloud 新网关,默认仅执行 HTTP 可完成的任务
 /**
  * 环境变量(必需):
- *   ydyp_ck="Authorization#手机号#authToken"   多账号用 @ 或换行分隔;仅 Authorization 或 Basic 时 authToken 可省略
- *   获取方式: 开抓包进 App, 搜 refresh, 找到 authTokenRefresh.do 请求, 取请求头中的 Authorization 与响应体 <token> 中的值
+ *   ydyp_ck="Authorization#手机号"   多账号用 @ 或换行分隔; 手机号段可省略 —— 脚本会从 token 的 mobile:<手机号>:<rest> 结构自动解析;
+ *             旧的三段写法 Authorization#手机号#任意第三段 仍兼容(第三段已废弃并被忽略)
+ *   获取方式: 抓包「中国移动云盘」App 任一 139 请求(如 user-njs.yun.139.com/user/status/query), 复制请求头里的 Authorization 整行;
+ *             注意 authTokenRefresh.do 已下线(2026-11-21 实测: 冷启动 + 重新登录两次抓包共 1300+ 条请求, 0 次命中), 不要再去搜 refresh;
+ *             一份凭证约 2~3 周需更新(11-03 采集的凭证 11-21 即已过可用期)
  *
  * 环境变量(可选, 前缀 CLOUD139_, 亦可用 $argument 同名键覆盖):
  *   已移除: CLOUD139_CLICK_NUM(原为「戳一下」次数, 默认 15)。实测点已完成任务零收益, 见 api.clickTask 的注释
@@ -653,7 +656,10 @@ const u = {
 		userAgent: "Mozilla/5.0 (Linux; Android 11; M2012K10C Build/RP1A.200720.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/90.0.4430.210 Mobile Safari/537.36 MCloudApp/10.0.1",
 	},
 	l = {
-		missingCookie: "未配置环境变量 ydyp_ck\n请在青龙面板添加环境变量 ydyp_ck（或通过 $argument 传入 cookie）\n值格式为 Authorization#手机号#authToken，多账号用 @ 或换行分隔\n获取方式：打开「中国移动云盘」App 抓包，搜索 refresh，找到 authTokenRefresh.do 请求，\n取请求头中的 Authorization 与响应体 <token> 中的值拼成上述格式",
+		missingCookie: "未配置环境变量 ydyp_ck\n请在青龙面板添加环境变量 ydyp_ck（或通过 $argument 传入 cookie）\n值格式为 Authorization#手机号（推荐），多账号用 @ 或换行分隔\n也可只填 Authorization，脚本会从 token 的 mobile:<手机号>:<rest> 结构自动解析手机号\n（旧的三段写法 Authorization#手机号#任意第三段 仍兼容，第三段已废弃并被忽略）\n获取方式：抓包「中国移动云盘」App 任一 139 请求（如 user-njs.yun.139.com/user/status/query），\n复制请求头里的 Authorization 整行；注意 authTokenRefresh.do 已下线（2026-11-21 实测），一份凭证约 2~3 周需更新",
+		// 配置缺失(手机号段): 与 missingCookie 同属 config_missing 通道, 文案不得命中失效分流关键词
+		// (logging-and-notify.md: 配置缺失不是凭证失效, 用户只需回面板补一段)
+		missingPhone: "ydyp_ck 缺少可识别的手机号: 既没有单独给出, 也无法从 token 的 mobile:<手机号>:<rest> 结构解析\n正确格式(任选一种):\n  Authorization#手机号            ← 推荐, 例: Authorization#13912345678\n  Authorization                  ← 脚本会从 token 中解析手机号\n  Authorization#手机号#任意第三段   ← 旧写法仍兼容, 第三段已废弃并被忽略\n手机号段的作用: 换票接口要把它作为 phoneNumber/account 参数提交, 缺失或写错会被服务端回「用户手机号格式错误」\n获取方式: 抓包「中国移动云盘」App 任一 139 请求(如 user-njs.yun.139.com/user/status/query), 复制请求头里的 Authorization 整行\n注意: authTokenRefresh.do 已下线(2026-11-21 实测), 不要再去搜 refresh; 一份凭证约 2~3 周需更新\n多账号用 @ 或换行分隔",
 		runStart: "开始执行",
 		runFailed: "执行失败",
 		runCompleted: "任务执行完成"
@@ -3033,7 +3039,7 @@ class Ye {
 	}
 	renderSummary() {
 		const e = [];
-		return this.invalid.length && e.push(`已失效账号(请重新登录获取并更新 ydyp_ck):\n${this.invalid.join("\n")}`), this.tasks.length && e.push(`任务进度:\n${this.tasks.join("\n")}`), this.amounts.length && e.push(`云朵统计:\n${this.amounts.join("\n")}`), this.errors.length && e.push(`异常信息:\n${this.errors.join("\n")}`), e.join("\n\n") || "执行完成"
+		return this.invalid.length && e.push(`已失效账号(请重新登录获取并更新 ydyp_ck):\n${this.invalid.join("\n")}\n获取方式: 抓包「中国移动云盘」App 任一 139 请求(如 user-njs.yun.139.com/user/status/query), 复制请求头里的 Authorization 头, 按 Authorization#手机号 填入 ydyp_ck\n注意: authTokenRefresh.do 已下线(2026-11-21 实测: 冷启动 + 重新登录两次抓包共 1300+ 条请求, 0 次命中, 别再去搜 refresh), 一份凭证约 2~3 周需更新`), this.tasks.length && e.push(`任务进度:\n${this.tasks.join("\n")}`), this.amounts.length && e.push(`云朵统计:\n${this.amounts.join("\n")}`), this.errors.length && e.push(`异常信息:\n${this.errors.join("\n")}`), e.join("\n\n") || "执行完成"
 	}
 }
 
@@ -4692,17 +4698,28 @@ class Ut {
 		}
 	}
 	parseCookie() {
+		// 2026-11-21 实测: Authorization 为 `Basic <base64>`, 解开恒为 `mobile:<手机号>:<rest>`(3 段) —— 手机号天然可从 token 解析。
+		// 解析不出手机号时**不得**回落假号码(历史上写死过一个 138 号段占位值): 服务端对假号码回
+		// {"success":false,"code":"05010011","message":"用户手机号格式错误"} —— 一个**配置错误**被包装成业务/凭证错误,
+		// 用户于是去查「手机号格式」而不是回来补变量。这里只记空串, 由 run() 在**发起任何请求之前**按 config_missing 终止。
+		const isPhone = e => /^\d{7,15}$/.test(String(e || "").trim()),
+			parsePhoneFromToken = e => {
+				try {
+					const t = String(e || "").replace(/^Basic\s+/i, "").trim(),
+						r = String(Ze.enc.Utf8.stringify(Ze.enc.Base64.parse(t)).split(":")[1] || "").trim();
+					// 只接受纯数字手机号段: 其余形态(如 base64 解出 foo)一律视为配置缺失 → 不发请求
+					return isPhone(r) ? r : ""
+				} catch (e) {
+					return ""
+				}
+			};
 		if (this.rawCookie.includes("#")) {
-			const [e, t, r] = this.rawCookie.split("#");
-			this.authorization = e, this.account = t, this.authToken = r || ""
-		} else this.authorization = this.rawCookie, this.authToken = "00", this.account = function(e) {
-			try {
-				const t = String(e || "").replace(/^Basic\s+/i, "");
-				return Ze.enc.Utf8.stringify(Ze.enc.Base64.parse(t)).split(":")[1] || "13800138000"
-			} catch (e) {
-				return "13800138000"
-			}
-		}(this.authorization);
+			// 支持两种写法: Authorization#手机号(推荐, 2 段) / Authorization#手机号#任意第三段(旧写法, 第三段已废弃 → 忽略)
+			// 显式手机号段非法时(如 Authorization#abc)不直接发出去, 先尝试从 token 解析; 仍解不出则留空交给 run() 报配置缺失
+			const [e, t] = this.rawCookie.split("#"),
+				r = String(t || "").trim();
+			this.authorization = String(e || "").trim(), this.account = isPhone(r) ? r : parsePhoneFromToken(this.authorization)
+		} else this.authorization = this.rawCookie, this.account = parsePhoneFromToken(this.authorization);
 		this.maskedAccount = function(e) {
 			const t = String(e || "未知账号");
 			return t.length >= 7 ? `${t.slice(0,3)}****${t.slice(7)}` : t
@@ -4724,6 +4741,12 @@ class Ut {
 		this.reporter.line(`[${this.maskedAccount}] ${e}`)
 	}
 	async run() {
+		// 配置缺失必须在**任何网络请求之前**就地终止(2026-11-21 实测根因):
+		// 旧实现解析不出手机号时回落假号码 → 服务端回 05010011「用户手机号格式错误」→ 被 classifySsoFailure 归成 credential,
+		// 用户看到「账号已失效, 请重新登录」而去重抓一份本来正确的凭证, 真实原因(变量少填了一段)永远暴露不出来。
+		// 复用顶层 catch 的 config_missing 通道: 中文配置指引 + 非零退出码, 不进失效 Bot。
+		// 必须在 try 之外: 下方步骤 catch 会经 noticeSafe 把异常收口成中性占位, 配置指引就丢了。
+		if (!this.account) throw new YdypError(l.missingPhone, "config_missing");
 		this.stepResults = [], this.authInterfaceFailure = !1;
 		try {
 			// 换票失败不等同于凭证失效: 接口/签名变更类失败只进 errors(退出码仍非 0),
@@ -5420,17 +5443,40 @@ async function notify(title, content) {
 	}
 	return console.log(`\n${title}\n${content}`), !1
 }
+// 单账号执行 + 错误隔离(2026-11-21): 一个账号的**配置错误**不得中断整轮 ——
+// 多账号里一条 ydyp_ck 写错(例如手机号解不出), 其它账号仍应照常跑完并汇总。
+// 只接住 config_missing; 其余异常维持原样上抛, 交给顶层 catch 翻译(不能被这里吞掉)。
+// makeUnit 参数只为让离线自检注入桩, 不引入额外的 DI 概念。
+async function runAccount(entry, cfg, reporter, idx, cfgFail, makeUnit) {
+	const u = makeUnit ? makeUnit(entry) : new Ut(entry, cfg, reporter);
+	try {
+		await u.run()
+	} catch (err) {
+		if (!(err instanceof YdypError) || "config_missing" !== err.type) throw err;
+		const msg = String(err.message || "");
+		// 汇总里只放结论句(第一行): 完整多行指引由"全军覆没"分支经顶层通道给出, 避免每个账号重复刷 8 行
+		const first = noticeSafe(msg.split(String.fromCharCode(10))[0]);
+		cfgFail.push(msg), reporter.errors.push(`第 ${idx+1} 个账号: ${first}`), reporter.line(`❌ 第 ${idx+1} 个账号配置缺失: ${first}`)
+	}
+	return u
+}
 async function Kt(r = ct()) {
 	if (!r.cookie) throw new YdypError(Jt, "config_missing");
 	const o = (i = r.cookie, String(i).split(/[@\n]/).map(e => e.trim()).filter(Boolean));
 	var i;
-	const s = new Ye;
+	// 0 个账号(ydyp_ck 只填了分隔符/空白)本身就是配置问题: 必须走缺失通道,
+	// 否则下面「全军覆没」条件(0 === 0)会拿 cfgFail[0]=undefined 拼出一条空正文通知。
+	if (!o.length) throw new YdypError(Jt, "config_missing");
+	const s = new Ye,
+		cfgFail = [];
 	s.info(`🚀 ${Wt} 共获取到 ${o.length} 个账号`);
 	for (let e = 0; e < o.length; e += 1) {
 		s.section(`第 ${e+1} 个账号`);
-		const t = new Ut(o[e], r, s);
-		await t.run(), e < o.length - 1 && await at(5e3, 1e4)
+		await runAccount(o[e], r, s, e, cfgFail), e < o.length - 1 && await at(5e3, 1e4)
 	}
+	// 全部账号都因配置错误跑不起来 → 交回顶层 config_missing 通道(整份中文指引 + 非零退出码)。
+	// 只在**全军覆没**时才抛: 多账号里一条写错, 其它账号的结果仍要照常汇总发出。
+	if (cfgFail.length && cfgFail.length === o.length) throw new YdypError(cfgFail[0], "config_missing");
 	const a = s.renderSummary();
 	return t.log(`${LOG_PREFIX} ${a}`), r.push && await notify(Wt, a), {
 		summary: a,
@@ -5476,6 +5522,8 @@ async function runSelfCheck() {
 		["已下线提示", "⚠️ 旧签到状态接口已下线(404), 直接尝试旧签到接口", !1],
 		["非凭证步骤失败汇总", `异常信息:\n1********** 云朵统计: ${NOTICE_SAFE_PLACEHOLDER}`, !1],
 		["配置缺失文案", `❌ ${l.missingCookie}`, !1],
+		// 配置缺失(手机号段): 与上面同属 config_missing, 不得命中失效分流(用户只需回面板补一段, 不是重登)
+		["配置缺失文案(手机号段)", `❌ ${l.missingPhone}`, !1],
 		// 换票失败分流(AC9): 接口/签名变更类不得命中失效关键词(否则会把用户引向「重抓 Cookie」这一无效动作)
 		["换票接口变更文案(签名被拒)", `异常信息:\n1**********: ${classifyAuthFailure(401, "请求签名校验失败", 200).msg}`, !1],
 		["换票接口变更文案(重放+时钟漂移提示)", `异常信息:\n1**********: ${classifyAuthFailure(401, "重复请求", 200).msg}`, !1],
@@ -5593,7 +5641,7 @@ async function runSelfCheck() {
 	};
 	const wireJwt = (primary, backup) => {
 		const rep = mkReporter();
-		const u = new Ut("Basic ZGVmYXVsdDoxMjM0NTY=#13800138000", {
+		const u = new Ut("Basic ZGVmYXVsdDoxMjM0NTY=#13912345678", {
 			drawTimes: 0, requestTimeout: 1e3, uploadEnabled: !1
 		}, rep);
 		u.api.ssoForMCloud = async () => primary;
@@ -5651,7 +5699,7 @@ async function runSelfCheck() {
 	// 夹具形态取自 probe-findings §5.3/§5.5 的真实响应结构, **值全部虚构**(不含任何真凭证/手机号)。
 	// 全部驱动**真实**实现(真分类函数、真步骤函数、真 Ye 记者), 不抄表达式
 	// (quality-guidelines.md:把正确表达式抄一遍当断言 = 同义反复, 没牙齿)。
-	const FAKE_COOKIE = "Basic ZGVmYXVsdDoxMjM0NTY=#13800138000";
+	const FAKE_COOKIE = "Basic ZGVmYXVsdDoxMjM0NTY=#13912345678";
 	const mkUnit = (cfg = {}, cookie = FAKE_COOKIE) => {
 			const rep = mkReporter();
 			const u = new Ut(cookie, Object.assign({
@@ -6150,17 +6198,21 @@ async function runSelfCheck() {
 		deadMethods = ["initTaskStatus", "getSignInfoV3", "getSigninStatus", "doSignin", "clickTask", "getTaskListV3", "getTaskList", "getDrawInfo", "getCloudNumV3", "receiveV3", "getBackupInfo", "getTaskExpansion"];
 	deadRun.u.jwt = async () => !0;
 	for (const m of deadMethods) deadRun.u.api[m] = async () => DEAD_BODY;
-	await deadRun.u.run();
+	// 包 drive: run() 现在可能早抛 config_missing(手机号解析失败), 裸 await 会让自检**崩栈**而不是打 FAIL
+	await drive(() => deadRun.u.run());
 	const deadText = deadRun.rep.lines.join("\n"),
-		deadTasks = deadRun.rep.tasks.join("\n");
+		deadTasks = deadRun.rep.tasks.join("\n"),
+		// run() 早抛(config_missing)时 stepResults 仍是 undefined: 兜底成空数组,
+		// 让「步骤表」断言干净地转红, 而不是在 .some() 上崩栈(2026-11-21 变异测试踩到)
+		deadSteps = deadRun.u.stepResults || [];
 	eqCases.push(
 		// 步骤表回归: 「戳一下」(盲点 task/click?id=319 十五次)已于 2026-11-02 删除。
 		// 驱动的是**真实** run()(下面刚跑过), 看它实际执行了哪些步骤 —— 把这一行加回去必让两条都转红。
-		["B3 步骤表里没有「戳一下」", deadRun.u.stepResults.some(s => "戳一下" === s.name), !1],
-		["B3 步骤表条目数 = 8(戳一下已删除)", deadRun.u.stepResults.length, 8],
+		["B3 步骤表里没有「戳一下」", deadSteps.some(s => "戳一下" === s.name), !1],
+		["B3 步骤表条目数 = 8(戳一下已删除)", deadSteps.length, 8],
 		["B3 全端点 404 → 不进 errors(exit 保持 0)", deadRun.rep.errors.length, 0],
 		["B3 全端点 404 → 不归 invalid(不误报凭证失效)", deadRun.rep.invalid.length, 0],
-		["B3 全端点 404 → 每步都未抛异常", deadRun.u.stepResults.every(s => s.ok), !0],
+		["B3 全端点 404 → 每步都未抛异常", deadSteps.every(s => s.ok), !0],
 		["B3 全端点 404 → 进度里如实记接口不可用", [deadRun.rep.tasks.length >= 4, deadTasks.includes("接口不可用")], [!0, !0]],
 		["B3 全端点 404 → 不出现「未获得奖励」", deadText.includes("未获得奖励"), !1],
 		["B3 全端点 404 → 无裸堆栈/执行异常", /执行异常|AxiosError/.test(deadText), !1],
@@ -6736,6 +6788,123 @@ async function runSelfCheck() {
 		["R4 curMonthBackup:true → 「本月已备份」", bfTrue.rep.lines.some(l => String(l).includes("本月已备份")), !0],
 		["R4 curMonthBackup:false → 「本月未备份」", bfFalse.rep.lines.some(l => String(l).includes("本月未备份")), !0],
 		["R4 curMonthBackup 缺失 → 不打印「本月」", [bfMissing.rep.lines.some(l => String(l).includes("本月")), bfThrown.every(t => "" === t)], [!1, !0]]
+	);
+	// ——— C 组: 配置诚信回归网(2026-11-21) ———
+	// 三件事必须由**真实现**证明, 且每条都能因回退而转红:
+	//   ① 解析不出手机号 → config_missing + 零网络请求(而不是把假号码发出去换一个业务错误)
+	//   ② Authorization#手机号 / Authorization / Authorization#手机号#任意第三段 三种写法都能得到正确 account
+	//   ③ 失效通知必须给出可执行的重抓步骤(authTokenRefresh.do 已下线, 别再让用户去搜 refresh)
+	// 夹具 token 全部虚构: base64("mobile:13912345678:FAKEREST"), 不对应任何真实号码
+	const fakePhoneToken = "bW9iaWxlOjEzOTEyMzQ1Njc4OkZBS0VSRVNU",
+		phoneOk = "13912345678",
+		cookieUnit = cookie => new Ut(cookie, {
+			drawTimes: 0,
+			requestTimeout: 1e3,
+			uploadEnabled: !1
+		}, mkReporter()),
+		phoneTwo = cookieUnit(`Basic ${fakePhoneToken}#${phoneOk}`),
+		phoneOnly = cookieUnit(`Basic ${fakePhoneToken}`),
+		phoneThree = cookieUnit(`Basic ${fakePhoneToken}#${phoneOk}#ANY_THIRD_SEGMENT`),
+		phoneBadSeg = cookieUnit(`Basic ${fakePhoneToken}#abc`),
+		// 配置缺失路径: 前置条件 = 一份解不出手机号的凭证(base64("foo"))
+		cfgRunUnit = cookieUnit("Basic Zm9v"),
+		cfgCallsBefore = offline.calls();
+	let cfgErr = null;
+	try {
+		await cfgRunUnit.run()
+	} catch (e) {
+		cfgErr = e
+	}
+	const cfgCallsAfter = offline.calls(),
+		cfgMsg = String(cfgErr?.message || ""),
+		// 失效段落用**真** renderSummary 生成(不拄模板), 否则文案一改断言就变成同义反复
+		invalidSummary = (() => {
+			const rep = mkReporter();
+			return rep.invalid.push(phoneOnly.maskedAccount), rep.renderSummary()
+		})(),
+		// 拼出来: 断言自身不得把假号码字面量写回源码(grep 应保持 0 命中)
+		fakePhoneNeedle = ["1380013800", "0"].join("");
+	// 优先级: 显式号段必须胜过 token 内的号段(此前夹具里两者总是同值, 无独立证据)
+	const precedenceUnit = cookieUnit(`Basic ${fakePhoneToken}#13900000001`),
+		// token 里是**非号码**号段(base64("mobile:abc:rest")): 必须判为解析失败, 不得把 "abc" 发出去
+		badTokenUnit = cookieUnit("Basic bW9iaWxlOmFiYzpyZXN0");
+	let badTokenErr = null;
+	try {
+		await badTokenUnit.run()
+	} catch (e) {
+		badTokenErr = e
+	}
+	const zeroCallsBefore = offline.calls(),
+		zeroAcctThrown = await drive(() => Kt({
+			cookie: "  @  ",
+			push: !1
+		})),
+		zeroCallsAfter = offline.calls();
+	// —— 多账号隔离夹具(2026-11-21 自查补): run() 里早抛 config_missing 会把 Kt 的账号循环一起打断,
+	//    导致「一个账号写错 → 其它账号全不跑、汇总也不发」。runAccount 必须只接住这一类, 其余照抛。
+	//    假 unit 只实现 run(), 因此不触网、也不吃 Kt 里的 5~10s 间隔。
+	const isoCalls = [],
+		isoRep = mkReporter(),
+		isoFail = [],
+		isoThrown = await drive(() => runAccount("BAD", {}, isoRep, 0, isoFail, () => ({
+			run: async () => {
+				isoCalls.push("bad");
+				throw new YdypError(l.missingPhone, "config_missing")
+			}
+		}))),
+		isoOtherThrown = await drive(() => runAccount("BROKEN", {}, isoRep, 0, isoFail, () => ({
+			run: async () => {
+				throw new TypeError("FAKE_SCRIPT_BUG")
+			}
+		}))),
+		allCfgCallsBefore = offline.calls(),
+		allCfgThrown = await drive(() => Kt({
+			cookie: "Basic Zm9v",
+			push: !1
+		})),
+		allCfgCallsAfter = offline.calls();
+	await drive(() => runAccount("GOOD", {}, isoRep, 1, isoFail, () => ({
+		run: async () => {
+			isoCalls.push("good")
+		}
+	})));
+	eqCases.push(
+		["C1 解不出手机号 → account 为空(不回落假号码)", cfgRunUnit.account, ""],
+		["C1 解不出手机号 → run() 抛 YdypError/config_missing", [cfgErr instanceof YdypError, cfgErr?.type], [!0, "config_missing"]],
+		// 零网络是核心承诺: 计数在 run() 前后各取一次, 均为 0
+		["C1 配置缺失路径零网络请求", [cfgCallsBefore, cfgCallsAfter], [0, 0]],
+		["C1 配置缺失文案含 Authorization#手机号 格式", cfgMsg.includes("Authorization#手机号"), !0],
+		["C1 配置缺失文案说明手机号段作用与获取方式", [cfgMsg.includes("phoneNumber"), cfgMsg.includes("获取方式"), cfgMsg.includes("user-njs.yun.139.com/user/status/query")], [!0, !0, !0]],
+		// 配置缺失属非凭证类: 不得进失效 Bot(否则用户去重抓一份本来就对的凭证)
+		["C1 配置缺失文案不命中失效分流", matchesAlertRouting(`❌ ${cfgMsg}`), !1],
+		["C1 配置缺失不进 reporter(通知由顶层 catch 发)", [cfgRunUnit.reporter.errors.length, cfgRunUnit.reporter.invalid.length], [0, 0]],
+		["C2 单账号配置错误不中断整轮(坏的前、好的照跑)", [isoThrown, isoCalls, isoFail.length], ["", ["bad", "good"], 1]],
+		["C2 汇总里的配置错误只留结论句(不刷整份指引)", [0 === isoRep.errors.length ? "NO_ERROR_RECORDED" : String(isoRep.errors[0]).includes(String.fromCharCode(10))], [!1]],
+		["C2 非 config_missing 异常仍上抛(不被吞)", isoOtherThrown.startsWith("TypeError"), !0],
+		// 全军覆没(单账号也算)才交回顶层通道: 用户要拿到完整指引, 不是一行结论
+		["C2 全账号配置错误 → 顶层抛 config_missing 完整指引", [allCfgThrown.startsWith("YdypError"), allCfgThrown.includes("Authorization#手机号")], [!0, !0]],
+		["C2 全账号配置错误路径零网络请求", [allCfgCallsBefore, allCfgCallsAfter], [0, 0]],
+		["C2 两段 Authorization#手机号 → account/mask 正确", [phoneTwo.account, phoneTwo.maskedAccount], [phoneOk, "139****5678"]],
+		["C2 仅 Authorization → 从 token 解析手机号", [phoneOnly.account, phoneOnly.maskedAccount], [phoneOk, "139****5678"]],
+		["C2 三段(第三段忽略) → account 仍正确", [phoneThree.account, phoneThree.maskedAccount], [phoneOk, "139****5678"]],
+		["C2 显式手机号段非法 → 回落 token 解析", [phoneBadSeg.account, phoneBadSeg.maskedAccount], [phoneOk, "139****5678"]],
+		// 0 账号(只填分隔符/空白): 属配置问题, 必须给"未配置"指引, 不得发空正文
+		["C3 0 账号 → 抛 config_missing 且文案是 missingCookie", [zeroAcctThrown.startsWith("YdypError"), zeroAcctThrown.includes("未配置环境变量 ydyp_ck")], [!0, !0]],
+		["C3 0 账号路径零网络请求", [zeroCallsBefore, zeroCallsAfter], [0, 0]],
+		// 显式号段优先于 token 内号段
+		["C2 显式号段优先于 token 内号段", [precedenceUnit.account, precedenceUnit.maskedAccount], ["13900000001", "139****0001"]],
+		// token 内号段不是纯数字 → 解析失败(不得把 "abc" 当手机号发出去)
+		["C2 token 内号段非数字 → account 为空且 run() 报配置缺失", [badTokenUnit.account, badTokenErr instanceof YdypError, badTokenErr?.type], ["", !0, "config_missing"]],
+		["C2 authorization 保留原头(含 Basic )", [phoneTwo.authorization, phoneOnly.authorization], [`Basic ${fakePhoneToken}`, `Basic ${fakePhoneToken}`]],
+		// authToken 是死字段(全文只有赋值, 没有使用点, 2026-11-21 确认): 两种写法都必须是 undefined,
+		// 并用源码锁住 —— 否则「恢复一个赋值」这类回退可以在不被察觉的情况下复活它
+		["C3 authToken 死字段已删除(两种写法)", [typeof phoneTwo.authToken, typeof phoneOnly.authToken], ["undefined", "undefined"]],
+		["C3 parseCookie 源码不再出现 authToken", Function.prototype.toString.call(Ut.prototype.parseCookie).includes("authToken"), !1],
+		["C3 parseCookie 源码不含假号码兜底", Function.prototype.toString.call(Ut.prototype.parseCookie).includes(fakePhoneNeedle), !1],
+		["C3 失效通知含重抓步骤(Authorization)", invalidSummary.includes("Authorization#手机号"), !0],
+		["C3 失效通知说明 authTokenRefresh.do 已下线", invalidSummary.includes("authTokenRefresh.do 已下线"), !0],
+		["C3 失效通知仍命中失效分流", matchesAlertRouting(invalidSummary), !0],
+		["C3 环境变量文档不再让用户搜 refresh", [l.missingCookie.includes("Authorization#手机号"), l.missingCookie.includes("authTokenRefresh.do 已下线"), /搜\s*refresh/.test(l.missingCookie)], [!0, !0, !1]]
 	);
 	// ——— 离线闸门回归网: 「全程离线」这个承诺必须可证伪(去掉入口桩必须转红) ———
 	// ① 到这里为止的**计划外**网络尝试必须为 0, 且闸门必须真的在位。
