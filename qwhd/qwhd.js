@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron: 20 8 * * *
+// cron: */30 * * * *
 // new Env('中国移动签到有礼');
 // description: 中国移动 App「签到有礼」(wx.10086.cn/qwhdhub mark31)每日签到 + 领累计奖励，脚本自己换票，无需每天手动贴 token
 /**
@@ -17,6 +17,14 @@
  *   可选（前缀 QWHD_）:
  *     QWHD_PUSH=1            是否发青龙通知（默认 1）
  *     QWHD_TIMEOUT_MS=15000  单请求超时（毫秒）
+ *     QWHD_STATE_FILE=<路径>  状态文件，默认与脚本同目录的 .qwhd-state.json
+ *
+ * 为什么用「每 30 分钟」而不是每天一次（2026-11-22 实测）:
+ *   换票 blob 背后是「移动认证 SSO 会话」，它有**约 4 小时绝对寿命**，且用 30 分钟重放一次也续不了
+ *   （body 里的 token 字段不被当成"使用会话"）。实测：10:15 抓的 blob 在 13:40 还能换票，14:10 起
+ *   一律回「APP登录状态已过期」。
+ *   所以每天定时跑必然撞空 → 改成每 30 分钟跑：用户当天抓一次 blob，脚本会在 30 分钟内自动签到；
+ *   当天签完就写状态文件、后续运行直接跳过（不发请求、不发通知）。
  *
  * 为什么配「换票 blob」而不是配 session token:
  *   QWHD_SESSION_TOKEN 有两条硬限制（2026-11-21 实测）——空闲约 30 分钟即失效、绝对寿命约 2 小时，
@@ -498,7 +506,7 @@ async function notify(title, content) {
 
 async function runAccount(account, index, cfg) {
   const tag = `账号${index + 1}(yx=${account.yx})`;
-  const reporter = { tag, ok: false, lines: [], errors: [], invalid: [], warnings: [] };
+  const reporter = { tag, yx: account.yx, ok: false, lines: [], errors: [], invalid: [], warnings: [] };
   log(`—— ${tag} 开始`);
 
   try {
@@ -594,11 +602,49 @@ function renderSummary(reporters) {
   return { title: `${TASK_TITLE} ${invalidCount ? '需要处理' : `${okCount}/${reporters.length}`}`, content: lines.join('\n').trim() };
 }
 
+// 状态文件：记录「今天哪些账号已签」「今天已经因 blob 失效告警过哪些账号」
+// 目的：30 分钟一轮的情况下，签名只做一次、通知只发一次，避免刷屏与重复写请求。
+function loadState(file) {
+  const today = ymdShanghai();
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (raw && raw.date === today && raw.signed && raw.notified) {
+      if (!raw.notifiedErr) raw.notifiedErr = {}; // 兼容旧状态文件
+      return raw;
+    }
+  } catch { /* 文件不存在/损坏都当空状态 */ }
+  return { date: today, signed: {}, notified: {}, notifiedErr: {} };
+}
+
+function saveState(file, state) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(state, null, 1));
+  } catch (e) {
+    logWarn(`⚠️ 状态文件写入失败(${e && e.message ? e.message : e})，本轮仍继续；下一轮可能重复检查`);
+  }
+}
+
+// 把本轮结果归并进状态，并决定「哪些失败值得发通知」（每个账号每天最多各一次）
+function applyResults(state, accounts, reporters) {
+  const alert = [];
+  const errors = [];
+  for (const r of reporters) {
+    if (r.ok) state.signed[r.yx] = true;
+    if (r.invalid.length) {
+      if (!state.notified[r.yx]) { state.notified[r.yx] = true; alert.push(r); }
+    } else if (!r.ok) {
+      if (!state.notifiedErr[r.yx]) { state.notifiedErr[r.yx] = true; errors.push(r); }
+    }
+  }
+  return { alert, errors, allSigned: accounts.every((a) => state.signed[a.yx]) };
+}
+
 function resolveConfig() {
   const raw = process.env.QWHD_ACCOUNTS;
   const timeoutMs = num(process.env.QWHD_TIMEOUT_MS, DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
   const push = String(process.env.QWHD_PUSH ?? '1') !== '0';
-  return { raw, timeoutMs, push };
+  const stateFile = process.env.QWHD_STATE_FILE || path.join(__dirname, '.qwhd-state.json');
+  return { raw, timeoutMs, push, stateFile };
 }
 
 async function main() {
@@ -622,20 +668,62 @@ async function main() {
     for (const p of problems) logWarn(`⚠️ ${p}（该条目已跳过）`);
   }
 
-  log(`共 ${accounts.length} 个账号，开始执行`);
-  const reporters = [];
-  for (let i = 0; i < accounts.length; i += 1) {
-    reporters.push(await runAccount(accounts[i], i, { ...cfg, sessionToken: null }));
-    if (i < accounts.length - 1) await sleep(1000);
+  // 每 30 分钟一轮：今天已签完就直接退出，一个请求都不发
+  const state = loadState(cfg.stateFile);
+  const pending = accounts.filter((a) => !state.signed[a.yx]);
+  if (!pending.length) {
+    log(`今日(${state.date})全部 ${accounts.length} 个账号均已签到，本轮跳过（不发请求、不发通知）`);
+    return;
   }
 
-  const { title, content } = renderSummary(reporters);
-  // 汇总只交给 notify() 输出(没有通知模块时它会 console.log 兜底)，避免同一段打两遍
-  if (cfg.push) await notify(title, content);
-  else log(`\n${title}\n${content}`);
+  log(`共 ${accounts.length} 个账号，其中 ${pending.length} 个未签，开始执行`);
+  const reporters = [];
+  for (let i = 0; i < pending.length; i += 1) {
+    reporters.push(await runAccount(pending[i], i, { ...cfg, sessionToken: null }));
+    if (i < pending.length - 1) await sleep(1000);
+  }
 
-  const anyOk = reporters.some((r) => r.ok);
-  process.exitCode = anyOk ? 0 : 1;
+  const { alert, errors, allSigned } = applyResults(state, accounts, reporters);
+  saveState(cfg.stateFile, state);
+
+  // 1) 凭证类失败：每个账号每天只告警一次，其余轮次静默等用户重抓 blob
+  if (alert.length) {
+    const { title, content } = renderSummary(alert);
+    if (cfg.push) await notify(title, content);
+    else log(`\n${title}\n${content}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // 2) 全部签完：只发一次成功汇总
+  if (allSigned) {
+    const out = [`完成 ${accounts.length}/${accounts.length}`, ''];
+    for (const r of reporters) {
+      out.push(`【${r.tag}】成功`);
+      for (const l of r.lines) out.push(`  ${l}`);
+    }
+    if (accounts.length > reporters.length) {
+      out.push(`（其余 ${accounts.length - reporters.length} 个账号本轮之前已签到）`);
+    }
+    const title = `${TASK_TITLE} ${accounts.length}/${accounts.length}`;
+    const content = out.join('\n').trim();
+    if (cfg.push) await notify(title, content);
+    else log(`\n${title}\n${content}`);
+    process.exitCode = 0;
+    return;
+  }
+
+  // 3) 非凭证类失败：每天也最多告警一次，避免每 30 分钟刷屏
+  if (errors.length) {
+    const { title, content } = renderSummary(errors);
+    if (cfg.push) await notify(title, content);
+    else log(`\n${title}\n${content}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // 4) 今天已经告警过、仍未成功：静默重试，不动退出码
+  log('本轮未完成，今日已告警过，静默等待下一轮');
 }
 
 /* ------------------------------------------------------------------ */
@@ -716,6 +804,37 @@ function selfcheck() {
   check('notify-cred-title', s2.title.includes('需要处理'), true);   // 有凭证类失败时标题不得写「完成 N/M」
   check('notify-ok-title', s1.title.includes('1/1'), true);
 
+  // 8.5) 状态文件与通知节流：每 30 分钟一轮，签名/告警都必须每天只做一次
+  const os = require('node:os');
+  const tmpState = path.join(os.tmpdir(), `qwhd-selfcheck-${process.pid}.json`);
+  fs.writeFileSync(tmpState, JSON.stringify({ date: '19700101', signed: { 1: true }, notified: {} }));
+  const rolled = loadState(tmpState);
+  check('state-rollover-date', rolled.date, ymdShanghai());
+  check('state-rollover-clear', rolled.signed, {});
+  fs.writeFileSync(tmpState, JSON.stringify({ date: ymdShanghai(), signed: { 9: true }, notified: {}, notifiedErr: {} }));
+  check('state-same-day-keep', loadState(tmpState).signed, { 9: true });
+  fs.unlinkSync(tmpState);
+
+  const accs = [{ yx: '1' }];
+  const st = { date: ymdShanghai(), signed: {}, notified: {}, notifiedErr: {} };
+  const okRun = applyResults(st, accs, [{ yx: '1', ok: true, invalid: [] }]);
+  check('apply-signed', st.signed['1'], true);
+  check('apply-allSigned', okRun.allSigned, true);
+  check('apply-no-alert', okRun.alert.length, 0);
+
+  const st2 = { date: ymdShanghai(), signed: {}, notified: {}, notifiedErr: {} };
+  const bad1 = applyResults(st2, accs, [{ yx: '1', ok: false, invalid: ['x'] }]);
+  const bad2 = applyResults(st2, accs, [{ yx: '1', ok: false, invalid: ['x'] }]);
+  check('throttle-first-alert', bad1.alert.length, 1);
+  check('throttle-second-silent', bad2.alert.length, 0);   // 同一账号同一天第二次不再告警
+  check('throttle-not-signed', st2.signed['1'], undefined);
+
+  const st3 = { date: ymdShanghai(), signed: {}, notified: {}, notifiedErr: {} };
+  const e1 = applyResults(st3, accs, [{ yx: '1', ok: false, invalid: [], errors: ['boom'] }]);
+  const e2 = applyResults(st3, accs, [{ yx: '1', ok: false, invalid: [], errors: ['boom'] }]);
+  check('throttle-err-first', e1.errors.length, 1);
+  check('throttle-err-second', e2.errors.length, 0);
+
   // 9) 写接口语义：HAVE_MARKED 视为成功，DATE_ERROR 视为失败（分支常量对齐服务端实测原文）
   const haveMarked = { code: 'FAILED', status: 'HAVE_MARKED', msg: '今日已签到过，无法再次签到' };
   check('havemarked-detect', haveMarked.status === 'HAVE_MARKED', true);
@@ -748,4 +867,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { parseAccounts, isTodaySigned, ymdShanghai, redactLog, noticeSafe, matchesAlertRouting, MSG_MISSING };
+module.exports = { parseAccounts, isTodaySigned, ymdShanghai, redactLog, noticeSafe, matchesAlertRouting, loadState, applyResults, MSG_MISSING };
