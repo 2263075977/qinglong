@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron: */30 * * * *
+// cron: 30 8,20 * * *
 // new Env('中国移动签到有礼');
 // description: 中国移动 App「签到有礼」(wx.10086.cn/qwhdhub mark31)每日签到 + 领累计奖励，脚本自己换票，无需每天手动贴 token
 /**
@@ -30,12 +30,11 @@
  *     QWHD_TIMEOUT_MS=15000  单请求超时（毫秒）
  *     QWHD_STATE_FILE=<路径>  状态文件，默认与脚本同目录的 .qwhd-state.json
  *
- * 为什么用「每 30 分钟」而不是每天一次（2026-11-22 实测）:
- *   换票 blob 背后是「移动认证 SSO 会话」，它有**约 4 小时绝对寿命**，且用 30 分钟重放一次也续不了
- *   （body 里的 token 字段不被当成"使用会话"）。实测：10:15 抓的 blob 在 13:40 还能换票，14:10 起
- *   一律回「APP登录状态已过期」。
- *   所以每天定时跑必然撞空 → 改成每 30 分钟跑：用户当天抓一次 blob，脚本会在 30 分钟内自动签到；
- *   当天签完就写状态文件、后续运行直接跳过（不发请求、不发通知）。
+ * 为什么 cron 是「每天两次」而不是高频:
+ *   早期（只能配短命 token 时）确实需要每 30 分钟跑一次，去撞那 2~4 小时的有效窗口；
+ *   现在有了 autoLogin 现签（见下），**不再依赖任何时间窗口** —— 每次运行现签一张会话即可。
+ *   因此改成每天 08:30 / 20:30 各跑一次：第一次失败还有第二次兜底，
+ *   当天签成就写状态文件、当天后续运行零请求直接跳过。
  *
  * 为什么配「换票 blob」而不是配 session token:
  *   QWHD_SESSION_TOKEN 有两条硬限制（2026-11-21 实测）——空闲约 30 分钟即失效、绝对寿命约 2 小时，
@@ -851,7 +850,7 @@ async function main() {
     for (const p of problems) logWarn(`⚠️ ${p}（该条目已跳过）`);
   }
 
-  // 每 30 分钟一轮：今天已签完就直接退出，一个请求都不发
+  // 今天已签完就直接退出，一个请求都不发（cron 每天两次，第二次也会命中这里）
   const stateExists = fs.existsSync(cfg.stateFile);
   const state = loadState(cfg.stateFile);
   log(`状态文件: ${cfg.stateFile}（${stateExists ? '已存在' : '本次新建'}，日期 ${state.date}，`
@@ -899,7 +898,7 @@ async function main() {
     return;
   }
 
-  // 3) 非凭证类失败：每天也最多告警一次，避免每 30 分钟刷屏
+  // 3) 非凭证类失败：每天也最多告警一次，避免每天两次都推
   if (errors.length) {
     const { title, content } = renderSummary(errors);
     if (cfg.push) await notify(title, content);
@@ -1012,7 +1011,7 @@ function selfcheck() {
   check('apptoken-has-ticket', /ticketID=SuZhou/.test(appTok), true);
   check('apptoken-reject-nonjsession', buildAppToken('UID=mhrz00; Secure'), null);
 
-  // 8.5) 状态文件与通知节流：每 30 分钟一轮，签名/告警都必须每天只做一次
+  // 8.5) 状态文件与通知节流：签名/告警都必须每天只做一次
   const os = require('node:os');
   const tmpState = path.join(os.tmpdir(), `qwhd-selfcheck-${process.pid}.json`);
   fs.writeFileSync(tmpState, JSON.stringify({ date: '19700101', signed: { 1: true }, notified: {} }));
