@@ -6,7 +6,18 @@
  * 环境变量（必需）:
  *   QWHD_ACCOUNTS —— 每项一个账号的「换票 blob」，多个账号用 & 或换行分隔（保序去重）。
  *
- *   取值路径（2026-11-21 实测，整条链路见下）:
+ *   两种填法（二选一，推荐 mint）:
+ *     A) mint —— autoLogin 明文模板（**一次性抓，之后永久免人工**）
+ *        抓 POST https://client.app.coc.10086.cn/biz-orange/LN/uamonekeylogin/autoLogin，
+ *        把请求体做 AES-128-CBC(key=tVkdaRWRY0ZkV1Vr, iv=VjFSQ1ZtVkQxRTlQ) 解密后得到的明文 JSON
+ *        整个填进 "mint"。脚本每次运行用它现签一张新会话（autoLogin 不校验 cookie），
+ *        所以不再需要每天重抓。⚠️ 该接口等于一次「App 一键登录」，调多会被风控
+ *        （214103 需人脸识别、可能连带封 App）；脚本已内置限频：两次至少间隔 10 分钟、
+ *        每天最多 3 次、命中 233031/214100/214103 自动静默 10 分钟/2 小时/24 小时。
+ *     B) token —— App 票据字符串（旧方式，几小时就失效，需每天重抓）
+ *        抓 POST https://wx.10086.cn/qwhdsso/appTokenLogin 的 body，取其中 token 字段。
+ *
+ *   取值路径（token 方式，2026-11-21 实测，整条链路见下）:
  *     1. 打开「中国移动」App → 进「签到有礼」活动页（wx.10086.cn/qwhdhub/qwhdmark/1021122301）
  *     2. 抓包工具里找 POST https://wx.10086.cn/qwhdsso/appTokenLogin?sid=...
  *     3. 「复制为 cURL」，把它的 body 整个 JSON 拿下来，再加一个字段 "yx"
@@ -40,6 +51,8 @@
  */
 'use strict';
 
+const crypto = require('node:crypto');
+const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -54,6 +67,23 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/6
   + '(KHTML, like Gecko) Mobile/15E148/wkwebview leadeon/12.5.7/CMCCIT';
 
 const DEFAULT_TIMEOUT_MS = 15000;
+
+// ---- App 网关「现签会话」（client.app.coc.10086.cn / autoLogin）------------------
+// 2026-11-23 实测（本地逐字节复现成功）：autoLogin 不校验 cookie 里的 JSESSIONID，
+// 只要请求体里的 cellNum（App 内 RSA 加密的手机号）与签名正确，就会换发一张全新会话。
+// 因此只要**一次性**抓到 autoLogin 请求体明文（模板），之后可无限现签，无需再抓包。
+const MINT_URL = 'https://client.app.coc.10086.cn/biz-orange/LN/uamonekeylogin/autoLogin';
+const MINT_PATH = '/biz-orange/LN/uamonekeylogin/autoLogin';
+const MINT_KEY_REQ = Buffer.from('tVkdaRWRY0ZkV1Vr', 'utf8');
+const MINT_KEY_RESP = Buffer.from('RYV0hCV1lV25KYVJ', 'utf8');
+const MINT_IV = Buffer.from('VjFSQ1ZtVkQxRTlQ', 'utf8');
+const MINT_TOK_KEY = Buffer.from('bAIgvwAuA4tbDr9d', 'utf8');
+const MINT_TOK_IV = Buffer.from('9791027341711819', 'utf8');
+const MINT_UA = 'ChinaMobile/12.5.7 (iPhone; iOS 27.0.1; Scale/3.00)';
+// 限频/风控（对齐社区实测阈值：同号 1 分钟内重复现签 → 233031；频繁 → 214100 → 214103 需人脸解封）
+const MINT_MIN_INTERVAL_SEC = 600;
+const MINT_MAX_PER_DAY = 3;
+const MINT_RISK_SILENCE_SEC = { '233031': 600, '214100': 7200, '214103': 86400, '213245': 7200 };
 
 // 下游 Node-RED 分流关键词（与 .trellis/spec/qinglong/logging-and-notify.md 一致）
 const ALERT_KEYWORDS = '已失效,无效用户,失效,cookie失效,ck失效,登录失效,账号失效,账号过期,重新登录,发生异常,invalid,expired';
@@ -141,7 +171,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /* 配置解析                                                            */
 /* ------------------------------------------------------------------ */
 
-const ACCOUNT_REQUIRED = ['jwtToken', 'token', 'provinceCode', 'cityCode', 'userCheckId', 'carrierOperator', 'yx'];
+const ACCOUNT_REQUIRED = ['provinceCode', 'cityCode', 'userCheckId', 'carrierOperator', 'yx'];
 
 const MSG_MISSING = [
   '❌ 未配置环境变量 QWHD_ACCOUNTS',
@@ -185,12 +215,19 @@ function parseAccounts(raw) {
       problems.push(`QWHD_ACCOUNTS[${index}] 缺少字段: ${missing.join(', ')}`);
       return;
     }
+    const mint = obj.mint && typeof obj.mint === 'object' ? obj.mint : null;
+    const hasMint = Boolean(mint && str(mint.xk) && mint.reqBody && str(mint.reqBody.cellNum));
+    if (!str(obj.token) && !hasMint) {
+      problems.push(`QWHD_ACCOUNTS[${index}] 既没有 token，也没有可用的 mint 模板（需含 xk 与 reqBody.cellNum）`);
+      return;
+    }
     // 解析不出必需字段时**不要**用占位值兜底(见 spec「解析不出必需字段」)
     const key = `${obj.yx}|${obj.userCheckId}`;
     if (seen.has(key)) return; // 保序去重
     seen.add(key);
     accounts.push({
       yx: str(obj.yx),
+      mint,
       jwtToken: str(obj.jwtToken),
       ssoToken: str(obj.token),
       provinceCode: str(obj.provinceCode),
@@ -239,6 +276,29 @@ async function httpFetch(url, options = {}) {
   }
 }
 
+// client.app.coc.10086.cn 要求 legacy renegotiation；Node 的 fetch(undici) 无法配置，
+// 会报 ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED。这里用 node:https 显式放开该开关。
+function httpsPostJson(urlStr, { headers = {}, body = '', timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(urlStr, {
+      method: 'POST',
+      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
+      headers,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        setCookies: res.headers['set-cookie'] || [],
+        text: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`超时 ${timeoutMs}ms`)));
+    req.on('error', (e) => reject(new QwhdError('network', `请求失败: ${e.code || e.message}`)));
+    req.end(body);
+  });
+}
+
 function getSetCookies(headers) {
   if (typeof headers.getSetCookie === 'function') return headers.getSetCookie();
   const raw = headers.get('set-cookie');
@@ -262,10 +322,117 @@ function parseJson(text, where) {
 }
 
 /* ------------------------------------------------------------------ */
+/* App 网关现签会话（autoLogin）—— 免人工的关键                          */
+/* ------------------------------------------------------------------ */
+
+const md5hex = (text) => crypto.createHash('md5').update(text, 'utf8').digest('hex');
+
+function aesEncryptB64(key, iv, text) {
+  const c = crypto.createCipheriv('aes-128-cbc', key, iv);
+  return Buffer.concat([c.update(text, 'utf8'), c.final()]).toString('base64');
+}
+
+function aesDecryptB64(key, iv, b64) {
+  const d = crypto.createDecipheriv('aes-128-cbc', key, iv);
+  return Buffer.concat([d.update(Buffer.from(b64, 'base64')), d.final()]).toString('utf8');
+}
+
+// 把服务端 Set-Cookie 收敛成 appTokenLogin 需要的 token 串。
+// 实测：必须是**完整**形态（含 Comment=SessionServer-unity / Path / HTTPOnly / Secure），
+// 只留 JSESSIONID+UID+ticketID 会被判「APP登录状态已过期」。
+function buildAppToken(setCookieValue) {
+  const parts = String(setCookieValue || '').split(';').map((x) => x.trim()).filter(Boolean);
+  const keep = parts.filter((x) => /^(JSESSIONID|UID|ticketID)=/.test(x));
+  if (!keep.some((x) => x.startsWith('JSESSIONID='))) return null;
+  return `${keep.join('; ')}; Comment=SessionServer-unity; Path=/;HTTPOnly; ${''}Secure`
+    .replace('; ; ', '; ').replace('  ', ' ');
+}
+
+function mintState(state, yx) {
+  if (!state.mint) state.mint = {};
+  if (!state.mint[yx]) state.mint[yx] = { lastTs: 0, count: 0, blockedUntil: 0, blockedCode: '' };
+  return state.mint[yx];
+}
+
+// 现签一张 App 网关会话，返回 appTokenLogin 需要的 token 串
+async function mintAppSession(account, cfg, state) {
+  const tpl = account.mint;
+  if (!tpl || !tpl.xk) {
+    throw new QwhdError('config_missing', '缺少 autoLogin 模板（account.mint）');
+  }
+  const ms = mintState(state, account.yx);
+  const now = Math.floor(Date.now() / 1000);
+  if (ms.blockedUntil > now) {
+    throw new QwhdError('credential', `现签被风控静默中（${ms.blockedCode}，剩余 ${Math.ceil((ms.blockedUntil - now) / 60)} 分钟）`);
+  }
+  if (now - ms.lastTs < MINT_MIN_INTERVAL_SEC) {
+    throw new QwhdError('credential', `距上次现签不足 ${MINT_MIN_INTERVAL_SEC / 60} 分钟，本轮跳过`);
+  }
+  if (ms.count >= MINT_MAX_PER_DAY) {
+    throw new QwhdError('credential', `今日现签已达上限 ${MINT_MAX_PER_DAY} 次`);
+  }
+
+  const ts = String(Date.now());
+  const nonce = String(Math.floor(10000000 + Math.random() * 90000000));
+  const plain = JSON.stringify(tpl);
+  const body = aesEncryptB64(MINT_KEY_REQ, MINT_IV, plain);
+  const xToken = aesEncryptB64(MINT_TOK_KEY, MINT_TOK_IV, `${tpl.xk}_${MINT_PATH}_${ts}_${nonce}`);
+  const xs = md5hex(`${MINT_URL}_${plain}_Leadeon/SecurityOrganization`);
+  const jsid = crypto.randomUUID();
+  const xSign = md5hex(`${xToken}_${ts}_${nonce}_${jsid}`);
+
+  ms.lastTs = now;
+  ms.count += 1;
+
+  const res = await httpsPostJson(MINT_URL, {
+    timeoutMs: cfg.timeoutMs,
+    headers: {
+      'content-type': 'application/Json',
+      'x-qen': '14',
+      xs,
+      'x-sign': xSign,
+      'x-nonce': nonce,
+      'x-time': ts,
+      'x-token': xToken,
+      'user-agent': MINT_UA,
+      'content-length': Buffer.byteLength(body),
+      cookie: `JSESSIONID=${jsid}; UID=mhrz${crypto.randomBytes(16).toString('hex')}; Comment=SessionServer-unity`,
+    },
+    body,
+  });
+
+  let retCode = '';
+  let retDesc = '';
+  try {
+    const j = JSON.parse(aesDecryptB64(MINT_KEY_RESP, MINT_IV, res.text.replace(/[^A-Za-z0-9+/=]/g, '')));
+    retCode = String(j.retCode || '');
+    retDesc = String(j.retDesc || '');
+  } catch { /* 解不开就只靠 Set-Cookie 判断 */ }
+
+  if (retCode && retCode !== '000000') {
+    const silence = MINT_RISK_SILENCE_SEC[retCode];
+    if (silence) {
+      ms.blockedUntil = now + silence;
+      ms.blockedCode = retCode;
+    }
+    throw new QwhdError('credential', `现签失败 retCode=${retCode}(${retDesc})`);
+  }
+
+  const setCookie = (res.setCookies || []).find((x) => /JSESSIONID=/.test(x)) || '';
+  const token = buildAppToken(setCookie);
+  if (!token) {
+    throw new QwhdError('credential', `现签没拿到 JSESSIONID（HTTP ${res.status}${retCode ? `, retCode=${retCode}` : ''}）`);
+  }
+  const ticket = (/(?:^|;\s*)ticketID=([^;]+)/.exec(setCookie) || [])[1] || '?';
+  log(`✅ 现签网关会话成功（ticketID=${ticket}，今日第 ${ms.count} 次）`);
+  return token;
+}
+
+/* ------------------------------------------------------------------ */
 /* 换票（R1.5）—— 全自动的关键                                          */
 /* ------------------------------------------------------------------ */
 
-async function mintSessionToken(account, cfg) {
+async function mintSessionToken(account, cfg, appTokenOverride) {
   const actUrl = activityUrl(account.yx);
   const loginUrl = `${BASE}/qwhdsso/login?dlwmh=true&actUrl=${encodeURIComponent(actUrl)}`;
 
@@ -283,14 +450,14 @@ async function mintSessionToken(account, cfg) {
 
   // 第 2 步：重放 blob 换票
   const body = {
-    jwtToken: account.jwtToken,
-    token: account.ssoToken,
+    token: appTokenOverride || account.ssoToken,
     provinceCode: account.provinceCode,
     cityCode: account.cityCode,
     userCheckId: account.userCheckId,
     carrierOperator: account.carrierOperator,
     appVersionCode: account.appVersionCode,
   };
+  if (account.jwtToken) body.jwtToken = account.jwtToken;
   if (account.took !== undefined && account.took !== null) body.took = account.took;
 
   const login = await httpFetch(`${BASE}/qwhdsso/appTokenLogin?sid=${encodeURIComponent(sid)}`, {
@@ -510,7 +677,13 @@ async function runAccount(account, index, cfg) {
   log(`—— ${tag} 开始`);
 
   try {
-    cfg.sessionToken = await mintSessionToken(account, cfg);
+    // 有 autoLogin 模板就现签一张新会话（免人工）；否则退回配置里的 token
+    let appToken = account.ssoToken;
+    if (account.mint && account.mint.xk) {
+      appToken = await mintAppSession(account, cfg, cfg.state);
+      saveState(cfg.stateFile, cfg.state);
+    }
+    cfg.sessionToken = await mintSessionToken(account, cfg, appToken);
   } catch (e) {
     if (e instanceof QwhdError && e.type === 'credential') {
       // 服务端原文只进面板日志；通知里用自有文案（外部文本进正文必须收口）
@@ -692,7 +865,7 @@ async function main() {
   log(`共 ${accounts.length} 个账号，其中 ${pending.length} 个未签，开始执行`);
   const reporters = [];
   for (let i = 0; i < pending.length; i += 1) {
-    reporters.push(await runAccount(pending[i], i, { ...cfg, sessionToken: null }));
+    reporters.push(await runAccount(pending[i], i, { ...cfg, sessionToken: null, state }));
     if (i < pending.length - 1) await sleep(1000);
   }
 
@@ -816,6 +989,28 @@ function selfcheck() {
   check('notify-cred-alert', matchesAlertRouting(s2.title + s2.content), true);
   check('notify-cred-title', s2.title.includes('需要处理'), true);   // 有凭证类失败时标题不得写「完成 N/M」
   check('notify-ok-title', s1.title.includes('1/1'), true);
+
+  // 8.2) 网关现签的加密/签名（向量固定，来自 2026-11-23 抓包逐字节复现）
+  const enc = aesEncryptB64(MINT_KEY_REQ, MINT_IV, '{"a":1}');
+  check('aes-roundtrip', aesDecryptB64(MINT_KEY_REQ, MINT_IV, enc), '{"a":1}');
+  check('xtoken-vector',
+    aesEncryptB64(MINT_TOK_KEY, MINT_TOK_IV, 'TESTXK_/p_1700000000000_12345678'),
+    'tOKhrYHqI31PMB2RmUjljq+MLqLB7TQgDG0FlW7+e2+tM3SPfcMbP8Mqe/ElNAf6');
+  check('xs-vector',
+    md5hex(`https://x/y_${JSON.stringify({ a: 1 })}_Leadeon/SecurityOrganization`),
+    '45d5470239c7cb7cfa23321e6563c427');
+  check('xsign-vector',
+    md5hex(['tOKhrYHqI31PMB2RmUjljq+MLqLB7TQgDG0FlW7+e2+tM3SPfcMbP8Mqe/ElNAf6',
+      '1700000000000', '12345678', 'js-1'].join('_')),
+    '004285ebf9f25b6e6adba1e251eeb775');
+
+  // token 串必须保留服务端原样结构（精简会失效，实测 X1~X4 全挂）
+  const appTok = buildAppToken('JSESSIONID=abc-1; UID=mhrz00; Comment=SessionServer-unity; Path=/;HTTPOnly; ticketID=SuZhou; Secure');
+  check('apptoken-has-jsessionid', /JSESSIONID=abc-1/.test(appTok), true);
+  check('apptoken-has-comment', /Comment=SessionServer-unity/.test(appTok), true);
+  check('apptoken-has-secure', /Secure/.test(appTok), true);
+  check('apptoken-has-ticket', /ticketID=SuZhou/.test(appTok), true);
+  check('apptoken-reject-nonjsession', buildAppToken('UID=mhrz00; Secure'), null);
 
   // 8.5) 状态文件与通知节流：每 30 分钟一轮，签名/告警都必须每天只做一次
   const os = require('node:os');
