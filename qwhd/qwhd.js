@@ -620,7 +620,8 @@ function saveState(file, state) {
   try {
     fs.writeFileSync(file, JSON.stringify(state, null, 1));
   } catch (e) {
-    logWarn(`⚠️ 状态文件写入失败(${e && e.message ? e.message : e})，本轮仍继续；下一轮可能重复检查`);
+    logWarn(`⚠️ 状态文件写入失败(${e && e.message ? e.message : e})：节流会失效，本轮仍继续。`
+      + ' 请把 QWHD_STATE_FILE 指到一个持久可写路径（青龙建议 /ql/data/config/qwhd-state.json）');
   }
 }
 
@@ -639,11 +640,20 @@ function applyResults(state, accounts, reporters) {
   return { alert, errors, allSigned: accounts.every((a) => state.signed[a.yx]) };
 }
 
+// 状态文件默认位置：优先青龙的持久可写目录 /ql/data/config（脚本目录可能被"订阅/同步"整个覆盖，
+// 放在脚本旁边会被连带清掉 → 节流失效 → 每轮都告警）。本地跑则回落到脚本同目录。
+function defaultStateFile() {
+  try {
+    if (fs.statSync('/ql/data/config').isDirectory()) return path.join('/ql/data/config', 'qwhd-state.json');
+  } catch { /* 非青龙环境 */ }
+  return path.join(__dirname, '.qwhd-state.json');
+}
+
 function resolveConfig() {
   const raw = process.env.QWHD_ACCOUNTS;
   const timeoutMs = num(process.env.QWHD_TIMEOUT_MS, DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
   const push = String(process.env.QWHD_PUSH ?? '1') !== '0';
-  const stateFile = process.env.QWHD_STATE_FILE || path.join(__dirname, '.qwhd-state.json');
+  const stateFile = process.env.QWHD_STATE_FILE || defaultStateFile();
   return { raw, timeoutMs, push, stateFile };
 }
 
@@ -669,7 +679,10 @@ async function main() {
   }
 
   // 每 30 分钟一轮：今天已签完就直接退出，一个请求都不发
+  const stateExists = fs.existsSync(cfg.stateFile);
   const state = loadState(cfg.stateFile);
+  log(`状态文件: ${cfg.stateFile}（${stateExists ? '已存在' : '本次新建'}，日期 ${state.date}，`
+    + `已签 ${Object.keys(state.signed).length}，已告警 ${Object.keys(state.notified).length}）`);
   const pending = accounts.filter((a) => !state.signed[a.yx]);
   if (!pending.length) {
     log(`今日(${state.date})全部 ${accounts.length} 个账号均已签到，本轮跳过（不发请求、不发通知）`);
