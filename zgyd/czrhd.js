@@ -89,7 +89,7 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/6
 const DEFAULT_TIMEOUT_MS = 15000;
 
 // ---- App 网关「现签会话」（client.app.coc.10086.cn / autoLogin）------------------
-// 与 qwhd/qwhd.js 完全同一套：autoLogin 不校验 cookie，只要请求体里的 cellNum（App 内 RSA 加密的
+// 与 zgyd/qwhd.js 完全同一套：autoLogin 不校验 cookie，只要请求体里的 cellNum（App 内 RSA 加密的
 // 手机号）与签名正确，就换发一张全新会话。配一次 autoLogin 明文模板（account.mint）即可永久免人工。
 // 为什么必须要有它：静态 blob 里的 token（JSESSIONID 串）**撑不了多久**——
 // 实测 2026-11-25 抓的那份只换了几次票就报「APP登录状态已过期」，之后再也换不出来。
