@@ -264,6 +264,16 @@ const CODE_TASK_OK = '0';                 // task/* 的 resultCode
 const CODE_TASK_GONE = '-1118';           // 任务不存在（taskId 过期）
 const CODE_LOTTERY_OK = '200';            // lottery/* 的 code（**字符串**）
 const CODE_CREDENTIAL = '40';             // 顶层凭证类业务码（code:"40" 无权限）
+// 风控评分拒绝（2026-11-28 实测抽奖）：
+//   {"code":-1,"message":"访问过于频繁,请稍后再试",
+//    "data":{"explain":"SCORE_REFUSE","level":5,"risk":true,"url":".../risk-verify/#/orderFail?..."}}
+// 判定用 explain==='SCORE_REFUSE' 或 risk===true，**不要**只看 code:-1 或 message 文案
+// （code:-1 是通用失败码，message 是给人看的自由文本，都可能变）。
+const CODE_RISK = '-1';
+const RISK_EXPLAIN = 'SCORE_REFUSE';
+// 风控冷却：命中后静默这么久（秒），期间不再发任何业务请求。
+// 抽奖次数不会被消耗（实测抽完 residue 仍是 1），所以冷却后重试是安全的。
+const RISK_COOLDOWN_SEC = 2 * 3600;
 const CODE_ACTIVITY_GONE = '-61003';      // 错误的活动信息，非抽奖活动
 // 二次嵌套的业务码（2026-11-25 实测，本轮 dry-run 新发现）：lottery/* 的 data 里**又套了一层**
 //   {"code":"200","msg":"操作成功","data":{"resultCode":-516,"msg":"用户未登录或登录已失效","data":null},"success":true}
@@ -286,6 +296,7 @@ const KIND = {
   MINT_CLOSED: 'mint_closed',   // 现签旧通道已被服务端关闭（213245）—— 重抓模板没用
   MINT_NETWORK: 'mint_network', // 现签被运营商网络/设备绑定拒（110001）—— 容器出口做不到
   NO_CREDENTIAL: 'no_credential', // 三条来源全都没拿到 token —— 零业务请求
+  RISK: 'risk_refused',   // 风控评分拒绝（SCORE_REFUSE）—— 不是凭证问题，冷却后重试
 };
 
 // 需要脱敏的键（日志与通知都要过一遍）。
@@ -1296,6 +1307,17 @@ async function loginCredential(account, cfg, deps = {}) {
 /* ------------------------------------------------------------------ */
 
 // family: 'task' 看 resultCode（数字），'lottery' 看 code（字符串 "200"）
+// 风控载荷判定：只认结构字段，不认文案。
+// 实测形态见 CODE_RISK 的注释；这里对 task/* 与 lottery/* 两种外壳都适用
+// （风控信息都在 data 里，不在顶层）。
+function isRiskPayload(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const data = payload.data;
+  if (!data || typeof data !== 'object') return false;
+  if (data.risk === true) return true;
+  return str(data.explain).toUpperCase() === RISK_EXPLAIN;
+}
+
 function classify(family, res) {
   const httpStatus = num(res && res.httpStatus, 0);
   const text = String((res && res.text) || '');
@@ -1320,6 +1342,17 @@ function classify(family, res) {
   //    所以先不分外壳统一认一次（resultCode 外壳里没有 code 字段，不会误伤）
   const genericCode = payload.code === undefined || payload.code === null ? '' : String(payload.code);
   if (genericCode === CODE_CREDENTIAL) return done(KIND.CREDENTIAL, genericCode);
+
+  // ③.5 风控评分拒绝（2026-11-28 实测抽奖 lottery/lottery）：
+  //   {"code":-1,"message":"访问过于频繁,请稍后再试",
+  //    "data":{"explain":"SCORE_REFUSE","level":5,"risk":true,"url":".../risk-verify/#/orderFail?..."}}
+  // 判据只用结构字段 explain / risk，**不看** code 或 message 文案（两者都可能变）。
+  // 归 RISK 而不是 UNKNOWN：它既不是凭证问题（不该进失效 Bot）、也不是契约漂移（不该报「脚本要更新」），
+  // 而是「短时间请求太多」—— 冷却后重试即可。抽奖次数不会被消耗（实测 residue 不变）。
+  if (isRiskPayload(payload)) {
+    const lv = payload.data && typeof payload.data === 'object' ? payload.data.level : '';
+    return done(KIND.RISK, genericCode || 'risk', `风控评分拒绝（${RISK_EXPLAIN}${lv !== '' ? `, level=${lv}` : ''}）`);
+  }
 
   if (family === 'task') {
     const code = payload.resultCode === undefined || payload.resultCode === null ? '' : String(payload.resultCode);
@@ -1616,6 +1649,12 @@ async function runDraws(account, cfg, entry, today, deps = {}) {
       item.detail = '抽奖时凭证已失效';
       out.push(item);
       break;
+    } else if (drawCls.kind === KIND.RISK) {
+      // 风控评分拒绝：不是失败、不是凭证问题，冷却后重试即可。
+      // 次数**不会被消耗**（实测抽完 residue 仍是 1），所以不标 invalid、不计入 problems。
+      item.settlement = 'skip';
+      item.detail = `风控拦截（${RISK_EXPLAIN}），本次不抽；次数保留，冷却后重试`;
+      markRiskCooldown(cfg, account, today);
     } else if (drawCls.kind === KIND.CONTRACT) {
       item.detail = '抽奖请求体契约漂移（HTTP 400 缺必需字段），请更新脚本';
     } else if (drawCls.kind === KIND.ACTIVITY_GONE) {
@@ -1646,6 +1685,20 @@ function describeFailure(cls) {
 // 连续凭证类失败「天数」计数（不是次数）。
 // 以前的写法是每次失败都 +1，于是同一天重跑 3 次就把 credFails 变成 3，通知写「已连续 3 天」，
 // 会骗用户去重抓一张本来有效的凭证。改成只有**换了一天**才 +1。
+// 风控冷却记账：把 blockedUntil 写进 mint 状态，复用现签那套「静默」机制。
+// 为什么复用：现签的静默本来就是「这段时间别发请求」的通用语义，再开一套字段只会增加状态面积。
+function markRiskCooldown(cfg, account, today) {
+  try {
+    const ms = mintState(cfg.state, account.fp);
+    const until = Math.floor(Date.now() / 1000) + RISK_COOLDOWN_SEC;
+    if (num(ms.blockedUntil, 0) < until) {
+      ms.blockedUntil = until;
+      ms.blockedCode = RISK_EXPLAIN;
+    }
+    ms.riskDate = today;
+  } catch { /* 记账失败不影响主流程 */ }
+}
+
 function bumpCredFails(entry, today) {
   if (!entry || typeof entry !== 'object') return 0;
   if (entry.lastCredFailDate === today) return num(entry.credFails, 0);
@@ -2535,6 +2588,27 @@ async function selfcheck() {
   checkTrue('cls-nested-cred-not-ok', C('lottery', NESTED_CRED).ok === false);
   check('cls-nested-ok', C('lottery', { code: '200', data: { resultCode: 0, msg: 'ok', data: 2 }, success: true }).kind, KIND.OK);
   check('cls-nested-unknown', C('lottery', { code: '200', data: { resultCode: -999, msg: '?' }, success: true }).kind, KIND.UNKNOWN);
+  // 风控评分拒绝（2026-11-28 实测抽奖真实响应）：判据只用 explain / risk 结构字段，
+  // 不看 code:-1 也不看 message 文案（两者都可能变）。
+  const RISK_REAL = {
+    code: -1,
+    data: { explain: 'SCORE_REFUSE', level: 5, risk: true,
+      url: 'https://dev.coc.10086.cn/coc3/gr/static-2c/risk-verify/#/orderFail?riskActionLogId=x&phone=138****1000' },
+    message: '访问过于频繁,请稍后再试',
+  };
+  check('cls-risk-lottery', C('lottery', RISK_REAL).kind, KIND.RISK);
+  checkTrue('cls-risk-not-ok', C('lottery', RISK_REAL).ok === false);
+  checkTrue('cls-risk-not-credential', C('lottery', RISK_REAL).kind !== KIND.CREDENTIAL);
+  checkTrue('cls-risk-not-unknown', C('lottery', RISK_REAL).kind !== KIND.UNKNOWN);
+  // risk:true 单独也能判（不依赖 explain）
+  check('cls-risk-by-flag', isRiskPayload({ code: -1, data: { risk: true } }), true);
+  // explain 单独也能判（大小写不敏感）
+  check('cls-risk-by-explain', isRiskPayload({ data: { explain: 'score_refuse' } }), true);
+  // 反面：普通 data 不是风控（避免把所有 -1 都当风控）
+  check('cls-risk-not-plain', isRiskPayload({ code: -1, data: null }), false);
+  check('cls-risk-not-nested', isRiskPayload({ code: '200', data: { resultCode: -516 } }), false);
+  check('const-risk-cooldown', RISK_COOLDOWN_SEC, 7200);
+  check('const-risk-explain', RISK_EXPLAIN, 'SCORE_REFUSE');
   check('unwrap-nested', unwrapNested({ resultCode: -516, msg: 'x', data: null }).resultCode, '-516');
   check('unwrap-plain', unwrapNested(2).data, 2);
   check('unwrap-plain-null', unwrapNested(null).data, null);
@@ -3918,6 +3992,10 @@ module.exports = {
   MINT_PATH,
   MINT_RISK_SILENCE_SEC,
   MINT_MIN_INTERVAL_SEC,
+  isRiskPayload,
+  markRiskCooldown,
+  RISK_COOLDOWN_SEC,
+  RISK_EXPLAIN,
   MINT_MAX_PER_DAY,
   LOGIN_URL,
   redact,
