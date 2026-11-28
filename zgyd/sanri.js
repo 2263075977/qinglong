@@ -237,7 +237,10 @@ const MINT_TOK_IV = Buffer.from('9791027341711819', 'utf8');
 const MINT_UA = 'ChinaMobile/12.5.7 (iPhone; iOS 27.0.1; Scale/3.00)';
 
 // 风控纪律（与 czrhd / qwhd 一致，服务端额度共享）：autoLogin 等于一次「App 一键登录」
-const MINT_MIN_INTERVAL_SEC = 600; // 两次现签至少隔 10 分钟
+// 两次现签的最小间隔（秒）。czrhd/qwhd 用 600s，那是因为它们一天跑两次、且失败会立刻重试；
+// 本脚本 cron 是每天一次，10 分钟只会挡住「手动补跑」，没有任何防风控收益。
+// 2026-11-28 实测踩过：一次失败后 3 分钟手动重跑，被这条挡成「正常跳过」，失败原因被静默吃掉。
+const MINT_MIN_INTERVAL_SEC = 120;
 const MINT_MAX_PER_DAY = 3;        // 每天最多 3 次
 const MINT_RISK_SILENCE_SEC = {
   '233031': 600, // 同号 1 分钟内重复现签
@@ -1113,7 +1116,12 @@ async function mintAppTicket(account, cfg, deps = {}) {
     throw new SanriError(KIND.THROTTLED, `现签风控静默中（code=${str(ms.blockedCode, '?')}，剩余 ${left} 分钟），本轮跳过`);
   }
   if (now - num(ms.lastTs, 0) < MINT_MIN_INTERVAL_SEC) {
-    throw new SanriError(KIND.THROTTLED, `距上次现签不足 ${MINT_MIN_INTERVAL_SEC / 60} 分钟，本轮跳过`);
+    // 把上一次的真实失败原因带出来：否则「失败 → 被节流跳过 → 原因永远看不到」，
+    // 用户只能看到一句「不足 N 分钟」，完全无从排查（2026-11-28 踩过）。
+    const lastErr = str(ms.lastError, '');
+    throw new SanriError(KIND.THROTTLED,
+      `距上次现签不足 ${Math.round(MINT_MIN_INTERVAL_SEC / 60)} 分钟，本轮跳过`
+      + (lastErr ? `；上次现签失败原因：${lastErr}` : ''));
   }
   // 每天最多 3 次：按**北京日**判断是否需要把计数归零（用 UTC 日界会变成北京时间 08:00
   // 前后各刷 3 次 = 6 次，正好踩在风控线上）
@@ -1133,8 +1141,12 @@ async function mintAppTicket(account, cfg, deps = {}) {
   const jsid = crypto.randomUUID();
   const xSign = md5hex(`${xToken}_${ts}_${nonce}_${jsid}`);
 
-  ms.lastTs = now;
-  ms.count = num(ms.count, 0) + 1;
+  // ⚠️ 先不动 ms.lastTs / ms.count：只有**真正拿到 ticket** 才算消耗一次现签额度。
+  // 2026-11-28 实测踩过：旧实现在发请求**之前**就落盘 lastTs+count，于是
+  //   · 一次网络失败/风控失败会白等 10 分钟（下一轮直接被「不足 10 分钟」挡掉）
+  //   · 每天 3 次的额度也会被失败请求吃掉
+  //   · 更糟的是「失败 → 下一轮被静默跳过 → 真正的失败原因永远看不到」
+  const prevCount = num(ms.count, 0);
 
   const request = deps.request || transport;
   const res = await request({
@@ -1195,6 +1207,9 @@ async function mintAppTicket(account, cfg, deps = {}) {
       `现签没拿到 JSESSIONID（HTTP ${num(res.httpStatus, 0)}${retCode ? `, retCode=${retCode}` : ''}）`);
   }
   const ticketId = (/(?:^|;\s*)ticketID=([^;]+)/.exec(setCookie) || [])[1] || '?';
+  // 只有走到这里才算真的消耗了一次现签额度（见上面 prevLastTs 的注释）
+  ms.lastTs = now;
+  ms.count = prevCount + 1;
   log(`✅ 现签网关会话成功（ticketID=${ticketId}，今日第 ${ms.count} 次）`);
   return ticket;
 }
@@ -1759,6 +1774,11 @@ async function runAccount(account, index, cfg, deps = {}) {
       reporter.kind = isCred ? KIND.LOGIN : KIND.NETWORK;
       reporter.authSource = 'mint';
       logErr(`${reporter.tag} ❌ 现签失败: ${e.message}`);
+      // 记下真实失败原因，供后续被「间隔节流」跳过时回放（否则原因会被静默吃掉）
+      try {
+        const msRec = mintState(cfg.state, account.fp);
+        msRec.lastError = String(e.message || '').slice(0, 200);
+      } catch { /* 记账失败不影响主流程 */ }
       if (isCred) {
         reporter.lines.push(`❌ 未拿到可用凭证（现签兜底失败：${noticeSafe(e.message)}）：本次未发任何业务请求。`
           + `mint 模板可能已过期 —— ${MSG_NEED_RELOGIN}`);
@@ -3455,7 +3475,9 @@ async function selfcheck() {
     const repGap = await runAccount(fakeAccount(35), 0, makeTestCfg({ state: stGap }), d);
     check('mint-gap-no-mint', d.seen, []);
     check('mint-gap-kind', repGap.kind, 'skipped_throttle');
-    check('mint-gap-secs', MINT_MIN_INTERVAL_SEC, 600);
+    // 2026-11-28 从 600 降到 120：日频 cron 下 10 分钟只会挡住手动补跑（见常量注释）
+    check('mint-gap-secs', MINT_MIN_INTERVAL_SEC, 120);
+    check('mint-gap-lt-czrhd', MINT_MIN_INTERVAL_SEC < 600, true);
   }
 
   // 24f) login 返回 403 / 非 JSON → 凭证类 / 未知（都不能当成功）
