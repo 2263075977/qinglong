@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron: */10 * * * *
+// cron: 35 8 * * *
 // new Env('中国移动幸运三日签');
 // description: 中国移动 App「幸运三日签」每日签到 + 累计抽奖（COC3 画布活动；token 优先、现签兜底）
 /**
@@ -32,8 +32,11 @@
  *
  * mint 为什么降级成兜底（2026-11-25 实测，研究文档 §8.8–8.10）
  *   | 端点                                              | 结果     | 含义                        |
- *   | uamonekeylogin/autoLogin（旧，czrhd/qwhd 在用）    | 213245   | 旧一键登录通道已关闭        |
+ *   | uamonekeylogin/autoLogin（旧，czrhd/qwhd 在用）    | 213245   | 旧一键登录通道已关闭（**临时**）|
  *   | uamonekeylogin/login（新，body 多 devToken/hyToken）| 110001   | 运营商网络/设备绑定         |
+ *   ⚠️ 2026-11-26 复核：在 App 内重新登录后，上面的 213245 消失、autoLogin 恢复 000000。
+ *      即那条通道是**运营商侧临时失效**，不是永久关闭 —— 恢复后 mint 立刻可用。
+ *      真正让 mint 失败的是第二步少传了 jsid（见 loginBody 的注释），已修。
  *   签名本身是对的（HTTP 200 + 结构化业务码）：x-qen: 14 与「原始明文字节」都已验证
  *   （不能 JSON.parse 再 stringify —— 会把 \/ 变成 /，xs 就对不上了）。所以这两个码
  *   **不是**脚本 bug，也**不是**用户的 mint 模板过期：重抓模板一点用都没有。
@@ -90,9 +93,10 @@
  *   SANRI_ACTIVITIES=<JSON> 抽奖活动表，默认三个活动（见 DEFAULT_ACTIVITIES）
  *   SANRI_REFERER=<URL>     referer 头，默认当月活动页 URL（pageKey 按月份换批次，换不动就改这里）
  *
- * 为什么 cron 是「每 10 分钟」而不是每天一次
- *   凭证来源 ① 的 token 只有约 30 分钟寿命。高频轮询就是为了**撞上用户打开活动页那一刻**：
- *   页面登录后带出来的 phone 头还躺在 Surge 的 recent / 会话里，脚本捡起来立刻用。
+ * 为什么 cron 是「每天一次」（2026-11-26 定稿）
+ *   现签（③）可用时，token 随用随取，不需要高频撞窗口 —— 见下面「mint 为什么降级成兜底」的复核结论。
+ *   早期曾用「每 10 分钟」，那是因为当时只有 Surge 捡 token 一条路，token 只有约 30 分钟寿命，必须高频撞上
+ *   「用户打开活动页那一刻」。若你日后**只能**靠 Surge（容器连不到 autoLogin），再改回每 10 分钟。
  *   签到本身**没有时间窗口**（不像周三充值日要抢 8:00 整点），所以「什么时候撞上」不影响结果。
  *   ⚠️ 高频 ≠ 高频请求：状态文件记当天结论，**当天已签完 + 三个抽奖活动都有结论 → 后续运行
  *      零请求、零通知**直接跳过。真正会撞到业务接口的只有"当天第一次且拿到了新 token"那一轮。
@@ -1209,6 +1213,11 @@ function loginBody(ticket) {
     s1: '',
     s2: '',
     from: '',
+    // ⚠️ jsid 必填且**与 ticket 同值**（2026-11-26 实测）：
+    //   只传 ticket 不传 jsid → 服务端认不出会话 → code=40006 用户信息已过期；
+    //   补上 jsid 后同一个 ticket 立即 code=0 成功。抓包样本（会话 2026-11-25-125054 #12331）
+    //   两个字段逐字相同，别自作聪明地只留一个。
+    jsid: ticket,
   };
 }
 
@@ -3458,9 +3467,12 @@ async function selfcheck() {
     check('login-cls-no-token', classifyLogin(reply({ code: '0', data: {} })).kind, KIND.CONTRACT);
     check('login-body-fixed', loginBody('T'), {
       ticket: 'T', ticketType: 11, businessType: 'RIGHTS_MARKET',
-      wxoaType: '', m1: '', m2: '', s1: '', s2: '', from: '',
+      wxoaType: '', m1: '', m2: '', s1: '', s2: '', from: '', jsid: 'T',
     });
     check('login-body-ticket-type', loginBody('T').ticketType, LOGIN_TICKET_TYPE);
+    // jsid 必须与 ticket 逐字相同：只传 ticket 不传 jsid → 服务端 code=40006（2026-11-26 实测）
+    check('login-body-jsid-equals-ticket', loginBody('XYZ').jsid, 'XYZ');
+    check('login-body-jsid-same-as-ticket', loginBody('XYZ').jsid === loginBody('XYZ').ticket, true);
   }
 
   // 24g) ticket 必须是 ① 那条 Set-Cookie 的**完整原值**（不能精简成 JSESSIONID+UID+ticketID）
